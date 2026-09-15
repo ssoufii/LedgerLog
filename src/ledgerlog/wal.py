@@ -1,16 +1,32 @@
-"""Write-ahead log: record framing and the append-only writer.
+"""Write-ahead log: file header, record framing and the append-only writer.
 
-Scope of this module today (story M1.1): encoding a put or a delete into an
-on-disk record, and appending those records to a file in call order. The file
-header carrying the format version (M1.2), the fsync policy (M1.3), sequential
-replay (M1.4) and torn-write truncation (M1.5) are separate stories and are not
-implemented here.
+Scope of this module today (stories M1.1 and M1.2): encoding a put or a delete
+into an on-disk record, stamping every WAL file with a header that carries the
+format version, and appending records to a file in call order. The fsync policy
+(M1.3), sequential replay (M1.4) and torn-write truncation (M1.5) are separate
+stories and are not implemented here.
 
-On-disk record layout (little endian, no padding)::
+On-disk file layout (little endian, no padding)::
+
+    [ 8B magic ][ 1B format version ][ record ][ record ]...
+
+On-disk record layout::
 
     [ 4B payload length ][ 4B CRC32 ][ payload ]
 
     payload = [ 1B op ][ 4B key length ][ key ][ value ]
+
+Why the header carries a magic string as well as the version byte: a lone
+version byte accepts any file whose first byte happens to hold a recognized
+number, so pointing the WAL at an unrelated file would be read as a valid log
+with a garbage tail. The magic makes "this is not a WAL at all" and "this is a
+WAL written by a different version" two distinct, reportable failures.
+
+Why the header is not checksummed: it is nine fixed bytes written once, at
+creation, before any record exists. A torn write can leave it short, which a
+length check catches, and any corruption of it shows up as an unrecognized
+magic or version. A CRC32 here would add a field to validate without covering a
+failure the magic and the length check do not already reject.
 
 Why the length and the checksum come first: a reader validates a record before
 it trusts any of its contents. The length says how many bytes to read, and the
@@ -43,18 +59,24 @@ import zlib
 from enum import IntEnum
 from pathlib import Path
 from types import TracebackType
+from typing import BinaryIO
 
 WAL_FORMAT_VERSION = 1
-"""Version of the record layout described in this module's docstring.
+"""Version of the file and record layout described in this module's docstring.
 
-The file header that stamps this version into the WAL itself is story M1.2. The
-constant is defined here because the number describes the record format, so the
-writer and the future header stay pinned to the same value.
+Every WAL file stamps this number into its header, and the writer refuses to
+append to a file stamped with anything else, so a layout change is detected
+instead of silently misread.
 """
 
+WAL_MAGIC = b"LEDGRWAL"
+"""Fixed marker at the start of every WAL file. Eight bytes, no terminator."""
+
+_FILE_HEADER_FORMAT = "<8sB"
 _RECORD_HEADER_FORMAT = "<II"
 _PAYLOAD_HEADER_FORMAT = "<BI"
 
+FILE_HEADER_SIZE = struct.calcsize(_FILE_HEADER_FORMAT)
 RECORD_HEADER_SIZE = struct.calcsize(_RECORD_HEADER_FORMAT)
 PAYLOAD_HEADER_SIZE = struct.calcsize(_PAYLOAD_HEADER_FORMAT)
 
@@ -81,7 +103,69 @@ class WalOp(IntEnum):
 
 
 class WalFormatError(ValueError):
-    """Raised when a record cannot be represented in the on-disk format."""
+    """Raised when WAL bytes cannot be represented in, or read as, the on-disk format."""
+
+
+class WalHeaderError(WalFormatError):
+    """Raised when a file's header is missing, too short, or not a WAL header at all.
+
+    Distinct from :class:`WalUnsupportedVersionError` because the two call for
+    different responses: this one means the file is not a LedgerLog WAL, while an
+    unsupported version means it is one that this build cannot parse.
+    """
+
+
+class WalUnsupportedVersionError(WalHeaderError):
+    """Raised when a WAL header carries a format version this build does not know."""
+
+    def __init__(self, found_version: int, expected_version: int = WAL_FORMAT_VERSION) -> None:
+        super().__init__(
+            f"WAL format version {found_version} is not supported by this build, "
+            f"which reads and writes version {expected_version}"
+        )
+        self.found_version = found_version
+        self.expected_version = expected_version
+
+
+def encode_file_header(version: int = WAL_FORMAT_VERSION) -> bytes:
+    """Return the bytes of a WAL file header stamping ``version``.
+
+    The version parameter exists so tests and future migration tooling can write
+    a header this build would reject. Normal callers take the default.
+    """
+    if not 0 <= version <= 0xFF:
+        raise WalFormatError(f"WAL format version {version} does not fit in one byte")
+    return struct.pack(_FILE_HEADER_FORMAT, WAL_MAGIC, version)
+
+
+def read_file_header(stream: BinaryIO) -> int:
+    """Read and validate a WAL file header from ``stream``, returning its version.
+
+    Reads exactly :data:`FILE_HEADER_SIZE` bytes from the stream's current
+    position and leaves it positioned at the first record. A short read is
+    treated as a corrupt header rather than as end of file, because a WAL that
+    exists at all was created header-first: fewer bytes than a header means the
+    file was truncated or was never a WAL.
+    """
+    raw = stream.read(FILE_HEADER_SIZE)
+    if len(raw) < FILE_HEADER_SIZE:
+        raise WalHeaderError(
+            f"WAL header is {len(raw)} bytes, expected {FILE_HEADER_SIZE}: "
+            "the file is truncated or is not a WAL"
+        )
+
+    magic, version = struct.unpack(_FILE_HEADER_FORMAT, raw)
+    if magic != WAL_MAGIC:
+        raise WalHeaderError(f"WAL magic mismatch: found {magic!r}, expected {WAL_MAGIC!r}")
+    if version != WAL_FORMAT_VERSION:
+        raise WalUnsupportedVersionError(version)
+    return version
+
+
+def read_file_header_from_path(path: str | os.PathLike[str]) -> int:
+    """Open ``path``, validate its WAL header, and return the format version."""
+    with open(path, "rb") as stream:
+        return read_file_header(stream)
 
 
 def encode_record(op: WalOp, key: bytes, value: bytes) -> bytes:
@@ -128,6 +212,18 @@ class WalWriter:
     concern: this writer flushes to the operating system on every append, but
     when the bytes reach the physical disk is decided by the fsync policy in
     story M1.3.
+
+    Opening a file is where the format version is enforced. A new file is
+    stamped with a header before any record can be appended, and an existing one
+    has its header validated before the writer will add to it. Doing this at open
+    time rather than at replay time means a WAL in an unreadable format is
+    rejected while it is still empty of this run's writes, instead of after a
+    crash when those writes are the only copy.
+
+    A file whose header is itself incomplete is rejected, not re-stamped. Such a
+    file holds no records (the header is written before the first append, in one
+    call), so refusing it loses nothing, while silently overwriting a short
+    header would also overwrite a foreign file that happened to be short.
     """
 
     def __init__(self, path: str | os.PathLike[str]) -> None:
@@ -135,6 +231,19 @@ class WalWriter:
         self._lock = threading.Lock()
         self._closed = False
         self._file = open(self._path, "ab")
+        try:
+            if self._file.tell() == 0:
+                self._file.write(encode_file_header())
+                self._file.flush()
+                self._format_version = WAL_FORMAT_VERSION
+            else:
+                # Validated through a separate read-only handle so the append
+                # handle is never seeked, keeping the append-only claim intact.
+                self._format_version = read_file_header_from_path(self._path)
+        except BaseException:
+            self._file.close()
+            self._closed = True
+            raise
 
     @property
     def path(self) -> Path:
@@ -145,6 +254,15 @@ class WalWriter:
     def closed(self) -> bool:
         """True once :meth:`close` has run."""
         return self._closed
+
+    @property
+    def format_version(self) -> int:
+        """Format version in the header of the file being appended to.
+
+        Read from the file's own header on open rather than returned as the
+        module constant, so the value reflects what is actually on disk.
+        """
+        return self._format_version
 
     def append_put(self, key: bytes, value: bytes) -> int:
         """Append a PUT record and return the byte offset it was written at."""
