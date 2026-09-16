@@ -1081,7 +1081,7 @@ def test_reader_can_be_iterated_more_than_once(tmp_path: Path) -> None:
 
 
 def test_records_appended_after_open_are_outside_the_reader_snapshot(tmp_path: Path) -> None:
-    """The size sampled at open is what bounds the read, so a concurrent append is not half seen."""
+    """The size sampled at open bounds the pass, so a log being appended to still ends."""
     path = tmp_path / "snapshot.wal"
     with WalWriter(path, fsync_policy=FsyncPolicy.NEVER) as writer:
         writer.append_put(b"before", b"1")
@@ -1160,43 +1160,68 @@ def test_iter_records_accepts_an_explicit_file_size() -> None:
     assert [(r.op, r.key, r.value) for r in records] == [(WalOp.PUT, b"alpha", b"one")]
 
 
-def test_reading_while_a_writer_appends_returns_an_intact_prefix(tmp_path: Path) -> None:
-    """A reader opened against a live WAL sees whole records, never half of one.
+def test_reading_while_a_writer_appends_yields_whole_records_in_order(tmp_path: Path) -> None:
+    """A read overlapping an append yields whole records in order, or stops at the tail.
 
     Threads rather than an interleaved single-threaded sequence, because the
     claim is about a read that overlaps an append in time, and only a real
     writer thread running against real reader threads can put the reader's size
     sample in the middle of the writer's work.
+
+    A torn tail is expected here, not a failure. The writer appends through a
+    buffered handle, so a record straddling the buffer boundary reaches the
+    operating system as two writes, and a reader sampling the file size between
+    them sees a header whose payload is not all there yet. What the test holds
+    the reader to is what it actually promises: every record handed back is
+    complete and in write order, damage only ever appears at the tail and only
+    as a truncation, and it is reported at the offset where the last intact
+    record ended.
     """
     path = tmp_path / "live.wal"
     record_count = 400
+    values = [b"v" * (index % 20) for index in range(record_count)]
     expected_keys = [f"k{index:04d}".encode() for index in range(record_count)]
+    # Where each record ends, so a reported truncation offset can be checked
+    # against the end of the last record the reader handed back.
+    record_ends: list[int] = []
+    end = FILE_HEADER_SIZE
+    for key, value in zip(expected_keys, values, strict=True):
+        end += RECORD_HEADER_SIZE + PAYLOAD_HEADER_SIZE + len(key) + len(value)
+        record_ends.append(end)
 
     failures: list[Exception] = []
-    reads: list[list[bytes]] = []
+    reads: list[tuple[list[bytes], WalTruncatedRecordError | None]] = []
     writing_done = threading.Event()
 
     def write_records(writer: WalWriter) -> None:
         try:
-            for index, key in enumerate(expected_keys):
-                writer.append_put(key, b"v" * (index % 20))
+            for key, value in zip(expected_keys, values, strict=True):
+                writer.append_put(key, value)
         except Exception as exc:
             # Collected rather than swallowed: the test asserts this is empty.
             failures.append(exc)
         finally:
             writing_done.set()
 
+    def drain(reader: WalReader) -> tuple[list[bytes], WalTruncatedRecordError | None]:
+        keys: list[bytes] = []
+        try:
+            for record in reader:
+                keys.append(record.key)
+        except WalTruncatedRecordError as exc:
+            return keys, exc
+        return keys, None
+
     def read_until_writing_stops() -> None:
         try:
             while True:
                 still_writing = not writing_done.is_set()
                 with WalReader(path) as reader:
-                    keys = [record.key for record in reader]
-                reads.append(keys)
+                    reads.append(drain(reader))
                 if not still_writing:
                     return
         except Exception as exc:
-            # Collected rather than swallowed: the test asserts this is empty.
+            # Any exception other than the tail truncation drain() handles.
             failures.append(exc)
 
     with WalWriter(path, fsync_policy=FsyncPolicy.NEVER) as writer:
@@ -1209,9 +1234,18 @@ def test_reading_while_a_writer_appends_returns_an_intact_prefix(tmp_path: Path)
         for thread in reader_threads:
             thread.join(timeout=30)
 
-    assert failures == [], f"reads raised while the writer was appending: {failures!r}"
+    assert failures == [], f"reads failed for something other than a torn tail: {failures!r}"
     assert not writer_thread.is_alive() and all(not t.is_alive() for t in reader_threads)
     assert reads, "no reader completed a pass"
-    for keys in reads:
+
+    for keys, truncation in reads:
         assert keys == expected_keys[: len(keys)], "a read returned something other than a prefix"
-    assert max(len(keys) for keys in reads) == record_count, "no reader saw the finished log"
+        if truncation is not None:
+            expected_offset = record_ends[len(keys) - 1] if keys else FILE_HEADER_SIZE
+            assert truncation.offset == expected_offset, (
+                "a truncation was reported somewhere other than the end of the last intact record"
+            )
+
+    complete = [keys for keys, truncation in reads if truncation is None]
+    assert complete, "no reader completed a pass without hitting the tail"
+    assert max(len(keys) for keys in complete) == record_count, "no reader saw the finished log"
