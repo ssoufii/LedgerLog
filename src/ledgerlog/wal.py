@@ -610,11 +610,19 @@ def iter_records(stream: BinaryIO, *, file_size: int | None = None) -> Iterator[
     forwards.
 
     ``file_size`` is the bound every record length is checked against, sampled
-    once by default. Sampling once rather than per record is what makes a read
-    concurrent with an append return a consistent prefix of the log: records
-    written after iteration starts are outside the snapshot and are simply not
-    returned, instead of appearing partway through and turning a tail that was
-    complete a moment ago into a torn one.
+    once by default. Sampling once rather than growing the bound as the file
+    grows keeps a pass over a log that is still being appended to finite and
+    bounded: records written after iteration starts fall outside the snapshot
+    and are simply not returned.
+
+    What the snapshot does not promise is that its last record is whole. A
+    writer appending through a buffered handle splits a record across two write
+    calls when it straddles the buffer boundary, so a size sampled in between
+    lands mid-record, and the reader stops there with
+    :class:`WalTruncatedRecordError`. Every record actually yielded is complete
+    and in write order; an append still in flight shows up only as a torn tail,
+    never as a garbled record in the middle. Recovery reads a log nobody is
+    appending to, so the only torn tail it can meet is one a crash really left.
 
     Records are read one at a time rather than by loading the file, because a WAL
     is sized by how much has been written since the last flush, not by what fits
