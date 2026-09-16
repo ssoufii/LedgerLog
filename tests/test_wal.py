@@ -1,7 +1,7 @@
-"""Tests for the WAL file header, record framing and the append-only writer.
+"""Tests for the WAL file header, record framing, append-only writer and fsync policy.
 
-Covers stories M1.1 (record framing, append writer) and M1.2 (file header with a
-format version byte).
+Covers stories M1.1 (record framing, append writer), M1.2 (file header with a
+format version byte) and M1.3 (configurable fsync policy).
 
 The bytes are decoded here with plain ``struct`` calls rather than with a reader
 from the library, because the point of these tests is that what lands on disk
@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import builtins
 import io
+import os
 import struct
 import threading
 import zlib
@@ -25,11 +26,13 @@ import pytest
 
 from ledgerlog import wal
 from ledgerlog.wal import (
+    DEFAULT_FSYNC_INTERVAL_SECONDS,
     FILE_HEADER_SIZE,
     PAYLOAD_HEADER_SIZE,
     RECORD_HEADER_SIZE,
     WAL_FORMAT_VERSION,
     WAL_MAGIC,
+    FsyncPolicy,
     WalFormatError,
     WalHeaderError,
     WalOp,
@@ -226,6 +229,9 @@ class _SeekRecordingFile:
 
     def tell(self) -> int:
         return self._wrapped.tell()
+
+    def fileno(self) -> int:
+        return self._wrapped.fileno()
 
     def write(self, data: bytes) -> int:
         return self._wrapped.write(data)
@@ -481,3 +487,312 @@ def test_rejected_open_does_not_leak_a_file_handle(
 
     assert opened, "expected the writer to have opened the file"
     assert all(handle.closed for handle in opened)
+
+
+# --- Configurable fsync policy (story M1.3) ----------------------------------
+
+
+class _FsyncRecorder:
+    """Stand-in for ``os.fsync`` that records each call and then syncs for real.
+
+    Counting calls is the only way to observe an fsync from the outside: the
+    acceptance criteria for this story are about how often the writer syncs, and
+    nothing in the file's own bytes says whether they reached the platter. Each
+    call also captures the file's inode and size as the kernel sees them at that
+    moment, which is what lets a test assert the sync targeted the WAL itself and
+    happened after the record was flushed, not before.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[int, int]] = []
+        self._real_fsync = os.fsync
+
+    def install(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(os, "fsync", self)
+
+    def __call__(self, fd: int) -> None:
+        stat = os.fstat(fd)
+        self.calls.append((stat.st_ino, stat.st_size))
+        self._real_fsync(fd)
+
+    @property
+    def count(self) -> int:
+        return len(self.calls)
+
+
+class _FakeClock:
+    """Monotonic clock a test advances by hand, so cadence tests never sleep."""
+
+    def __init__(self, now: float = 0.0) -> None:
+        self.now = now
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def test_default_policy_is_always(tmp_path: Path) -> None:
+    """A write-ahead log's default must be the durable one."""
+    with WalWriter(tmp_path / "default.wal") as writer:
+        assert writer.fsync_policy is FsyncPolicy.ALWAYS
+        assert writer.fsync_interval_seconds == DEFAULT_FSYNC_INTERVAL_SECONDS
+
+
+@pytest.mark.parametrize("policy", list(FsyncPolicy))
+def test_writer_accepts_each_policy_as_an_enum_or_as_its_string(
+    tmp_path: Path, policy: FsyncPolicy
+) -> None:
+    with WalWriter(tmp_path / f"{policy.value}-enum.wal", fsync_policy=policy) as writer:
+        assert writer.fsync_policy is policy
+    with WalWriter(tmp_path / f"{policy.value}-str.wal", fsync_policy=policy.value) as writer:
+        assert writer.fsync_policy is policy
+
+
+def test_unknown_policy_is_rejected_before_the_file_is_created(tmp_path: Path) -> None:
+    path = tmp_path / "unknown_policy.wal"
+    with pytest.raises(ValueError, match="unknown fsync policy") as excinfo:
+        WalWriter(path, fsync_policy="sometimes")
+    for policy in FsyncPolicy:
+        assert policy.value in str(excinfo.value)
+    assert not path.exists(), "a rejected policy must not leave a WAL behind"
+
+
+@pytest.mark.parametrize("interval", [0, -1.0, float("nan"), float("inf")])
+def test_unusable_fsync_interval_is_rejected(tmp_path: Path, interval: float) -> None:
+    """A NaN interval would silently downgrade the interval policy to never."""
+    path = tmp_path / "bad_interval.wal"
+    with pytest.raises(ValueError, match="finite positive"):
+        WalWriter(path, fsync_policy=FsyncPolicy.INTERVAL, fsync_interval_seconds=interval)
+    assert not path.exists()
+
+
+def test_always_policy_fsyncs_before_each_append_returns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "always.wal"
+    recorder = _FsyncRecorder()
+    recorder.install(monkeypatch)
+
+    with WalWriter(path, fsync_policy=FsyncPolicy.ALWAYS) as writer:
+        assert recorder.count == 1, "the file header is a durable write too"
+        for index in range(5):
+            expected_count = recorder.count + 1
+            writer.append_put(f"k{index}".encode(), b"value")
+            assert recorder.count == expected_count, "append returned without fsyncing"
+            synced_inode, synced_size = recorder.calls[-1]
+            assert synced_inode == path.stat().st_ino, "fsynced a file other than the WAL"
+            assert synced_size == path.stat().st_size, "fsynced before the record was flushed"
+        writer.append_delete(b"k0")
+        assert recorder.count == 7
+
+    assert recorder.count == 7, "close has nothing left to sync under the always policy"
+    assert len(decode_all(path.read_bytes())) == 6
+
+
+def test_never_policy_makes_no_fsync_calls(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    path = tmp_path / "never.wal"
+    recorder = _FsyncRecorder()
+    recorder.install(monkeypatch)
+
+    with WalWriter(path, fsync_policy=FsyncPolicy.NEVER) as writer:
+        for index in range(20):
+            writer.append_put(f"k{index}".encode(), b"value")
+        writer.append_delete(b"k0")
+
+    assert recorder.count == 0, "the never policy must not fsync, not even on close"
+    assert len(decode_all(path.read_bytes())) == 21, "records still reach the file"
+
+
+def test_interval_policy_fsyncs_on_cadence_not_on_every_append(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "interval.wal"
+    recorder = _FsyncRecorder()
+    recorder.install(monkeypatch)
+    clock = _FakeClock()
+
+    with WalWriter(
+        path,
+        fsync_policy=FsyncPolicy.INTERVAL,
+        fsync_interval_seconds=1.0,
+        clock=clock,
+    ) as writer:
+        assert recorder.count == 0, "opening a file does not start the cadence with a sync"
+
+        for index in range(10):
+            writer.append_put(f"early{index}".encode(), b"value")
+        assert recorder.count == 0, "synced before the interval elapsed"
+
+        clock.advance(1.0)
+        writer.append_put(b"due", b"value")
+        assert recorder.count == 1, "the first append past the deadline must sync"
+        assert recorder.calls[-1][1] == path.stat().st_size
+
+        for index in range(10):
+            writer.append_put(f"late{index}".encode(), b"value")
+        assert recorder.count == 1, "the deadline must reset after a sync"
+
+        clock.advance(2.5)
+        writer.append_put(b"due-again", b"value")
+        assert recorder.count == 2
+
+    assert recorder.count == 2, "nothing was pending, so close syncs nothing"
+    assert len(decode_all(path.read_bytes())) == 22
+
+
+def test_interval_policy_syncs_the_pending_tail_on_close(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Closing is not permission to drop records the cadence has not reached yet."""
+    path = tmp_path / "interval_close.wal"
+    recorder = _FsyncRecorder()
+    recorder.install(monkeypatch)
+    clock = _FakeClock()
+
+    writer = WalWriter(
+        path,
+        fsync_policy=FsyncPolicy.INTERVAL,
+        fsync_interval_seconds=60.0,
+        clock=clock,
+    )
+    writer.append_put(b"tail", b"value")
+    assert recorder.count == 0
+
+    writer.close()
+    assert recorder.count == 1
+    assert recorder.calls[-1][1] == path.stat().st_size
+
+    writer.close()
+    assert recorder.count == 1, "close is idempotent and must not sync twice"
+
+
+def test_sync_forces_a_sync_whatever_the_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "explicit_sync.wal"
+    recorder = _FsyncRecorder()
+    recorder.install(monkeypatch)
+
+    with WalWriter(path, fsync_policy=FsyncPolicy.NEVER) as writer:
+        writer.append_put(b"k", b"value")
+        assert recorder.count == 0
+        writer.sync()
+        assert recorder.count == 1
+        assert recorder.calls[-1][1] == path.stat().st_size
+
+    assert recorder.count == 1, "an explicit sync leaves nothing for close to do"
+
+
+def test_explicit_sync_restarts_the_interval_cadence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "sync_resets.wal"
+    recorder = _FsyncRecorder()
+    recorder.install(monkeypatch)
+    clock = _FakeClock()
+
+    with WalWriter(
+        path,
+        fsync_policy=FsyncPolicy.INTERVAL,
+        fsync_interval_seconds=1.0,
+        clock=clock,
+    ) as writer:
+        writer.append_put(b"k1", b"value")
+        clock.advance(0.9)
+        writer.sync()
+        assert recorder.count == 1
+
+        clock.advance(0.5)  # 1.4s since the append, but only 0.5s since the sync
+        writer.append_put(b"k2", b"value")
+        assert recorder.count == 1, "the deadline must run from the last sync"
+
+        clock.advance(0.5)
+        writer.append_put(b"k3", b"value")
+        assert recorder.count == 2
+
+
+def test_sync_after_close_raises(tmp_path: Path) -> None:
+    writer = WalWriter(tmp_path / "closed_sync.wal", fsync_policy=FsyncPolicy.NEVER)
+    writer.close()
+    with pytest.raises(ValueError, match="closed"):
+        writer.sync()
+
+
+def _append_from_threads(writer: WalWriter, thread_count: int, per_thread: int) -> list[Exception]:
+    """Run ``thread_count`` threads appending ``per_thread`` records each, all at once."""
+    barrier = threading.Barrier(thread_count)
+    failures: list[Exception] = []
+
+    def append_many(thread_index: int) -> None:
+        try:
+            barrier.wait()
+            for record_index in range(per_thread):
+                writer.append_put(f"t{thread_index}-k{record_index}".encode(), b"value")
+        except Exception as exc:
+            # Collected rather than swallowed: the caller asserts this is empty.
+            failures.append(exc)
+
+    threads = [threading.Thread(target=append_many, args=(index,)) for index in range(thread_count)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return failures
+
+
+def test_always_policy_syncs_once_per_append_under_concurrency(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Concurrent appenders each get their own sync, none piggybacks on another's."""
+    path = tmp_path / "concurrent_always.wal"
+    recorder = _FsyncRecorder()
+    recorder.install(monkeypatch)
+    thread_count, per_thread = 4, 20
+
+    with WalWriter(path, fsync_policy=FsyncPolicy.ALWAYS) as writer:
+        failures = _append_from_threads(writer, thread_count, per_thread)
+
+    assert failures == []
+    assert recorder.count == thread_count * per_thread + 1  # the records plus the header
+    assert len(decode_all(path.read_bytes())) == thread_count * per_thread
+
+
+def test_interval_policy_deadline_is_not_raced_by_concurrent_appenders(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The cadence state is shared, so it is only correct if the lock covers it.
+
+    The clock is frozen for the duration, which makes the expected sync count
+    exact (zero while appending, one for the pending tail at close) no matter how
+    the threads interleave. A racy deadline update would show up as a sync that
+    nothing was due for.
+    """
+    path = tmp_path / "concurrent_interval.wal"
+    recorder = _FsyncRecorder()
+    recorder.install(monkeypatch)
+    clock = _FakeClock()
+    thread_count, per_thread = 8, 25
+
+    writer = WalWriter(
+        path,
+        fsync_policy=FsyncPolicy.INTERVAL,
+        fsync_interval_seconds=30.0,
+        clock=clock,
+    )
+    try:
+        failures = _append_from_threads(writer, thread_count, per_thread)
+    finally:
+        writer.close()
+
+    assert failures == []
+    assert recorder.count == 1, "only the close-time sync of the pending tail was due"
+
+    records = decode_all(path.read_bytes())  # decode_all asserts every checksum
+    assert len(records) == thread_count * per_thread
+    assert {record.key for record in records} == {
+        f"t{thread_index}-k{record_index}".encode()
+        for thread_index in range(thread_count)
+        for record_index in range(per_thread)
+    }

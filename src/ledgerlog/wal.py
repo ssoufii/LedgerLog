@@ -1,10 +1,12 @@
-"""Write-ahead log: file header, record framing and the append-only writer.
+"""Write-ahead log: file header, record framing, the append-only writer and its
+fsync policy.
 
-Scope of this module today (stories M1.1 and M1.2): encoding a put or a delete
-into an on-disk record, stamping every WAL file with a header that carries the
-format version, and appending records to a file in call order. The fsync policy
-(M1.3), sequential replay (M1.4) and torn-write truncation (M1.5) are separate
-stories and are not implemented here.
+Scope of this module today (stories M1.1, M1.2 and M1.3): encoding a put or a
+delete into an on-disk record, stamping every WAL file with a header that
+carries the format version, appending records to a file in call order, and
+deciding how often those bytes are forced from the operating system's page cache
+onto the physical disk. Sequential replay (M1.4) and torn-write truncation
+(M1.5) are separate stories and are not implemented here.
 
 On-disk file layout (little endian, no padding)::
 
@@ -52,11 +54,14 @@ actually remaining in the file before allocating or slicing, which is why
 
 from __future__ import annotations
 
+import math
 import os
 import struct
 import threading
+import time
 import zlib
-from enum import IntEnum
+from collections.abc import Callable
+from enum import IntEnum, StrEnum
 from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO
@@ -100,6 +105,68 @@ class WalOp(IntEnum):
 
     PUT = 1
     DELETE = 2
+
+
+class FsyncPolicy(StrEnum):
+    """When the writer forces appended bytes from the page cache onto the disk.
+
+    A plain ``flush()`` only moves bytes out of Python's buffer into the
+    operating system, where a process crash still leaves them intact but a power
+    loss or kernel panic does not. Only ``fsync`` makes a write survive that, and
+    it is expensive, so the choice is the caller's to make:
+
+    ``ALWAYS``
+        fsync before every append returns. A write that has been acknowledged is
+        on the disk.
+    ``INTERVAL``
+        fsync at most once per configured interval. Acknowledged writes can be
+        lost up to roughly that interval back if the machine loses power, in
+        exchange for amortizing one fsync over every append in the window.
+    ``NEVER``
+        no fsync at all. Durability is left entirely to the operating system's
+        own writeback, which is appropriate only for caches and for tests.
+
+    A string enum so a policy can come straight from a config file or a command
+    line argument without the caller maintaining a lookup table.
+    """
+
+    ALWAYS = "always"
+    INTERVAL = "interval"
+    NEVER = "never"
+
+
+DEFAULT_FSYNC_INTERVAL_SECONDS = 0.1
+"""Default cadence for :attr:`FsyncPolicy.INTERVAL`, in seconds.
+
+100ms is small enough that the exposure window after a power loss stays in the
+range of a single-digit number of writes for most workloads, and large enough
+that a burst of appends collapses into one fsync instead of thousands.
+"""
+
+
+def _coerce_fsync_policy(policy: FsyncPolicy | str) -> FsyncPolicy:
+    """Return ``policy`` as an :class:`FsyncPolicy`, naming the valid values if it is not."""
+    try:
+        return FsyncPolicy(policy)
+    except ValueError:
+        valid = ", ".join(repr(member.value) for member in FsyncPolicy)
+        raise ValueError(f"unknown fsync policy {policy!r}, expected one of {valid}") from None
+
+
+def _validate_fsync_interval(interval_seconds: float) -> float:
+    """Return ``interval_seconds`` if it is a usable cadence, else raise ``ValueError``.
+
+    Rejected up front, in the constructor, rather than at the first append: a
+    NaN interval compares false against every deadline, so an unchecked one would
+    turn the interval policy into the never policy silently, which is exactly the
+    kind of quiet durability downgrade this module exists to prevent.
+    """
+    interval = float(interval_seconds)
+    if not math.isfinite(interval) or interval <= 0:
+        raise ValueError(
+            f"fsync interval must be a finite positive number of seconds, got {interval_seconds!r}"
+        )
+    return interval
 
 
 class WalFormatError(ValueError):
@@ -208,10 +275,19 @@ class WalWriter:
 
     Appends are guarded by a lock. The engine reaches the WAL from more than one
     thread, and the lock is what makes "records land in call order with no gaps
-    or overlaps" true rather than merely likely. Durability is a separate
-    concern: this writer flushes to the operating system on every append, but
-    when the bytes reach the physical disk is decided by the fsync policy in
-    story M1.3.
+    or overlaps" true rather than merely likely. The same lock covers the fsync
+    bookkeeping, so concurrent appenders cannot both decide that the interval
+    deadline is theirs to reset.
+
+    Every append flushes Python's buffer to the operating system. Whether it goes
+    further, onto the physical disk, is the :class:`FsyncPolicy` the writer was
+    opened with. The interval policy checks its deadline on the append path
+    rather than from a background timer thread: a timer would have to take the
+    same lock as the appenders, so it would buy a tighter bound on idle data at
+    the cost of a thread that contends with the write path. The consequence,
+    documented rather than hidden, is that the cadence holds while writes are
+    flowing, and a WAL that goes idle keeps its last few records unsynced until
+    the next append or until :meth:`close`.
 
     Opening a file is where the format version is enforced. A new file is
     stamped with a header before any record can be appended, and an existing one
@@ -226,15 +302,46 @@ class WalWriter:
     header would also overwrite a foreign file that happened to be short.
     """
 
-    def __init__(self, path: str | os.PathLike[str]) -> None:
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        *,
+        fsync_policy: FsyncPolicy | str = FsyncPolicy.ALWAYS,
+        fsync_interval_seconds: float = DEFAULT_FSYNC_INTERVAL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        """Open ``path`` for appending under ``fsync_policy``.
+
+        The default is :attr:`FsyncPolicy.ALWAYS`. A write-ahead log exists to
+        make writes durable, so the default is the one that keeps that promise,
+        and trading it away is something a caller has to ask for.
+
+        ``clock`` is the monotonic time source the interval policy measures its
+        cadence against. It is a parameter so that a test can drive the deadline
+        deterministically instead of sleeping, and because a monotonic source is
+        required for correctness here: a wall clock stepping backwards (an NTP
+        correction) would stall fsyncs for as long as the step.
+        """
         self._path = Path(path)
+        self._fsync_policy = _coerce_fsync_policy(fsync_policy)
+        self._fsync_interval_seconds = _validate_fsync_interval(fsync_interval_seconds)
+        self._clock = clock
         self._lock = threading.Lock()
         self._closed = False
+        # Set before the header write below so a failure there still leaves the
+        # object in a state close() can reason about.
+        self._unsynced = False
+        self._next_fsync_deadline = clock() + self._fsync_interval_seconds
         self._file = open(self._path, "ab")
         try:
             if self._file.tell() == 0:
                 self._file.write(encode_file_header())
                 self._file.flush()
+                # The header is a durable write like any other: under the always
+                # policy it is on the disk before the constructor returns, and
+                # under the others it counts as unsynced bytes for close().
+                self._unsynced = True
+                self._apply_fsync_policy()
                 self._format_version = WAL_FORMAT_VERSION
             else:
                 # Validated through a separate read-only handle so the append
@@ -264,6 +371,16 @@ class WalWriter:
         """
         return self._format_version
 
+    @property
+    def fsync_policy(self) -> FsyncPolicy:
+        """Policy deciding when appended bytes are forced onto the disk."""
+        return self._fsync_policy
+
+    @property
+    def fsync_interval_seconds(self) -> float:
+        """Cadence the :attr:`FsyncPolicy.INTERVAL` policy syncs on, in seconds."""
+        return self._fsync_interval_seconds
+
     def append_put(self, key: bytes, value: bytes) -> int:
         """Append a PUT record and return the byte offset it was written at."""
         return self._append(encode_record(WalOp.PUT, key, value))
@@ -276,15 +393,47 @@ class WalWriter:
         """
         return self._append(encode_record(WalOp.DELETE, key, b""))
 
+    def sync(self) -> None:
+        """Force everything appended so far onto the disk, whatever the policy says.
+
+        This is the escape hatch a caller needs under the interval and never
+        policies: an engine that is about to acknowledge something stronger than
+        its usual write (a checkpoint, a flush, a clean shutdown) can make the
+        log durable at that one point without paying for a fsync on every
+        append.
+        """
+        with self._lock:
+            if self._closed:
+                raise ValueError("cannot sync a closed WalWriter")
+            self._file.flush()
+            self._fsync_now()
+
     def close(self) -> None:
-        """Close the underlying file. Safe to call more than once."""
+        """Close the underlying file. Safe to call more than once.
+
+        A clean close syncs any bytes still pending, under every policy except
+        never. A policy is a statement about how often a running writer syncs,
+        not permission to discard the tail of the log on the way out, and a
+        caller that closes has stopped appending, so nothing else will come along
+        to trigger the pending sync. The never policy is the one exception: it
+        asks for no fsync calls at all, and close does not overrule that.
+
+        The file handle is closed even if that final fsync fails, and the failure
+        is then raised, because a caller who is told the close succeeded would
+        otherwise assume a durability the disk never confirmed.
+        """
         with self._lock:
             if self._closed:
                 return
             try:
-                self._file.close()
+                if self._unsynced and self._fsync_policy is not FsyncPolicy.NEVER:
+                    self._file.flush()
+                    self._fsync_now()
             finally:
-                self._closed = True
+                try:
+                    self._file.close()
+                finally:
+                    self._closed = True
 
     def __enter__(self) -> WalWriter:
         return self
@@ -301,9 +450,38 @@ class WalWriter:
         with self._lock:
             if self._closed:
                 raise ValueError("cannot append to a closed WalWriter")
+            # Marked before the write rather than after it: a write that raises
+            # partway can still have put bytes in the file, and syncing bytes
+            # that turned out to be already durable is harmless, while skipping a
+            # sync for bytes that were not is how a log loses records.
+            self._unsynced = True
             self._file.write(record)
             self._file.flush()
             # The start offset is derived after the flush rather than read before the
             # write, because the file is opened O_APPEND: the kernel picks the write
             # position at write time, so a position sampled beforehand is a guess.
-            return self._file.tell() - len(record)
+            offset = self._file.tell() - len(record)
+            # Sampled before the fsync so that an append reporting an offset has
+            # also honored the policy for the bytes at that offset.
+            self._apply_fsync_policy()
+            return offset
+
+    def _apply_fsync_policy(self) -> None:
+        """Sync if the policy calls for it. Caller holds the lock, or is the constructor."""
+        if self._fsync_policy is FsyncPolicy.ALWAYS:
+            self._fsync_now()
+        elif self._fsync_policy is FsyncPolicy.INTERVAL:
+            if self._clock() >= self._next_fsync_deadline:
+                self._fsync_now()
+
+    def _fsync_now(self) -> None:
+        """Force the file's bytes onto the disk and restart the interval cadence.
+
+        The deadline is set from the time after the fsync returns, not from the
+        time it was due, so a sync that takes longer than the interval does not
+        immediately owe another one. Caller holds the lock, or is the
+        constructor.
+        """
+        os.fsync(self._file.fileno())
+        self._unsynced = False
+        self._next_fsync_deadline = self._clock() + self._fsync_interval_seconds
