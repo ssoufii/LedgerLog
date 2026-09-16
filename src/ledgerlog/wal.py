@@ -1,12 +1,15 @@
 """Write-ahead log: file header, record framing, the append-only writer and its
-fsync policy.
+fsync policy, and the sequential reader.
 
-Scope of this module today (stories M1.1, M1.2 and M1.3): encoding a put or a
-delete into an on-disk record, stamping every WAL file with a header that
-carries the format version, appending records to a file in call order, and
-deciding how often those bytes are forced from the operating system's page cache
-onto the physical disk. Sequential replay (M1.4) and torn-write truncation
-(M1.5) are separate stories and are not implemented here.
+Scope of this module today (stories M1.1, M1.2, M1.3 and M1.4): encoding a put
+or a delete into an on-disk record, stamping every WAL file with a header that
+carries the format version, appending records to a file in call order, deciding
+how often those bytes are forced from the operating system's page cache onto the
+physical disk, and reading records back in the order they were written.
+Torn-write and checksum-mismatch handling (M1.5), which turns an unreadable tail
+into a truncation rather than an error, is a separate story and is not
+implemented here: the reader below reports where it stopped and leaves the file
+untouched.
 
 On-disk file layout (little endian, no padding)::
 
@@ -46,9 +49,10 @@ value.
 
 The payload length itself is deliberately not covered by the CRC32, because it
 is the field a reader needs before it can read anything else. A corrupted length
-is still caught: the bytes it selects will not match the stored checksum. The
-reader story (M1.4) is responsible for validating a length against the bytes
-actually remaining in the file before allocating or slicing, which is why
+is still caught: the bytes it selects will not match the stored checksum, which
+is what the replay story (M1.5) checks. Before then, and independently of the
+checksum, :func:`iter_records` validates a length against the bytes actually
+remaining in the file before allocating or slicing anything, which is why
 ``MAX_PAYLOAD_SIZE`` below is part of the format rather than a writer detail.
 """
 
@@ -60,7 +64,8 @@ import struct
 import threading
 import time
 import zlib
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from enum import IntEnum, StrEnum
 from pathlib import Path
 from types import TracebackType
@@ -182,6 +187,40 @@ class WalHeaderError(WalFormatError):
     """
 
 
+class WalRecordError(WalFormatError):
+    """Raised when the bytes at a given offset cannot be read as a record.
+
+    Carries the offset the bad record starts at, because that offset is the only
+    thing recovery can do something with: it is where a reader stopped trusting
+    the file, and (from M1.5 onwards) where the file gets truncated.
+    """
+
+    def __init__(self, message: str, offset: int) -> None:
+        super().__init__(f"{message} (record at byte offset {offset})")
+        self.offset = offset
+
+
+class WalTruncatedRecordError(WalRecordError):
+    """Raised when a record claims more bytes than the file actually holds.
+
+    This is the shape a crash mid-append leaves behind: a record header, or a
+    header plus part of a payload, with the rest never written. Kept distinct
+    from :class:`WalInvalidRecordError` because a short tail is an expected
+    outcome of a power loss, while a record whose own fields contradict each
+    other means the bytes on disk are damaged rather than merely incomplete.
+    """
+
+
+class WalInvalidRecordError(WalRecordError):
+    """Raised when a record's fields are internally inconsistent or out of range.
+
+    A payload length below the minimum or above :data:`MAX_PAYLOAD_SIZE`, a key
+    length reaching past the end of its own payload, an op byte that is not a
+    :class:`WalOp`, or a DELETE carrying a value: each of these means the bytes
+    cannot be the ones the writer produced, whatever the file's length says.
+    """
+
+
 class WalUnsupportedVersionError(WalHeaderError):
     """Raised when a WAL header carries a format version this build does not know."""
 
@@ -262,6 +301,71 @@ def encode_record(op: WalOp, key: bytes, value: bytes) -> bytes:
     payload = struct.pack(_PAYLOAD_HEADER_FORMAT, int(op), len(key)) + key + value
     checksum = zlib.crc32(payload) & 0xFFFFFFFF
     return struct.pack(_RECORD_HEADER_FORMAT, len(payload), checksum) + payload
+
+
+@dataclass(frozen=True)
+class WalRecord:
+    """One decoded WAL record, with the span of the file it came from.
+
+    Frozen because a record is a decoded view of bytes that are already on disk
+    and immutable there. Replay hands these to the memtable, and an accidental
+    mutation on the way would make the recovered state disagree with the log.
+
+    The offsets are part of the record rather than something the caller tracks
+    separately: recovery reports where it stopped, and (from M1.5) truncates
+    there, so every record has to know where it began and ended.
+    """
+
+    op: WalOp
+    key: bytes
+    value: bytes
+    offset: int
+    end_offset: int
+
+
+def decode_payload(payload: bytes, *, offset: int = 0) -> tuple[WalOp, bytes, bytes]:
+    """Decode a record payload into its op, key and value.
+
+    ``offset`` is the record's position in the file and is used only to make
+    errors point at the right place, so decoding a payload in isolation (a test,
+    a debugging session) does not have to invent one.
+
+    Every field is checked against the payload's own length before it is used to
+    slice: a key length read from a damaged file can claim far more than the
+    payload holds, and a slice would silently return a short key rather than
+    reporting the damage.
+    """
+    if len(payload) < PAYLOAD_HEADER_SIZE:
+        raise WalInvalidRecordError(
+            f"record payload is {len(payload)} bytes, too short to hold the "
+            f"{PAYLOAD_HEADER_SIZE} byte op and key length header",
+            offset,
+        )
+
+    op_code, key_length = struct.unpack(_PAYLOAD_HEADER_FORMAT, payload[:PAYLOAD_HEADER_SIZE])
+    try:
+        op = WalOp(op_code)
+    except ValueError:
+        raise WalInvalidRecordError(f"unknown WAL op code {op_code}", offset) from None
+
+    available = len(payload) - PAYLOAD_HEADER_SIZE
+    if key_length > available:
+        raise WalInvalidRecordError(
+            f"record claims a {key_length} byte key but only {available} payload bytes follow "
+            "its header",
+            offset,
+        )
+
+    key_end = PAYLOAD_HEADER_SIZE + key_length
+    key = payload[PAYLOAD_HEADER_SIZE:key_end]
+    value = payload[key_end:]
+    if op is WalOp.DELETE and value:
+        raise WalInvalidRecordError(
+            f"DELETE record carries a {len(value)} byte value, but the format's "
+            "empty-value convention requires none",
+            offset,
+        )
+    return op, key, value
 
 
 class WalWriter:
@@ -485,3 +589,197 @@ class WalWriter:
         os.fsync(self._file.fileno())
         self._unsynced = False
         self._next_fsync_deadline = self._clock() + self._fsync_interval_seconds
+
+
+def _stream_size(stream: BinaryIO) -> int:
+    """Return the total size of a seekable stream, leaving its position unchanged."""
+    position = stream.tell()
+    try:
+        return stream.seek(0, os.SEEK_END)
+    finally:
+        stream.seek(position)
+
+
+def iter_records(stream: BinaryIO, *, file_size: int | None = None) -> Iterator[WalRecord]:
+    """Yield records from ``stream``, which must be positioned at a record boundary.
+
+    The header is not read here. A caller that has an open WAL has already
+    validated the version through :func:`read_file_header` (or is using
+    :class:`WalReader`, which does it for them), and repeating that check per
+    iteration would mean seeking backwards in a file this module only ever reads
+    forwards.
+
+    ``file_size`` is the bound every record length is checked against, sampled
+    once by default. Sampling once rather than per record is what makes a read
+    concurrent with an append return a consistent prefix of the log: records
+    written after iteration starts are outside the snapshot and are simply not
+    returned, instead of appearing partway through and turning a tail that was
+    complete a moment ago into a torn one.
+
+    Records are read one at a time rather than by loading the file, because a WAL
+    is sized by how much has been written since the last flush, not by what fits
+    in memory, and recovery consumes it strictly in order.
+
+    A length is validated against the bytes actually remaining before a single
+    one of them is read, so a corrupted 32 bit length cannot make this function
+    allocate for a record that was never written. Both an out of range length and
+    a payload that reaches past the end of the file raise rather than being
+    trimmed to fit, since either means the caller is looking at damage, and
+    guessing what the writer meant is how a log resurrects a record it never
+    stored.
+
+    What this function does not do is verify the CRC32: that is story M1.5,
+    along with truncating the file at the first record that fails. Nothing here
+    writes to ``stream``.
+    """
+    if file_size is None:
+        if not stream.seekable():
+            raise ValueError(
+                "iter_records needs a seekable stream, or an explicit file_size, so that "
+                "record lengths can be bounds checked before they are read"
+            )
+        file_size = _stream_size(stream)
+    return _iter_records(stream, file_size)
+
+
+def _iter_records(stream: BinaryIO, file_size: int) -> Iterator[WalRecord]:
+    """Generator half of :func:`iter_records`, kept separate so its argument checks run eagerly."""
+    while True:
+        offset = stream.tell()
+        remaining = file_size - offset
+        if remaining <= 0:
+            return
+        if remaining < RECORD_HEADER_SIZE:
+            raise WalTruncatedRecordError(
+                f"{remaining} bytes remain in the file, fewer than the "
+                f"{RECORD_HEADER_SIZE} byte record header",
+                offset,
+            )
+
+        raw_header = stream.read(RECORD_HEADER_SIZE)
+        if len(raw_header) < RECORD_HEADER_SIZE:
+            # The file shrank between the size sample and this read.
+            raise WalTruncatedRecordError(
+                f"read {len(raw_header)} of {RECORD_HEADER_SIZE} record header bytes", offset
+            )
+
+        payload_length, _checksum = struct.unpack(_RECORD_HEADER_FORMAT, raw_header)
+        if payload_length < PAYLOAD_HEADER_SIZE:
+            raise WalInvalidRecordError(
+                f"record claims a {payload_length} byte payload, below the "
+                f"{PAYLOAD_HEADER_SIZE} byte minimum for an op and a key length",
+                offset,
+            )
+        if payload_length > MAX_PAYLOAD_SIZE:
+            raise WalInvalidRecordError(
+                f"record claims a {payload_length} byte payload, above the "
+                f"{MAX_PAYLOAD_SIZE} byte format limit",
+                offset,
+            )
+        available = remaining - RECORD_HEADER_SIZE
+        if payload_length > available:
+            raise WalTruncatedRecordError(
+                f"record claims a {payload_length} byte payload but only {available} bytes "
+                "remain in the file",
+                offset,
+            )
+
+        payload = stream.read(payload_length)
+        if len(payload) < payload_length:
+            raise WalTruncatedRecordError(
+                f"read {len(payload)} of {payload_length} payload bytes", offset
+            )
+
+        op, key, value = decode_payload(payload, offset=offset)
+        yield WalRecord(
+            op=op,
+            key=key,
+            value=value,
+            offset=offset,
+            end_offset=offset + RECORD_HEADER_SIZE + payload_length,
+        )
+
+
+class WalReader:
+    """Sequential, read-only reader over a WAL file.
+
+    Opening validates the file header (magic and format version) before any
+    record is parsed, so a file in a layout this build does not understand is
+    rejected while it is still just a file, rather than after its bytes have been
+    interpreted as records and handed to recovery.
+
+    The handle is opened read-only and the reader never writes, truncates or
+    deletes. Recovery's response to a damaged tail (truncate at the first bad
+    record) is story M1.5 and belongs to the replay path, not to the reader:
+    keeping the two apart means a tool can inspect a suspect log without the act
+    of looking at it changing what is there.
+
+    Iterating more than once is allowed and starts again from the first record.
+    A one-shot reader would force a caller who wants two passes (count the
+    records, then replay them) to reopen the file, and reopening is exactly what
+    would let the file change underneath the two passes. The passes are
+    sequential, not simultaneous: every iterator moves the one file position this
+    reader owns, so a caller that wants two live cursors needs two readers.
+    """
+
+    def __init__(self, path: str | os.PathLike[str]) -> None:
+        """Open ``path`` for reading and validate its WAL header."""
+        self._path = Path(path)
+        self._closed = False
+        self._file = open(self._path, "rb")
+        try:
+            self._format_version = read_file_header(self._file)
+            # Sampled once, here, for the reasons given in iter_records: every
+            # pass over this reader bounds record lengths against the same size.
+            self._file_size = _stream_size(self._file)
+        except BaseException:
+            self._file.close()
+            self._closed = True
+            raise
+
+    @property
+    def path(self) -> Path:
+        """Path of the WAL file being read."""
+        return self._path
+
+    @property
+    def closed(self) -> bool:
+        """True once :meth:`close` has run."""
+        return self._closed
+
+    @property
+    def format_version(self) -> int:
+        """Format version read from the file's own header."""
+        return self._format_version
+
+    @property
+    def file_size(self) -> int:
+        """Size of the file in bytes, as sampled when the reader was opened."""
+        return self._file_size
+
+    def __iter__(self) -> Iterator[WalRecord]:
+        """Yield every record in the file, in the order it was written."""
+        if self._closed:
+            raise ValueError("cannot read from a closed WalReader")
+        self._file.seek(FILE_HEADER_SIZE)
+        return iter_records(self._file, file_size=self._file_size)
+
+    def close(self) -> None:
+        """Close the underlying file. Safe to call more than once."""
+        if self._closed:
+            return
+        try:
+            self._file.close()
+        finally:
+            self._closed = True
+
+    def __enter__(self) -> WalReader:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()

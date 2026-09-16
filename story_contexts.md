@@ -19,3 +19,19 @@ This matters because the way entries are arranged in the file may change in futu
 Writing to a file does not actually put the data on the disk. The operating system usually holds it in memory for a while first, which is fast but means a power cut can lose it. The only way to be sure is to ask the disk to confirm, and that confirmation is slow. This change lets the caller choose how often to ask: on every single write, once every so often (a tenth of a second by default), or never. The safe choice is the default, so giving up safety for speed has to be a deliberate decision.
 
 This matters because different applications want different things. A system recording payments will want every write confirmed before it says yes to anyone, while a system building a throwaway cache would rather have the speed. There is also a way to ask for a confirmation on demand, and closing the log cleanly confirms anything still waiting, so shutting down does not quietly throw away the most recent entries.
+
+## Story M1.4: Sequential WAL reader
+
+The log can now be read back. A reader opens a log file, checks the label at the
+front to be sure it understands the layout, and then hands back each entry in the
+exact order it was written, saying for each one whether it was a set or a delete,
+which key it touched and what value it carried. An empty log, one with a label
+and nothing else, simply comes back with no entries rather than an error.
+
+This matters because a log nobody can read is not a safety net. It also matters
+that the reader is suspicious: before it takes an entry at its word about how
+long it is, it checks that many bytes are really there, so a damaged or
+half-written file cannot make the program grab an enormous amount of memory or
+read past the end of the file. It reports where it stopped and leaves the file
+exactly as it found it, which is what the next piece of work needs in order to
+decide what to trim.

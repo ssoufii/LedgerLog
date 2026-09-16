@@ -1,13 +1,17 @@
-"""Tests for the WAL file header, record framing, append-only writer and fsync policy.
+"""Tests for the WAL file header, record framing, append-only writer, fsync policy
+and sequential reader.
 
 Covers stories M1.1 (record framing, append writer), M1.2 (file header with a
-format version byte) and M1.3 (configurable fsync policy).
+format version byte), M1.3 (configurable fsync policy) and M1.4 (sequential
+reader).
 
-The bytes are decoded here with plain ``struct`` calls rather than with a reader
-from the library, because the point of these tests is that what lands on disk
-matches the documented layout. A decoder that shared code with the encoder could
-agree with it and still be wrong about the format. The sequential reader is
-story M1.4.
+The writer tests decode bytes with plain ``struct`` calls rather than with the
+reader from the library, because the point of those tests is that what lands on
+disk matches the documented layout. A decoder that shared code with the encoder
+could agree with it and still be wrong about the format. The reader tests go the
+other way: they build files the writer would never produce, so that the reader's
+bounds checks are exercised against real damage rather than against well-formed
+input.
 """
 
 from __future__ import annotations
@@ -28,6 +32,7 @@ from ledgerlog import wal
 from ledgerlog.wal import (
     DEFAULT_FSYNC_INTERVAL_SECONDS,
     FILE_HEADER_SIZE,
+    MAX_PAYLOAD_SIZE,
     PAYLOAD_HEADER_SIZE,
     RECORD_HEADER_SIZE,
     WAL_FORMAT_VERSION,
@@ -35,11 +40,16 @@ from ledgerlog.wal import (
     FsyncPolicy,
     WalFormatError,
     WalHeaderError,
+    WalInvalidRecordError,
     WalOp,
+    WalReader,
+    WalTruncatedRecordError,
     WalUnsupportedVersionError,
     WalWriter,
+    decode_payload,
     encode_file_header,
     encode_record,
+    iter_records,
     read_file_header,
     read_file_header_from_path,
 )
@@ -796,3 +806,412 @@ def test_interval_policy_deadline_is_not_raced_by_concurrent_appenders(
         for thread_index in range(thread_count)
         for record_index in range(per_thread)
     }
+
+
+# --- Sequential reader (story M1.4) ------------------------------------------
+
+
+def write_raw_wal(path: Path, *record_bytes: bytes) -> Path:
+    """Write a WAL file with a valid header followed by the given raw record bytes.
+
+    Built here rather than through WalWriter because most of these tests need a
+    file the writer would never produce (a length field claiming more bytes than
+    exist, an op code no writer emits), which is exactly what a reader has to
+    survive.
+    """
+    path.write_bytes(encode_file_header() + b"".join(record_bytes))
+    return path
+
+
+class _ReadSizeRecorder(io.BytesIO):
+    """A BytesIO that remembers the largest single read it was ever asked for.
+
+    Used to assert that a corrupted length field never reaches a read call: the
+    difference between rejecting a bogus length and honoring it is invisible in
+    the raised exception but very visible in how many bytes were requested.
+    """
+
+    def __init__(self, data: bytes) -> None:
+        super().__init__(data)
+        self.max_read_request = 0
+
+    def read(self, size: int | None = -1, /) -> bytes:
+        if size is not None and size >= 0:
+            self.max_read_request = max(self.max_read_request, size)
+        return super().read(size)
+
+
+def read_all(path: Path) -> list[wal.WalRecord]:
+    with WalReader(path) as reader:
+        return list(reader)
+
+
+def test_reader_yields_every_record_in_write_order(tmp_path: Path) -> None:
+    path = tmp_path / "order.wal"
+    expected = [
+        (WalOp.PUT, b"k1", b"v1"),
+        (WalOp.DELETE, b"k1", b""),
+        (WalOp.PUT, b"k2", b""),
+        (WalOp.PUT, b"\x00\xffbinary", b"\x01\x02\x03"),
+        (WalOp.PUT, b"k3", b"x" * 5000),
+        (WalOp.DELETE, b"", b""),
+    ]
+
+    offsets: list[int] = []
+    with WalWriter(path) as writer:
+        for op, key, value in expected:
+            if op is WalOp.PUT:
+                offsets.append(writer.append_put(key, value))
+            else:
+                offsets.append(writer.append_delete(key))
+
+    records = read_all(path)
+    assert [(r.op, r.key, r.value) for r in records] == expected
+    assert [r.offset for r in records] == offsets
+
+
+def test_reader_reports_contiguous_record_spans(tmp_path: Path) -> None:
+    """Each record's end offset is the next one's start, and the last one ends at EOF."""
+    path = tmp_path / "spans.wal"
+    with WalWriter(path) as writer:
+        writer.append_put(b"alpha", b"one")
+        writer.append_delete(b"beta")
+        writer.append_put(b"gamma", b"three")
+
+    records = read_all(path)
+    assert records[0].offset == FILE_HEADER_SIZE
+    for earlier, later in zip(records, records[1:], strict=False):
+        assert earlier.end_offset == later.offset
+    assert records[-1].end_offset == path.stat().st_size
+
+
+def test_reader_round_trips_many_records(tmp_path: Path) -> None:
+    path = tmp_path / "many.wal"
+    written = [(f"key-{index:04d}".encode(), b"v" * (index % 37)) for index in range(500)]
+
+    with WalWriter(path, fsync_policy=FsyncPolicy.NEVER) as writer:
+        for key, value in written:
+            writer.append_put(key, value)
+
+    records = read_all(path)
+    assert [(r.key, r.value) for r in records] == written
+
+
+def test_reader_on_header_only_file_yields_no_records(tmp_path: Path) -> None:
+    path = tmp_path / "empty.wal"
+    with WalWriter(path):
+        pass
+
+    assert path.stat().st_size == FILE_HEADER_SIZE
+    assert read_all(path) == []
+
+
+def test_reader_validates_the_header_before_any_record(tmp_path: Path) -> None:
+    """A file this build cannot parse is rejected at open, not decoded as records."""
+    record = encode_record(WalOp.PUT, b"alpha", b"one")
+
+    future = tmp_path / "future.wal"
+    future.write_bytes(encode_file_header(WAL_FORMAT_VERSION + 1) + record)
+    with pytest.raises(WalUnsupportedVersionError):
+        WalReader(future)
+
+    foreign = tmp_path / "foreign.wal"
+    foreign.write_bytes(b"NOTAWAL!" + bytes([WAL_FORMAT_VERSION]) + record)
+    with pytest.raises(WalHeaderError):
+        WalReader(foreign)
+
+    empty = tmp_path / "zero.wal"
+    empty.write_bytes(b"")
+    with pytest.raises(WalHeaderError):
+        WalReader(empty)
+
+
+def test_reader_rejects_a_length_reaching_past_the_end_of_the_file(tmp_path: Path) -> None:
+    """The prior records still come back; the record that overruns the file does not."""
+    good = [encode_record(WalOp.PUT, b"k1", b"v1"), encode_record(WalOp.DELETE, b"k2", b"")]
+    overrun_payload = struct.pack("<BI", int(WalOp.PUT), 3) + b"key" + b"value"
+    # A header claiming twice the payload that follows it.
+    overrun = struct.pack("<II", len(overrun_payload) * 2, 0) + overrun_payload
+    path = write_raw_wal(tmp_path / "overrun.wal", *good, overrun)
+
+    with WalReader(path) as reader:
+        iterator = iter(reader)
+        recovered = [next(iterator), next(iterator)]
+        with pytest.raises(WalTruncatedRecordError) as excinfo:
+            next(iterator)
+
+    assert [(r.op, r.key, r.value) for r in recovered] == [
+        (WalOp.PUT, b"k1", b"v1"),
+        (WalOp.DELETE, b"k2", b""),
+    ]
+    assert excinfo.value.offset == FILE_HEADER_SIZE + len(good[0]) + len(good[1])
+
+
+@pytest.mark.parametrize(
+    ("kept_payload_bytes", "description"),
+    [
+        (-6, "mid length field"),
+        (-3, "mid checksum"),
+        (2, "mid payload"),
+    ],
+)
+def test_reader_rejects_a_truncated_tail_record(
+    tmp_path: Path, kept_payload_bytes: int, description: str
+) -> None:
+    """A crash mid-append leaves a short tail, whichever field it lands in."""
+    complete = encode_record(WalOp.PUT, b"k1", b"v1")
+    torn = encode_record(WalOp.PUT, b"k2", b"v2")
+    kept = RECORD_HEADER_SIZE + kept_payload_bytes
+    path = write_raw_wal(tmp_path / "torn.wal", complete, torn[:kept])
+
+    with WalReader(path) as reader:
+        iterator = iter(reader)
+        first = next(iterator)
+        with pytest.raises(WalTruncatedRecordError) as excinfo:
+            next(iterator)
+
+    assert (first.key, first.value) == (b"k1", b"v1"), description
+    assert excinfo.value.offset == FILE_HEADER_SIZE + len(complete)
+
+
+def test_reader_rejects_a_length_above_the_format_limit_without_over_reading(
+    tmp_path: Path,
+) -> None:
+    """A 32 bit length off a damaged disk must not become a multi-gigabyte allocation."""
+    header = struct.pack("<II", MAX_PAYLOAD_SIZE + 1, 0)
+    raw = encode_file_header() + header
+
+    stream = _ReadSizeRecorder(raw)
+    assert read_file_header(stream) == WAL_FORMAT_VERSION
+    with pytest.raises(WalInvalidRecordError) as excinfo:
+        list(iter_records(stream))
+
+    assert excinfo.value.offset == FILE_HEADER_SIZE
+    assert stream.max_read_request <= len(raw)
+
+    path = write_raw_wal(tmp_path / "huge.wal", header)
+    with pytest.raises(WalInvalidRecordError):
+        read_all(path)
+
+
+def test_reader_never_requests_more_bytes_than_the_file_holds() -> None:
+    """Every read is bounded by the file, including for a length that merely overruns it."""
+    payload = struct.pack("<BI", int(WalOp.PUT), 3) + b"key"
+    raw = encode_file_header() + struct.pack("<II", 4096, 0) + payload
+
+    stream = _ReadSizeRecorder(raw)
+    read_file_header(stream)
+    with pytest.raises(WalTruncatedRecordError):
+        list(iter_records(stream))
+
+    assert stream.max_read_request <= len(raw)
+
+
+def test_reader_rejects_a_payload_length_below_the_minimum(tmp_path: Path) -> None:
+    path = write_raw_wal(tmp_path / "short.wal", struct.pack("<II", PAYLOAD_HEADER_SIZE - 1, 0))
+    with pytest.raises(WalInvalidRecordError):
+        read_all(path)
+
+
+def test_reader_rejects_a_key_length_reaching_past_its_payload(tmp_path: Path) -> None:
+    """The key/value boundary is bounds checked, not clamped to whatever is there."""
+    payload = struct.pack("<BI", int(WalOp.PUT), 99) + b"key" + b"value"
+    record = struct.pack("<II", len(payload), zlib.crc32(payload) & 0xFFFFFFFF) + payload
+    path = write_raw_wal(tmp_path / "boundary.wal", record)
+
+    with pytest.raises(WalInvalidRecordError) as excinfo:
+        read_all(path)
+    assert excinfo.value.offset == FILE_HEADER_SIZE
+
+
+def test_reader_rejects_an_unknown_op_code(tmp_path: Path) -> None:
+    payload = struct.pack("<BI", 0, 3) + b"key"
+    record = struct.pack("<II", len(payload), zlib.crc32(payload) & 0xFFFFFFFF) + payload
+    path = write_raw_wal(tmp_path / "op.wal", record)
+
+    with pytest.raises(WalInvalidRecordError):
+        read_all(path)
+
+
+def test_reader_rejects_a_delete_carrying_a_value(tmp_path: Path) -> None:
+    """The empty-value convention is a format rule, so the reader enforces it too."""
+    payload = struct.pack("<BI", int(WalOp.DELETE), 3) + b"key" + b"value"
+    record = struct.pack("<II", len(payload), zlib.crc32(payload) & 0xFFFFFFFF) + payload
+    path = write_raw_wal(tmp_path / "valued-delete.wal", record)
+
+    with pytest.raises(WalInvalidRecordError):
+        read_all(path)
+
+
+def test_decode_payload_reports_the_offset_it_was_given() -> None:
+    with pytest.raises(WalInvalidRecordError) as excinfo:
+        decode_payload(struct.pack("<BI", int(WalOp.PUT), 10) + b"key", offset=123)
+    assert excinfo.value.offset == 123
+    assert "123" in str(excinfo.value)
+
+    with pytest.raises(WalInvalidRecordError):
+        decode_payload(b"\x01\x02")
+
+
+def test_reading_a_damaged_file_leaves_its_bytes_untouched(tmp_path: Path) -> None:
+    """Truncating at the first bad record is M1.5's job; looking must not change the log."""
+    complete = encode_record(WalOp.PUT, b"k1", b"v1")
+    torn = encode_record(WalOp.PUT, b"k2", b"v2")[:4]
+    path = write_raw_wal(tmp_path / "untouched.wal", complete, torn)
+    before = path.read_bytes()
+
+    with pytest.raises(WalTruncatedRecordError):
+        read_all(path)
+
+    assert path.read_bytes() == before
+
+
+def test_reader_can_be_iterated_more_than_once(tmp_path: Path) -> None:
+    path = tmp_path / "reiterate.wal"
+    with WalWriter(path) as writer:
+        writer.append_put(b"alpha", b"one")
+        writer.append_delete(b"beta")
+
+    with WalReader(path) as reader:
+        first_pass = [(r.op, r.key, r.value) for r in reader]
+        second_pass = [(r.op, r.key, r.value) for r in reader]
+
+    assert first_pass == second_pass
+    assert len(first_pass) == 2
+
+
+def test_records_appended_after_open_are_outside_the_reader_snapshot(tmp_path: Path) -> None:
+    """The size sampled at open is what bounds the read, so a concurrent append is not half seen."""
+    path = tmp_path / "snapshot.wal"
+    with WalWriter(path, fsync_policy=FsyncPolicy.NEVER) as writer:
+        writer.append_put(b"before", b"1")
+        writer.sync()
+
+        with WalReader(path) as reader:
+            writer.append_put(b"after", b"2")
+            writer.sync()
+            keys = [record.key for record in reader]
+
+    assert keys == [b"before"]
+    assert [record.key for record in read_all(path)] == [b"before", b"after"]
+
+
+def test_reader_releases_its_file_handle(tmp_path: Path) -> None:
+    path = tmp_path / "handle.wal"
+    with WalWriter(path) as writer:
+        writer.append_put(b"alpha", b"one")
+
+    reader = WalReader(path)
+    assert reader.path == path
+    assert reader.format_version == WAL_FORMAT_VERSION
+    assert reader.file_size == path.stat().st_size
+    assert not reader.closed
+
+    handle = reader._file
+    reader.close()
+    reader.close()  # idempotent
+    assert reader.closed
+    assert handle.closed
+
+    with pytest.raises(ValueError, match="closed"):
+        iter(reader)
+
+
+def test_rejected_reader_open_does_not_leak_a_file_handle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "bad-version.wal"
+    path.write_bytes(encode_file_header(WAL_FORMAT_VERSION + 1))
+
+    opened: list[Any] = []
+    real_open = builtins.open
+
+    def tracking_open(*args: Any, **kwargs: Any) -> Any:
+        handle = real_open(*args, **kwargs)
+        opened.append(handle)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+    with pytest.raises(WalUnsupportedVersionError):
+        WalReader(path)
+
+    assert opened, "the reader opened no file at all"
+    assert all(handle.closed for handle in opened)
+
+
+def test_iter_records_needs_a_bound_it_can_check_lengths_against() -> None:
+    class _Unseekable(io.RawIOBase):
+        def readable(self) -> bool:
+            return True
+
+        def seekable(self) -> bool:
+            return False
+
+    with pytest.raises(ValueError, match="seekable"):
+        iter_records(_Unseekable())
+
+
+def test_iter_records_accepts_an_explicit_file_size() -> None:
+    record = encode_record(WalOp.PUT, b"alpha", b"one")
+    stream = io.BytesIO(encode_file_header() + record)
+    read_file_header(stream)
+
+    records = list(iter_records(stream, file_size=FILE_HEADER_SIZE + len(record)))
+    assert [(r.op, r.key, r.value) for r in records] == [(WalOp.PUT, b"alpha", b"one")]
+
+
+def test_reading_while_a_writer_appends_returns_an_intact_prefix(tmp_path: Path) -> None:
+    """A reader opened against a live WAL sees whole records, never half of one.
+
+    Threads rather than an interleaved single-threaded sequence, because the
+    claim is about a read that overlaps an append in time, and only a real
+    writer thread running against real reader threads can put the reader's size
+    sample in the middle of the writer's work.
+    """
+    path = tmp_path / "live.wal"
+    record_count = 400
+    expected_keys = [f"k{index:04d}".encode() for index in range(record_count)]
+
+    failures: list[Exception] = []
+    reads: list[list[bytes]] = []
+    writing_done = threading.Event()
+
+    def write_records(writer: WalWriter) -> None:
+        try:
+            for index, key in enumerate(expected_keys):
+                writer.append_put(key, b"v" * (index % 20))
+        except Exception as exc:
+            # Collected rather than swallowed: the test asserts this is empty.
+            failures.append(exc)
+        finally:
+            writing_done.set()
+
+    def read_until_writing_stops() -> None:
+        try:
+            while True:
+                still_writing = not writing_done.is_set()
+                with WalReader(path) as reader:
+                    keys = [record.key for record in reader]
+                reads.append(keys)
+                if not still_writing:
+                    return
+        except Exception as exc:
+            # Collected rather than swallowed: the test asserts this is empty.
+            failures.append(exc)
+
+    with WalWriter(path, fsync_policy=FsyncPolicy.NEVER) as writer:
+        writer_thread = threading.Thread(target=write_records, args=(writer,))
+        reader_threads = [threading.Thread(target=read_until_writing_stops) for _ in range(4)]
+        writer_thread.start()
+        for thread in reader_threads:
+            thread.start()
+        writer_thread.join(timeout=30)
+        for thread in reader_threads:
+            thread.join(timeout=30)
+
+    assert failures == [], f"reads raised while the writer was appending: {failures!r}"
+    assert not writer_thread.is_alive() and all(not t.is_alive() for t in reader_threads)
+    assert reads, "no reader completed a pass"
+    for keys in reads:
+        assert keys == expected_keys[: len(keys)], "a read returned something other than a prefix"
+    assert max(len(keys) for keys in reads) == record_count, "no reader saw the finished log"
