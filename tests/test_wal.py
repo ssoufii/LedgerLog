@@ -1249,3 +1249,386 @@ def test_reading_while_a_writer_appends_yields_whole_records_in_order(tmp_path: 
     complete = [keys for keys, truncation in reads if truncation is None]
     assert complete, "no reader completed a pass without hitting the tail"
     assert max(len(keys) for keys in complete) == record_count, "no reader saw the finished log"
+
+
+# --- Torn-write and corruption detection with truncation (story M1.5) --------
+
+
+def build_log(path: Path, *records: tuple[WalOp, bytes, bytes]) -> list[bytes]:
+    """Write a well-formed log through the writer, returning each record's raw bytes.
+
+    The raw bytes are what the damage in these tests is inflicted on: a test that
+    wants to cut a record in half, or flip a byte inside one, needs to know
+    exactly where that record sits in the file.
+    """
+    encoded = [encode_record(op, key, value) for op, key, value in records]
+    with WalWriter(path) as writer:
+        for op, key, value in records:
+            if op is WalOp.PUT:
+                writer.append_put(key, value)
+            else:
+                writer.append_delete(key)
+    assert path.stat().st_size == FILE_HEADER_SIZE + sum(len(r) for r in encoded)
+    return encoded
+
+
+def corrupt_byte(path: Path, offset: int) -> None:
+    """Flip every bit of the byte at ``offset``, in place, leaving the file's size alone."""
+    raw = bytearray(path.read_bytes())
+    raw[offset] ^= 0xFF
+    path.write_bytes(bytes(raw))
+
+
+def test_replay_returns_every_record_of_an_intact_log(tmp_path: Path) -> None:
+    path = tmp_path / "intact.wal"
+    build_log(
+        path,
+        (WalOp.PUT, b"k1", b"v1"),
+        (WalOp.DELETE, b"k1", b""),
+        (WalOp.PUT, b"k2", b"v2"),
+    )
+    before = path.read_bytes()
+
+    result = wal.replay(path)
+
+    assert [(r.op, r.key, r.value) for r in result.records] == [
+        (WalOp.PUT, b"k1", b"v1"),
+        (WalOp.DELETE, b"k1", b""),
+        (WalOp.PUT, b"k2", b"v2"),
+    ]
+    assert result.is_intact
+    assert result.stopped_at is None
+    assert result.damage is None and result.reason is None
+    assert not result.truncated
+    assert result.end_offset == path.stat().st_size
+    assert path.read_bytes() == before, "an intact log must not be rewritten"
+
+
+def test_replay_of_a_header_only_log_returns_no_records(tmp_path: Path) -> None:
+    path = tmp_path / "empty.wal"
+    with WalWriter(path):
+        pass
+
+    result = wal.replay(path)
+
+    assert result.records == ()
+    assert result.is_intact and not result.truncated
+    assert result.end_offset == FILE_HEADER_SIZE
+    assert path.stat().st_size == FILE_HEADER_SIZE
+
+
+@pytest.mark.parametrize(
+    ("kept_bytes", "field"),
+    [
+        (2, "mid length field"),
+        (RECORD_HEADER_SIZE - 2, "mid checksum"),
+        (RECORD_HEADER_SIZE + 1, "mid op and key length"),
+        (RECORD_HEADER_SIZE + PAYLOAD_HEADER_SIZE + 1, "mid key"),
+        (RECORD_HEADER_SIZE + PAYLOAD_HEADER_SIZE + 3, "mid value"),
+    ],
+)
+def test_replay_stops_and_truncates_at_a_torn_tail(
+    tmp_path: Path, kept_bytes: int, field: str
+) -> None:
+    """A crash mid-append leaves a short tail, and replay ends the file where it starts."""
+    path = tmp_path / "torn.wal"
+    encoded = build_log(path, (WalOp.PUT, b"k1", b"v1"), (WalOp.DELETE, b"k0", b""))
+    torn = encode_record(WalOp.PUT, b"k2", b"v2")
+    assert kept_bytes < len(torn), "the cut must leave a partial record, not a whole one"
+    good_end = FILE_HEADER_SIZE + len(encoded[0]) + len(encoded[1])
+    with open(path, "ab") as handle:
+        handle.write(torn[:kept_bytes])
+
+    result = wal.replay(path)
+
+    assert [(r.op, r.key) for r in result.records] == [
+        (WalOp.PUT, b"k1"),
+        (WalOp.DELETE, b"k0"),
+    ], field
+    assert result.stopped_at == good_end, field
+    assert result.end_offset == good_end
+    assert isinstance(result.damage, WalTruncatedRecordError)
+    assert result.damage.offset == good_end
+    assert result.reason is not None and str(good_end) in result.reason
+    assert result.truncated
+    assert path.stat().st_size == good_end, "the torn tail is still on disk"
+
+
+@pytest.mark.parametrize("kept_bytes", list(range(1, 17)))
+def test_replay_handles_a_tail_cut_at_every_byte_offset(tmp_path: Path, kept_bytes: int) -> None:
+    """Exhaustive over where a crash can land inside one record, not just three samples."""
+    path = tmp_path / "every-cut.wal"
+    encoded = build_log(path, (WalOp.PUT, b"k1", b"v1"))
+    torn = encode_record(WalOp.PUT, b"k2", b"v2")
+    assert len(torn) == 17, "the parametrization above tracks this record's length"
+    good_end = FILE_HEADER_SIZE + len(encoded[0])
+    with open(path, "ab") as handle:
+        handle.write(torn[:kept_bytes])
+
+    result = wal.replay(path)
+
+    assert [(r.key, r.value) for r in result.records] == [(b"k1", b"v1")]
+    assert result.stopped_at == good_end
+    assert result.truncated and path.stat().st_size == good_end
+    assert wal.replay(path).is_intact, "the truncated file is a valid log again"
+
+
+def test_replay_discards_a_record_whose_checksum_does_not_match(tmp_path: Path) -> None:
+    """A checksum mismatch halts replay exactly like a torn write does."""
+    path = tmp_path / "checksum.wal"
+    encoded = build_log(
+        path,
+        (WalOp.PUT, b"k1", b"v1"),
+        (WalOp.PUT, b"k2", b"v2"),
+        (WalOp.PUT, b"k3", b"v3"),
+    )
+    second_offset = FILE_HEADER_SIZE + len(encoded[0])
+    # A byte inside the second record's value: its length field and its framing
+    # are untouched, so only the checksum can catch this.
+    corrupt_byte(path, second_offset + len(encoded[1]) - 1)
+
+    result = wal.replay(path)
+
+    assert [(r.key, r.value) for r in result.records] == [(b"k1", b"v1")]
+    assert result.stopped_at == second_offset
+    assert isinstance(result.damage, wal.WalChecksumError)
+    assert result.damage.expected != result.damage.found
+    assert result.truncated and path.stat().st_size == second_offset
+
+
+@pytest.mark.parametrize(
+    ("field_offset", "field"),
+    [
+        (0, "op byte"),
+        (1, "key length"),
+        (PAYLOAD_HEADER_SIZE, "key"),
+        (PAYLOAD_HEADER_SIZE + 2, "value"),
+    ],
+)
+def test_corruption_anywhere_in_a_payload_is_caught(
+    tmp_path: Path, field_offset: int, field: str
+) -> None:
+    """Every payload field is covered by the checksum, including the key/value boundary."""
+    path = tmp_path / "field.wal"
+    encoded = build_log(path, (WalOp.PUT, b"k1", b"v1"), (WalOp.PUT, b"k2", b"v2"))
+    second_offset = FILE_HEADER_SIZE + len(encoded[0])
+    corrupt_byte(path, second_offset + RECORD_HEADER_SIZE + field_offset)
+
+    result = wal.replay(path)
+
+    assert [r.key for r in result.records] == [b"k1"], field
+    assert result.stopped_at == second_offset
+    # A damaged op byte or key length is reported as a checksum failure rather
+    # than as an unknown op or an out of range key length: the checksum is
+    # verified first, so a damaged record is never explained by one of its own
+    # untrustworthy fields.
+    assert isinstance(result.damage, wal.WalChecksumError), field
+    assert path.stat().st_size == second_offset
+
+
+def test_replay_drops_valid_records_that_follow_a_bad_one(tmp_path: Path) -> None:
+    """Halt when torn: a good record after a bad one is not resumed, it is discarded.
+
+    Skipping past the damage would hand recovery a state that never existed, with
+    a later write present while the earlier one it depended on is missing.
+    """
+    path = tmp_path / "halt.wal"
+    encoded = build_log(
+        path,
+        (WalOp.PUT, b"keep", b"1"),
+        (WalOp.PUT, b"damaged", b"2"),
+        (WalOp.PUT, b"after", b"3"),
+        (WalOp.DELETE, b"keep", b""),
+    )
+    damaged_offset = FILE_HEADER_SIZE + len(encoded[0])
+    corrupt_byte(path, damaged_offset + RECORD_HEADER_SIZE + PAYLOAD_HEADER_SIZE)
+
+    result = wal.replay(path)
+
+    assert [r.key for r in result.records] == [b"keep"]
+    assert result.stopped_at == damaged_offset
+    assert path.stat().st_size == damaged_offset
+    # The delete that followed is gone too, so the key it would have removed is
+    # still present after recovery.
+    assert [r.key for r in wal.replay(path).records] == [b"keep"]
+
+
+def test_replay_truncates_the_whole_log_when_the_first_record_is_torn(tmp_path: Path) -> None:
+    path = tmp_path / "first.wal"
+    with WalWriter(path):
+        pass
+    with open(path, "ab") as handle:
+        handle.write(encode_record(WalOp.PUT, b"k1", b"v1")[:5])
+
+    result = wal.replay(path)
+
+    assert result.records == ()
+    assert result.stopped_at == FILE_HEADER_SIZE
+    assert result.truncated
+    assert path.stat().st_size == FILE_HEADER_SIZE, "the header itself must survive"
+    assert read_file_header_from_path(path) == WAL_FORMAT_VERSION
+
+
+def test_replay_can_report_damage_without_touching_the_file(tmp_path: Path) -> None:
+    """truncate=False is what an inspection tool uses: find out, change nothing."""
+    path = tmp_path / "dry-run.wal"
+    encoded = build_log(path, (WalOp.PUT, b"k1", b"v1"))
+    with open(path, "ab") as handle:
+        handle.write(encode_record(WalOp.PUT, b"k2", b"v2")[:6])
+    before = path.read_bytes()
+
+    result = wal.replay(path, truncate=False)
+
+    assert [r.key for r in result.records] == [b"k1"]
+    assert result.stopped_at == FILE_HEADER_SIZE + len(encoded[0])
+    assert not result.truncated
+    assert path.read_bytes() == before
+
+
+def test_the_log_is_appendable_again_after_replay_truncates_it(tmp_path: Path) -> None:
+    """The point of truncating: the next append continues the log, it does not bury the damage."""
+    path = tmp_path / "reuse.wal"
+    build_log(path, (WalOp.PUT, b"before", b"1"))
+    with open(path, "ab") as handle:
+        handle.write(encode_record(WalOp.PUT, b"torn", b"2")[:10])
+
+    recovered = wal.replay(path)
+    assert [r.key for r in recovered.records] == [b"before"]
+
+    with WalWriter(path) as writer:
+        writer.append_put(b"after", b"3")
+
+    replayed = wal.replay(path)
+    assert [(r.key, r.value) for r in replayed.records] == [(b"before", b"1"), (b"after", b"3")]
+    assert replayed.is_intact and not replayed.truncated
+    assert [r.key for r in read_all(path)] == [b"before", b"after"]
+
+
+def test_replay_refuses_a_file_that_is_not_a_readable_wal(tmp_path: Path) -> None:
+    """A header this build cannot parse is raised on, never truncated away."""
+    record = encode_record(WalOp.PUT, b"k1", b"v1")
+
+    future = tmp_path / "future.wal"
+    future.write_bytes(encode_file_header(WAL_FORMAT_VERSION + 1) + record)
+    with pytest.raises(WalUnsupportedVersionError):
+        wal.replay(future)
+    assert future.stat().st_size == FILE_HEADER_SIZE + len(record)
+
+    foreign = tmp_path / "foreign.wal"
+    foreign.write_bytes(b"NOTAWAL!" + bytes([WAL_FORMAT_VERSION]) + record)
+    before = foreign.read_bytes()
+    with pytest.raises(WalHeaderError):
+        wal.replay(foreign)
+    assert foreign.read_bytes() == before
+
+
+def test_replay_forces_the_truncation_onto_the_disk(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A truncation left in the page cache can be undone by the next crash."""
+    path = tmp_path / "durable.wal"
+    build_log(path, (WalOp.PUT, b"k1", b"v1"))
+    with open(path, "ab") as handle:
+        handle.write(encode_record(WalOp.PUT, b"k2", b"v2")[:7])
+
+    synced: list[int] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        synced.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+
+    assert wal.replay(path).truncated
+    assert synced, "the shrunk file was never fsynced"
+
+
+def test_replay_releases_every_file_handle_it_opens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "handles.wal"
+    build_log(path, (WalOp.PUT, b"k1", b"v1"))
+    with open(path, "ab") as handle:
+        handle.write(encode_record(WalOp.PUT, b"k2", b"v2")[:3])
+
+    opened: list[Any] = []
+    real_open = builtins.open
+
+    def tracking_open(*args: Any, **kwargs: Any) -> Any:
+        handle = real_open(*args, **kwargs)
+        opened.append(handle)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+    assert wal.replay(path).truncated
+
+    assert len(opened) >= 2, "replay opened neither a read nor a write handle"
+    assert all(handle.closed for handle in opened)
+
+
+def test_truncation_refuses_to_eat_the_header_or_to_extend_the_file(tmp_path: Path) -> None:
+    """Guards on the one call in this module that makes a WAL file shorter.
+
+    Unreachable through replay, whose offsets always land on a record boundary,
+    and checked anyway: this is the only code here that can destroy a durable
+    record, so a wrong offset must fail loudly rather than quietly reshape the
+    file.
+    """
+    path = tmp_path / "guards.wal"
+    build_log(path, (WalOp.PUT, b"k1", b"v1"))
+    before = path.read_bytes()
+
+    with pytest.raises(ValueError, match="header"):
+        wal._truncate_to(path, FILE_HEADER_SIZE - 1)
+    with pytest.raises(ValueError, match="extend"):
+        wal._truncate_to(path, len(before) + 1)
+
+    assert path.read_bytes() == before
+
+
+def test_reader_reports_a_checksum_mismatch_with_both_values(tmp_path: Path) -> None:
+    """The read-only path detects the same damage, and still changes nothing."""
+    payload = struct.pack("<BI", int(WalOp.PUT), 3) + b"key" + b"value"
+    stored_checksum = (zlib.crc32(payload) & 0xFFFFFFFF) ^ 0xFFFFFFFF
+    record = struct.pack("<II", len(payload), stored_checksum) + payload
+    path = write_raw_wal(tmp_path / "mismatch.wal", record)
+    before = path.read_bytes()
+
+    with pytest.raises(wal.WalChecksumError) as excinfo:
+        read_all(path)
+
+    assert excinfo.value.offset == FILE_HEADER_SIZE
+    assert excinfo.value.expected == stored_checksum
+    assert excinfo.value.found == zlib.crc32(payload) & 0xFFFFFFFF
+    assert isinstance(excinfo.value, wal.WalRecordError)
+    assert path.read_bytes() == before, "reading never writes"
+
+
+def test_replay_survives_a_writer_killed_mid_append(tmp_path: Path) -> None:
+    """End to end: appends with no clean close, a process death mid-record, then recovery.
+
+    The kill is simulated by writing part of a record through a raw handle, which
+    is the state a real crash leaves: the bytes that reached the disk before the
+    process stopped, and nothing after them.
+    """
+    path = tmp_path / "crash.wal"
+    durable = [(f"key{index}".encode(), f"value{index}".encode()) for index in range(50)]
+    writer = WalWriter(path, fsync_policy=FsyncPolicy.ALWAYS)
+    for key, value in durable:
+        writer.append_put(key, value)
+    # No close(): the process is gone. The always policy means every record above
+    # is on the disk, so recovery must return all of them.
+    partial = encode_record(WalOp.PUT, b"key50", b"value50")
+    with open(path, "ab") as handle:
+        handle.write(partial[: len(partial) // 2])
+        handle.flush()
+        os.fsync(handle.fileno())
+    writer._file.close()
+
+    result = wal.replay(path)
+
+    assert [(r.key, r.value) for r in result.records] == durable
+    assert result.truncated
+    assert result.stopped_at == path.stat().st_size
+    assert wal.replay(path).is_intact

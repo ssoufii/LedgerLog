@@ -35,3 +35,22 @@ half-written file cannot make the program grab an enormous amount of memory or
 read past the end of the file. It reports where it stopped and leaves the file
 exactly as it found it, which is what the next piece of work needs in order to
 decide what to trim.
+
+## Story M1.5: Torn-write and corruption detection with truncation
+
+If the program dies in the middle of writing an entry to the log, the last entry
+is left half finished, and a damaged disk can leave an entry that looks complete
+but no longer holds the bytes that were written. Recovery now handles both the
+same way: it reads entries from the start of the log, and the moment it reaches
+one it cannot trust, it stops, keeps everything before it, and reports exactly
+how far it got. It then shortens the file at that point, so the unusable tail is
+gone and the disk is asked to confirm the change.
+
+This matters for two reasons. The damaged part is not skipped over, because
+carrying on past a gap would rebuild a state the system was never actually in,
+with a later change present while an earlier one it relied on is missing. And
+cutting the file back is what lets writing resume normally: without it, the next
+entry would be added after the damage, where the next recovery would stop and
+quietly lose everything written since the crash. Simply looking at a log with the
+read-only reader still changes nothing, so a suspect file can be inspected before
+anyone decides to repair it.
