@@ -1,15 +1,19 @@
 """Write-ahead log: file header, record framing, the append-only writer and its
-fsync policy, and the sequential reader.
+fsync policy, the sequential reader, and recovery's replay-and-truncate pass.
 
-Scope of this module today (stories M1.1, M1.2, M1.3 and M1.4): encoding a put
-or a delete into an on-disk record, stamping every WAL file with a header that
-carries the format version, appending records to a file in call order, deciding
-how often those bytes are forced from the operating system's page cache onto the
-physical disk, and reading records back in the order they were written.
-Torn-write and checksum-mismatch handling (M1.5), which turns an unreadable tail
-into a truncation rather than an error, is a separate story and is not
-implemented here: the reader below reports where it stopped and leaves the file
-untouched.
+Scope of this module today (stories M1.1, M1.2, M1.3, M1.4 and M1.5): encoding a
+put or a delete into an on-disk record, stamping every WAL file with a header
+that carries the format version, appending records to a file in call order,
+deciding how often those bytes are forced from the operating system's page cache
+onto the physical disk, reading records back in the order they were written, and
+replaying a log whose tail a crash left unreadable.
+
+Two ways of reading a WAL live here, and the difference between them is whether
+looking at the file is allowed to change it. :class:`WalReader` only ever reads:
+it hands back records until something is wrong and then raises, leaving the bytes
+exactly as it found them, which is what a debugging tool wants. :func:`replay` is
+recovery's path: it collects every record up to the first unreadable one, reports
+the offset it stopped at, and truncates the file there.
 
 On-disk file layout (little endian, no padding)::
 
@@ -49,11 +53,12 @@ value.
 
 The payload length itself is deliberately not covered by the CRC32, because it
 is the field a reader needs before it can read anything else. A corrupted length
-is still caught: the bytes it selects will not match the stored checksum, which
-is what the replay story (M1.5) checks. Before then, and independently of the
-checksum, :func:`iter_records` validates a length against the bytes actually
-remaining in the file before allocating or slicing anything, which is why
-``MAX_PAYLOAD_SIZE`` below is part of the format rather than a writer detail.
+is still caught, in two stages. First, and independently of the checksum,
+:func:`iter_records` validates a length against the bytes actually remaining in
+the file before allocating or slicing anything, which is why ``MAX_PAYLOAD_SIZE``
+below is part of the format rather than a writer detail. Second, a length that
+survives those bounds checks still selects the wrong bytes, and those bytes will
+not match the stored checksum.
 """
 
 from __future__ import annotations
@@ -192,7 +197,7 @@ class WalRecordError(WalFormatError):
 
     Carries the offset the bad record starts at, because that offset is the only
     thing recovery can do something with: it is where a reader stopped trusting
-    the file, and (from M1.5 onwards) where the file gets truncated.
+    the file, and where :func:`replay` truncates it.
     """
 
     def __init__(self, message: str, offset: int) -> None:
@@ -219,6 +224,31 @@ class WalInvalidRecordError(WalRecordError):
     :class:`WalOp`, or a DELETE carrying a value: each of these means the bytes
     cannot be the ones the writer produced, whatever the file's length says.
     """
+
+
+class WalChecksumError(WalRecordError):
+    """Raised when a record's stored CRC32 does not match the payload that follows it.
+
+    Kept distinct from its siblings because it is the one failure that says
+    nothing about which field went wrong. A short tail says the write never
+    finished, and an inconsistent field says a specific number is impossible, but
+    a checksum mismatch only says that these are not the bytes the writer wrote.
+    It covers the case the other two cannot see at all: a record whose fields are
+    all individually plausible and whose contents are nonetheless damaged.
+
+    Recovery treats all three identically (stop, report the offset, truncate),
+    which is why they share :class:`WalRecordError` as a base. The distinction is
+    for the operator reading the error, not for the control flow.
+    """
+
+    def __init__(self, expected: int, found: int, offset: int) -> None:
+        super().__init__(
+            f"record checksum mismatch: payload hashes to {found:#010x}, "
+            f"but the record header stores {expected:#010x}",
+            offset,
+        )
+        self.expected = expected
+        self.found = found
 
 
 class WalUnsupportedVersionError(WalHeaderError):
@@ -312,8 +342,8 @@ class WalRecord:
     mutation on the way would make the recovered state disagree with the log.
 
     The offsets are part of the record rather than something the caller tracks
-    separately: recovery reports where it stopped, and (from M1.5) truncates
-    there, so every record has to know where it began and ended.
+    separately: recovery reports where it stopped, and truncates there, so every
+    record has to know where it began and ended.
     """
 
     op: WalOp
@@ -636,9 +666,11 @@ def iter_records(stream: BinaryIO, *, file_size: int | None = None) -> Iterator[
     guessing what the writer meant is how a log resurrects a record it never
     stored.
 
-    What this function does not do is verify the CRC32: that is story M1.5,
-    along with truncating the file at the first record that fails. Nothing here
-    writes to ``stream``.
+    Every record's CRC32 is verified against its payload before the payload is
+    decoded, so a record that is intact in shape but damaged in content raises
+    :class:`WalChecksumError` rather than reaching the caller. Nothing here writes
+    to ``stream``: acting on the damage (truncating the file at the offset the
+    error carries) is :func:`replay`'s job.
     """
     if file_size is None:
         if not stream.seekable():
@@ -671,7 +703,7 @@ def _iter_records(stream: BinaryIO, file_size: int) -> Iterator[WalRecord]:
                 f"read {len(raw_header)} of {RECORD_HEADER_SIZE} record header bytes", offset
             )
 
-        payload_length, _checksum = struct.unpack(_RECORD_HEADER_FORMAT, raw_header)
+        payload_length, checksum = struct.unpack(_RECORD_HEADER_FORMAT, raw_header)
         if payload_length < PAYLOAD_HEADER_SIZE:
             raise WalInvalidRecordError(
                 f"record claims a {payload_length} byte payload, below the "
@@ -698,6 +730,14 @@ def _iter_records(stream: BinaryIO, file_size: int) -> Iterator[WalRecord]:
                 f"read {len(payload)} of {payload_length} payload bytes", offset
             )
 
+        # Checked before the payload is decoded, not after: once the checksum
+        # fails, every field inside the payload is suspect, and reporting one of
+        # them as the problem would send an operator looking for a bug in the
+        # writer rather than at a damaged disk.
+        found_checksum = zlib.crc32(payload) & 0xFFFFFFFF
+        if found_checksum != checksum:
+            raise WalChecksumError(checksum, found_checksum, offset)
+
         op, key, value = decode_payload(payload, offset=offset)
         yield WalRecord(
             op=op,
@@ -718,9 +758,9 @@ class WalReader:
 
     The handle is opened read-only and the reader never writes, truncates or
     deletes. Recovery's response to a damaged tail (truncate at the first bad
-    record) is story M1.5 and belongs to the replay path, not to the reader:
-    keeping the two apart means a tool can inspect a suspect log without the act
-    of looking at it changing what is there.
+    record) belongs to :func:`replay`, not to the reader: keeping the two apart
+    means a tool can inspect a suspect log without the act of looking at it
+    changing what is there.
 
     Iterating more than once is allowed and starts again from the first record.
     A one-shot reader would force a caller who wants two passes (count the
@@ -791,3 +831,155 @@ class WalReader:
         tb: TracebackType | None,
     ) -> None:
         self.close()
+
+
+def _truncate_to(path: Path, offset: int) -> None:
+    """Shrink the WAL at ``path`` to ``offset`` bytes and force the change to disk.
+
+    In place rather than through a temporary file and a rename, which is how the
+    rest of the engine commits a change to disk. The difference is what is at
+    stake: an SSTable footer or a compaction swap replaces bytes a reader may
+    still need, so those need a rename that either happens or does not. This
+    removes a suffix that no reader can use and that no future append may build
+    on, and doing it by copying the good prefix to a new file would mean writing
+    out the whole log to delete its last few bytes, with a window where the only
+    copy of the durable prefix is an unsynced new file.
+
+    The fsync is not optional bookkeeping. A crash between the truncate and the
+    disk acknowledging it can leave the torn tail in place, and the next replay
+    would then have to detect and truncate it all over again. That second pass
+    would be correct, but only because this one made no other change to the file.
+    Forcing the shrink down now is what keeps a repeated crash from repeatedly
+    re-examining the same damage.
+
+    Both bounds are checked before the call rather than trusted: truncating below
+    the header would destroy the magic and version bytes and leave something that
+    is no longer a WAL, and truncating past the end of the file would extend it
+    with a run of zero bytes, manufacturing exactly the kind of damage this
+    function exists to remove.
+    """
+    if offset < FILE_HEADER_SIZE:
+        raise ValueError(
+            f"refusing to truncate {path} to {offset} bytes, which is inside its "
+            f"{FILE_HEADER_SIZE} byte header"
+        )
+    with open(path, "r+b") as handle:
+        current_size = handle.seek(0, os.SEEK_END)
+        if offset > current_size:
+            raise ValueError(
+                f"refusing to truncate {path} to {offset} bytes, past its current "
+                f"size of {current_size}: that would extend the file, not shrink it"
+            )
+        handle.truncate(offset)
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+@dataclass(frozen=True)
+class ReplayResult:
+    """What a replay pass found, and what it did about it.
+
+    ``records`` holds every record up to the first unreadable one, in write
+    order. Collected eagerly into a tuple rather than streamed, because a WAL is
+    bounded by how much has been written since the last memtable flush, and
+    replay's consumer (a fresh memtable) holds all of it in memory anyway. The
+    alternative, a generator, would also have no way to report where it stopped
+    without the caller catching the exception itself, which is the work this
+    function exists to do for them.
+    """
+
+    records: tuple[WalRecord, ...]
+    end_offset: int
+    damage: WalRecordError | None
+    truncated: bool
+
+    @property
+    def is_intact(self) -> bool:
+        """True if every byte after the header parsed as a record."""
+        return self.damage is None
+
+    @property
+    def stopped_at(self) -> int | None:
+        """Byte offset replay stopped at, or None if the whole file replayed.
+
+        This is where the first unreadable record starts, which is also where the
+        last valid one ended: records are contiguous, so the offset that bounds
+        the good prefix and the offset that begins the bad tail are the same
+        number seen from two sides.
+        """
+        return None if self.damage is None else self.end_offset
+
+    @property
+    def reason(self) -> str | None:
+        """Human-readable description of the damage, or None if there was none."""
+        return None if self.damage is None else str(self.damage)
+
+
+def replay(path: str | os.PathLike[str], *, truncate: bool = True) -> ReplayResult:
+    """Read every valid record from the WAL at ``path``, then truncate any bad tail.
+
+    This is recovery's entry point, and it implements the "halt when torn" rule
+    from ARCHITECTURE.md section 1: read forward from the first record, and at
+    the first one that cannot be trusted, stop. Everything before it is returned;
+    it and everything after it are discarded, not skipped over. Discarding rather
+    than resuming at the next parsable-looking record is the whole point. The
+    records after a torn one are not known to be independent of it, and a log
+    that silently resumed past a gap would hand the memtable a state that never
+    existed: a later value present while the write it superseded is missing.
+
+    A torn tail (the crash landed mid-append) and a checksum mismatch (the bytes
+    on disk are damaged) are deliberately treated the same way. From recovery's
+    side there is nothing to choose between them: in both cases the log stops
+    being a faithful record of what happened at that offset, and in both cases
+    what came before is still good. The distinction survives in the exception
+    kept on the result, for an operator who wants to know whether they are
+    looking at a power loss or at a failing disk.
+
+    ``truncate`` exists so a caller can ask what replay would do without doing
+    it, which is what an inspection tool or a test wants. It defaults to true
+    because the engine's normal startup needs the file left in a state the writer
+    can append to: appending after a torn record would bury the damage in the
+    middle of the log, where the next replay would stop at it and silently lose
+    every record written after the crash.
+
+    A header that is missing, foreign, or of an unknown version raises rather
+    than truncating anything. That file is not a WAL this build can reason about,
+    and the one thing worse than refusing to recover from it is deleting it.
+
+    The caller must be the log's only user for the duration of the call. Replay
+    reads a snapshot of the file and then shortens it to the end of the last good
+    record, so a record appended between those two steps would be discarded by a
+    truncation that never saw it. This is a real constraint rather than a
+    theoretical one, and it is also free to satisfy: recovery runs at startup,
+    before the engine opens the WAL for writing, which is the only moment the
+    engine is entitled to shorten its own log.
+    """
+    records: list[WalRecord] = []
+    damage: WalRecordError | None = None
+    with WalReader(path) as reader:
+        end_offset = FILE_HEADER_SIZE
+        try:
+            for record in reader:
+                records.append(record)
+                end_offset = record.end_offset
+        except WalRecordError as error:
+            # Caught here rather than left to the caller, but note what is not
+            # caught: WalHeaderError, which is raised by the constructor above
+            # and so cannot reach this block at all.
+            damage = error
+
+    # The truncation point is the end of the last record actually returned, not
+    # the offset carried by the error. The two agree for every failure the reader
+    # can raise, and where they ever disagreed, this one is the conservative
+    # choice: it can never discard a record that was just handed to the caller.
+    truncated = False
+    if damage is not None and truncate:
+        _truncate_to(Path(path), end_offset)
+        truncated = True
+
+    return ReplayResult(
+        records=tuple(records),
+        end_offset=end_offset,
+        damage=damage,
+        truncated=truncated,
+    )
