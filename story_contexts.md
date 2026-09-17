@@ -54,3 +54,21 @@ entry would be added after the damage, where the next recovery would stop and
 quietly lose everything written since the crash. Simply looking at a log with the
 read-only reader still changes nothing, so a suspect file can be inspected before
 anyone decides to repair it.
+
+## Story M2.1: Skip list core: insert/search/delete/sorted iteration
+
+Alongside the log on disk, the engine needs somewhere in memory to keep recent
+changes so it can answer questions quickly. This change adds that container. It
+stores a value under a key, finds a value by its key, removes one, and can walk
+through everything it holds in key order. It is built by hand out of simple
+linked lists stacked on top of each other, where the upper lists act like express
+lanes that let a search skip over most of the entries instead of checking them
+one by one.
+
+This matters because looking something up has to stay fast as the number of
+entries grows, and because handing the entries back already in order is what
+lets them be written to disk later without sorting them first. To be confident it
+is right, the tests run long random sequences of adds, lookups and removals
+against an ordinary Python dictionary and check the two agree after every single
+step, and they also inspect the express lanes directly, since a mistake up there
+can stay hidden while every answer still looks correct.
