@@ -72,3 +72,15 @@ is right, the tests run long random sequences of adds, lookups and removals
 against an ordinary Python dictionary and check the two agree after every single
 step, and they also inspect the express lanes directly, since a mistake up there
 can stay hidden while every answer still looks correct.
+
+## Story M2.2: Tombstone support
+
+Deleting a key no longer erases it from memory. Instead the engine writes a note
+in its place saying the key was deleted, and a later lookup reads that note and
+answers "not found" rather than handing back the value that used to be there.
+This matters because the same key may still have an older copy sitting in a file
+on disk, and simply removing the copy held in memory would let that older value
+resurface and look current again, undoing a deletion the caller had already been
+told was done. The note is what stops the search at the right place, and it is
+only cleared away much later, once the engine can be sure no older file still
+mentions the key.

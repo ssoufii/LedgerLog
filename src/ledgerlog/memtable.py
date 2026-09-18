@@ -1,24 +1,58 @@
 """Memtable: the in-memory sorted structure that holds recent writes.
 
-Scope of this module today (story M2.1): the skip list itself, as a plain sorted
-container with insert, search, delete and in-order iteration. Keys are compared
-as bytes, so iteration order is the byte-lexicographic order that SSTables are
-written in later, and a flush can walk this structure front to back without
-re-sorting anything.
+Scope of this module today (stories M2.1 and M2.2): the skip list itself, as a
+plain sorted container with insert, search, delete and in-order iteration, plus
+the key-value layer above it that turns a delete into a tombstone. Keys are
+compared as bytes, so iteration order is the byte-lexicographic order that
+SSTables are written in later, and a flush can walk this structure front to back
+without re-sorting anything.
+
+Two classes, in two layers. :class:`SkipList` is a sorted container and nothing
+more: its :meth:`SkipList.delete` unlinks the node, which is the ordinary
+data-structure operation. :class:`Memtable` is the key-value view the engine
+actually writes through, and its :meth:`Memtable.delete` leaves a tombstone
+record in place of the value instead of removing anything. Keeping the two apart
+is what the layering in ARCHITECTURE.md section 3 asks for: physical removal is
+compaction's job, once no older SSTable can still answer for the key, so nothing
+below compaction is allowed to make a key simply disappear.
+
+How a tombstone is represented: :class:`Memtable` stores every value in the skip
+list behind a one byte tag, ``\\x01`` for a put and ``\\x02`` for a delete, and a
+tombstone is that tag byte on its own. The tag is what makes the distinction
+unambiguous, and the alternatives are worse rather than merely different. A
+reserved sentinel value cannot work, because a put of ``b""`` is a real write
+that has to stay distinguishable from a delete of the same key, exactly as it is
+in the WAL. A sentinel object recognized by identity would work but rests on the
+identity of a bytes object rather than on anything written down. A parallel set
+of deleted keys would keep two structures that have to agree, and a flush walking
+one of them would be trusting that the other did not drift.
+
+What the tag costs, stated plainly: a put concatenates the tag onto the value,
+and a read slices it back off, so a value is copied once on the way in and once
+on the way out. That is the price of keeping the skip list a ``bytes`` to
+``bytes`` container. Avoiding it means letting the skip list hold some other
+value type, which would move the tombstone concept down into the container that
+ARCHITECTURE.md section 3 wants kept clear of it. Correctness of the layering
+is worth more here than the copy, and if the copy ever shows up in the M10
+benchmarks it can be removed without changing what any caller sees.
+
+Why the tag carries no format version, unlike every on-disk structure in this
+engine: it is never written to disk. A flush re-encodes these records into the
+SSTable format, which carries its own version byte, so the tag lives and dies
+inside one process and there is no future reader to keep compatible with it.
 
 What is deliberately not here yet:
 
-* Tombstones (story M2.2). :meth:`SkipList.delete` unlinks the node, which is the
-  ordinary data-structure operation. At the KV level a delete has to leave a
-  marker behind instead, so that it shadows an older value sitting in an
-  SSTable, and that marker is built on top of this structure rather than inside
-  it.
-* Thread safety (stories M2.3 and M2.4). :class:`SkipList` carries no lock and
-  makes no concurrency guarantee: a reader running against a concurrent insert
-  can observe a partially linked node. Story M2.3 chooses the locking strategy
-  and M2.4 implements it, and per ARCHITECTURE.md section 2 the chosen approach
-  gets documented here once it exists. Until then, callers sharing an instance
+* Thread safety (stories M2.3 and M2.4). Neither :class:`SkipList` nor
+  :class:`Memtable` carries a lock, and neither makes any concurrency
+  guarantee: a reader running against a concurrent insert can observe a
+  partially linked node. Story M2.3 chooses the locking strategy and M2.4
+  implements it, and per ARCHITECTURE.md section 2 the chosen approach gets
+  documented here once it exists. Until then, callers sharing an instance
   between threads must synchronize externally.
+* The size accounting that decides when a memtable is full enough to freeze and
+  flush (story M6.1). :func:`len` counts records here, which is not the byte
+  measure the flush threshold is expressed in.
 
 Why a skip list rather than a balanced tree: per ARCHITECTURE.md section 2, a
 skip list reaches O(log n) expected search and insert without rebalancing. An
@@ -48,6 +82,8 @@ from __future__ import annotations
 
 import random
 from collections.abc import Iterator
+from dataclasses import dataclass
+from typing import NoReturn
 
 DEFAULT_MAX_LEVEL = 16
 """Highest number of forward pointers any node may have by default.
@@ -337,3 +373,235 @@ def _check_value(value: bytes) -> None:
     """Reject anything but ``bytes`` as a value."""
     if not isinstance(value, bytes):
         raise TypeError(f"value must be bytes, got {type(value).__name__}")
+
+
+_TAG_PUT = b"\x01"
+"""Tag prefixed to a stored value, marking the record as a live write.
+
+One byte rather than a flag alongside the value, because the skip list beneath
+holds ``bytes`` and nothing else. See this module's docstring for why the
+distinction is carried in the bytes at all.
+"""
+
+_TAG_DELETE = b"\x02"
+"""Tag marking a record as a tombstone. A tombstone is this byte and nothing else.
+
+The codes deliberately read the same as :class:`ledgerlog.wal.WalOp`'s PUT and
+DELETE, so a record means the same thing whichever layer is looking at it, and
+they start at 1 there for the same reason: a zero byte is what a partially
+written or freshly allocated region looks like, so no run of zeros should decode
+as a valid operation. They are a separate constant rather than an import because
+CLAUDE.md asks that the WAL and the memtable stay independently testable, and a
+shared enum would make each module's tests depend on the other's format.
+"""
+
+
+@dataclass(frozen=True)
+class MemtableEntry:
+    """One record in the memtable: a key with either a value or a tombstone.
+
+    ``value`` is ``None`` when the record is a tombstone. That is a different
+    statement from the ``None`` :meth:`Memtable.get` returns, and the difference
+    is the whole point of the type: this ``None`` says "deleted here, stop
+    looking", while a missing entry says "not here, keep looking in older
+    layers". Per ARCHITECTURE.md section 5 the read path has to be able to tell
+    those apart, because a tombstone must shadow a value in an older SSTable
+    rather than let the search fall through to it.
+
+    Frozen because an entry is a decoded view of a record the memtable still
+    owns. Handing out something mutable would let a caller edit what looks like
+    their own copy and find they had changed the memtable's idea of the record,
+    or the reverse.
+    """
+
+    key: bytes
+    value: bytes | None
+
+    @property
+    def is_tombstone(self) -> bool:
+        """True if this record marks the key deleted rather than holding a value."""
+        return self.value is None
+
+
+def _decode_stored(key: bytes, stored: bytes) -> MemtableEntry:
+    """Decode one tagged skip list value into an entry.
+
+    The unknown-tag and trailing-bytes cases are not reachable through
+    :class:`Memtable`'s API, which is the only writer of these bytes. They are
+    checked rather than assumed because the cost is one comparison on a read
+    path that is already slicing, and because the failure they would otherwise
+    produce is a silently wrong answer: an unrecognized tag treated as a put
+    would hand back a value with a stray byte on the front, and a tombstone with
+    a payload would mean a delete and a put had been conflated somewhere above.
+    """
+    tag = stored[:1]
+    if tag == _TAG_PUT:
+        return MemtableEntry(key=key, value=stored[1:])
+    if tag == _TAG_DELETE:
+        if len(stored) != len(_TAG_DELETE):
+            raise ValueError(
+                f"tombstone record for key {key!r} carries "
+                f"{len(stored) - len(_TAG_DELETE)} bytes of value, which a tombstone never has"
+            )
+        return MemtableEntry(key=key, value=None)
+    raise ValueError(f"record for key {key!r} carries an unknown memtable tag {tag!r}")
+
+
+class Memtable:
+    """The key-value view of a memtable: puts, gets, and deletes that leave tombstones.
+
+    This is what the engine writes through. It wraps a :class:`SkipList`, so
+    records stay in ascending key order and a flush can stream them straight
+    into an SSTable's data block, and it adds the one piece of key-value
+    semantics the container itself has no business knowing about: a delete
+    records that the key was deleted instead of making it vanish.
+
+    Why a delete must not remove anything here: the memtable is only the newest
+    layer. A key it drops could still have an older value sitting in an SSTable,
+    and a read that found nothing in memory would fall through and return that
+    stale value, resurrecting a key the caller deleted. The tombstone is what
+    stops the search at the right layer. It is dropped for real during compaction
+    (story M8.3), once no older table can still answer for the key.
+
+    ``in`` is deliberately refused rather than answered. "Is this key in the
+    memtable" has two honest answers for a tombstoned key, since the record is
+    present and the value is not, and either one silently misleads half its
+    callers. :class:`SkipList` can answer the same question because there is only
+    one thing it can mean there. Callers here ask what they actually mean:
+    :meth:`get` for "is there a value", and :meth:`lookup` for "is there a
+    record, and what kind".
+
+    Not thread safe, for the reasons in this module's docstring.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_level: int = DEFAULT_MAX_LEVEL,
+        level_probability: float = DEFAULT_LEVEL_PROBABILITY,
+        rng: random.Random | None = None,
+    ) -> None:
+        """Create an empty memtable.
+
+        The tuning parameters are forwarded to the underlying :class:`SkipList`
+        unchanged, including ``rng``, so a test can pin the node heights and
+        assert on the shape of the structure a sequence of puts and deletes
+        leaves behind.
+        """
+        self._skiplist = SkipList(
+            max_level=max_level,
+            level_probability=level_probability,
+            rng=rng,
+        )
+
+    def __len__(self) -> int:
+        """Number of records held, counting tombstones.
+
+        Tombstones are counted because they are records: they occupy a node, they
+        are written out by a flush, and they are what a later compaction has to
+        read in order to decide the key can finally go. A count that skipped them
+        would understate how much work a flush has to do.
+        """
+        return len(self._skiplist)
+
+    def __contains__(self, key: object) -> NoReturn:
+        """Refuse the membership test, naming the two questions it could mean.
+
+        This raises where most containers answer, and the reason is that
+        :meth:`__iter__` below yields records. Without this method, ``key in
+        memtable`` would fall back to iteration, compare a key against a run of
+        :class:`MemtableEntry` objects, and report ``False`` for every key,
+        including ones that are present. A loud refusal is worth more than an
+        answer that is wrong every time it is asked.
+        """
+        raise TypeError(
+            "Memtable does not support 'in': a tombstoned key has a record but no value, "
+            "so use get(key) is not None for a live value, or lookup(key) is not None for "
+            "any record"
+        )
+
+    def put(self, key: bytes, value: bytes) -> None:
+        """Store ``value`` under ``key``, replacing whatever record was there.
+
+        A put over a tombstone is an ordinary overwrite: the key is live again,
+        and nothing remembers that it was briefly deleted. It does not need to,
+        because the tombstone existed only to shadow older layers, and this
+        newer value now shadows them itself.
+        """
+        _check_key(key)
+        _check_value(value)
+        self._skiplist.insert(key, _TAG_PUT + value)
+
+    def delete(self, key: bytes) -> None:
+        """Record that ``key`` was deleted, whether or not it held a value here.
+
+        Deleting a key with no record in this memtable still writes a tombstone,
+        rather than being treated as a no-op, because the key may well have a
+        value in an SSTable that only this tombstone can shadow. Deleting an
+        already tombstoned key rewrites the same tombstone, so repeated deletes
+        are idempotent and none of them is an error.
+
+        Returns nothing, deliberately, where :meth:`SkipList.delete` returns
+        whether the key was there. At this layer that boolean would be actively
+        misleading: the memtable can only see its own records, so "there was
+        nothing to delete" would be a claim about one layer dressed up as a
+        claim about the engine, and answering it honestly needs the whole read
+        path (story M7.2).
+        """
+        _check_key(key)
+        self._skiplist.insert(key, _TAG_DELETE)
+
+    def get(self, key: bytes) -> bytes | None:
+        """Return the value stored under ``key``, or ``None`` if there is none here.
+
+        A tombstoned key reads as ``None``, the same as a key this memtable has
+        never seen. The two are different facts and the difference matters to the
+        engine's read path, which is why :meth:`lookup` exists, but to a caller
+        asking only for a value they come to the same thing.
+
+        A key put with an empty value reads back as ``b""``, which is not
+        ``None``. That distinction is the same one the WAL draws between a put of
+        an empty value and a delete, and it survives here intact.
+        """
+        entry = self.lookup(key)
+        if entry is None or entry.is_tombstone:
+            return None
+        return entry.value
+
+    def lookup(self, key: bytes) -> MemtableEntry | None:
+        """Return ``key``'s record, or ``None`` if this memtable holds none.
+
+        This is the read path's primitive rather than :meth:`get`, because it is
+        the only one that separates "deleted" from "absent". A tombstone comes
+        back as an entry whose value is ``None``, and the read path stops there;
+        no record at all comes back as ``None``, and the read path moves on to
+        the next layer.
+        """
+        stored = self._skiplist.search(key)
+        if stored is None:
+            return None
+        return _decode_stored(key, stored)
+
+    def entries(self) -> Iterator[MemtableEntry]:
+        """Yield every record in ascending key order, tombstones included.
+
+        This is the shape a flush consumes: an SSTable's data block is written in
+        key order, and it stores tombstones alongside values, so the flush walks
+        this iterator once and writes what it is given.
+        """
+        for key, stored in self._skiplist.items():
+            yield _decode_stored(key, stored)
+
+    def keys(self) -> Iterator[bytes]:
+        """Yield every key in ascending byte order, including tombstoned keys."""
+        return self._skiplist.keys()
+
+    def __iter__(self) -> Iterator[MemtableEntry]:
+        """Iterate records, matching :meth:`entries`.
+
+        Records rather than keys, which is the opposite of :class:`SkipList`'s
+        choice. The two classes have different consumers: the container is asked
+        what keys it holds, while a memtable is drained into an SSTable, and the
+        thing being drained is the records.
+        """
+        return self.entries()
