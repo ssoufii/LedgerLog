@@ -43,13 +43,12 @@ inside one process and there is no future reader to keep compatible with it.
 
 What is deliberately not here yet:
 
-* Thread safety (stories M2.3 and M2.4). Neither :class:`SkipList` nor
-  :class:`Memtable` carries a lock, and neither makes any concurrency
-  guarantee: a reader running against a concurrent insert can observe a
-  partially linked node. Story M2.3 chooses the locking strategy and M2.4
-  implements it, and per ARCHITECTURE.md section 2 the chosen approach gets
-  documented here once it exists. Until then, callers sharing an instance
-  between threads must synchronize externally.
+* Thread safety (story M2.4). Neither :class:`SkipList` nor :class:`Memtable`
+  carries a lock yet, so neither *makes* a concurrency guarantee today, and
+  callers sharing an instance between threads must still synchronize
+  externally. The strategy those locks will follow is decided, and is written
+  down under "Concurrency strategy" below: story M2.3 chose it, and M2.4 adds
+  the lock and the multi-threaded tests that turn it into a promise.
 * The size accounting that decides when a memtable is full enough to freeze and
   flush (story M6.1). :func:`len` counts records here, which is not the byte
   measure the flush threshold is expressed in.
@@ -76,6 +75,101 @@ distribution of levels would require rebalancing on every insert and delete,
 which is the cost the skip list exists to avoid. Drawing each node's height from
 a geometric distribution gives the same expected O(log n) shape on average,
 without any node ever needing to be rewritten because of an insert elsewhere.
+
+Concurrency strategy (the story M2.3 decision)
+----------------------------------------------
+
+ARCHITECTURE.md section 2 asks that whichever approach is implemented be written
+down here, because this is the part of the engine most likely to hold a subtle
+bug. The approach chosen is: **one lock around the whole mutating path, and no
+lock at all on the read path**. Readers walk the structure while a writer is
+linking into it, and what makes that safe is the order in which the writer
+publishes its stores, not readers excluding the writer.
+
+Locking granularity, insert versus search:
+
+* Insert, update and physical delete take a single per-instance
+  ``threading.Lock`` for the whole call, from the predecessor search
+  through the last pointer store, and release it on the way out. The
+  granularity is the entire structure. Writers therefore never overlap each
+  other, which is exactly the "single writer at a time" that section 2
+  specifies, and the predecessor list a writer computed cannot go stale under
+  it, since nothing else can relink anything while it holds the lock.
+* Search, lookup, iteration and :func:`len` take nothing at all. The
+  granularity is zero locks and zero atomic operations. A reader's cost does
+  not depend on whether a write is in flight, and a reader cannot deadlock
+  against a writer because it holds nothing to deadlock with.
+
+Why not per-node or hand-over-hand locking, the other candidate section 2 names:
+per-node locks exist so that two writers can work on disjoint stretches of the
+list at once. This design has one writer, so that is concurrency the engine
+never uses, and the price is real: a lock object per node (against a node count
+whose memory footprint is what decides how often a flush happens), an acquire
+and a release per level on the hot insert path, and a lock ordering that has to
+be argued deadlock free. None of it helps readers, which is what this milestone
+is actually about, since readers take no lock under either scheme.
+
+Why not a genuinely lock-free scheme: linking a node without a lock needs an
+atomic compare-and-swap over an object reference, and CPython exposes no such
+primitive. Simulating one with a lock is the design above with extra steps.
+
+What the lock-free read side rests on, listed so that M2.4 can test each point
+and a later reader can check they all still hold:
+
+1. Publication order. A node's own forward pointer for a level is stored before
+   the predecessor at that level is redirected to the node (see
+   :meth:`SkipList.insert`). A reader that can reach the node at some level
+   therefore finds it already pointing at its successor there, so nothing is
+   ever reachable half linked.
+2. Single reference stores. Every store a writer makes to publish a node is one
+   store of one object reference: ``predecessors[i].forward[i] = node``,
+   ``existing.value = value``, ``self._level = level``. Under CPython's global
+   interpreter lock such a store does not interleave with a reader's load of the
+   same slot, so a reader sees either the old reference or the new one, never a
+   half-written one.
+3. Bottom-up linking, then the level bump. Levels are linked upwards from 0, and
+   ``self._level`` is raised only after the node is linked at the new top level.
+   A reader that sees the raised level finds that express lane already
+   populated, and a reader that sees the old level just starts one lane lower
+   and still reaches the key on the way down.
+4. Nodes are never destructively edited. The only field a writer overwrites on a
+   node that is already reachable is ``value``, which is point 2. Keys never
+   change once linked, and an unlinked node keeps its forward pointers instead
+   of having them cleared, so a reader left holding a node that was removed
+   underneath it walks forward into the live list rather than off the end.
+
+What a reader is promised as a result: a search returns either the value in
+place before a concurrent write or the value after it, never a torn or invented
+one, and iteration yields keys in ascending order throughout. What a reader is
+not promised: that it observes a write which lands while it is running. That
+weakening is deliberate. The memtable is the newest layer of the engine, so a
+read that misses a write by microseconds is indistinguishable from the same read
+issued microseconds earlier, and paying for a stronger promise would mean
+serializing every reader behind the writer, which is the thing this milestone
+exists to avoid.
+
+Three scope limits come with the decision and must be carried into M2.4 rather
+than quietly dropped:
+
+* Concurrent *physical* removal is out of scope. Point 4 keeps a reader holding
+  a removed node from walking off the end, but it cannot keep that reader from
+  missing a key inserted into the gap ahead of it after the removal. The engine
+  does not have this problem, because :class:`Memtable` never calls
+  :meth:`SkipList.delete` (a key-value delete is a tombstone insert), so the
+  guarantee is stated for insert and update against concurrent readers, and
+  :meth:`SkipList.delete` stays a single-threaded container operation.
+* Point 2 is an argument about the GIL build, and nothing stops this package
+  being installed on a free-threaded one: ``requires-python`` is a version
+  floor, and a free-threaded 3.13 or later (PEP 703) satisfies it while removing
+  the interpreter lock the argument is made from. So M2.4 has to check
+  ``sys._is_gil_enabled()`` where it exists and fall back to taking the writer
+  lock on the read path too, rather than letting a test that happens to pass on
+  the maintainer's interpreter stand in for a guarantee on the user's.
+* :func:`len` and :attr:`SkipList.level` are approximate while a writer is
+  running: they are read without the lock, so they can be one insert behind.
+  Nothing in the engine branches on them mid-write (the M6.1 flush threshold is
+  checked by the writer, under the lock), so this is a documented limit rather
+  than a problem to fix.
 """
 
 from __future__ import annotations

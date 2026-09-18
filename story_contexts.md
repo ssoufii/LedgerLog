@@ -84,3 +84,27 @@ resurface and look current again, undoing a deletion the caller had already been
 told was done. The note is what stops the search at the right place, and it is
 only cleared away much later, once the engine can be sure no older file still
 mentions the key.
+
+## Story M2.3: Spike: choose concurrency strategy for the memtable
+
+The part of the engine that holds recent changes in memory is read by several
+threads at once while one thread is writing to it. This piece of work did not
+add that ability. It made the decision about how it will work, and wrote the
+decision down where the next person will find it, because getting this wrong
+produces the kind of fault that shows up rarely, under load, as a wrong answer
+rather than a crash. The choice is that a writer takes a single lock for the
+whole of its work, while readers take no lock at all and are never made to wait
+for the writer. Readers stay safe because of the order the writer does things
+in: it finishes preparing a new entry completely before it attaches it to
+anything a reader can reach, so a reader either does not see the entry yet or
+sees it whole.
+
+This matters because the alternative, making readers queue behind the writer,
+would have been much easier to reason about and considerably slower, and because
+a decision like this one tends to get made by accident halfway through writing
+the code otherwise. Writing it down first also made it checkable, so the work
+includes tests that watch the writer at the exact moment it attaches a new
+entry and confirm the four things the decision depends on are really true of the
+code, rather than taking them on trust. The notes also record honestly what the
+decision does not cover, including one situation the engine never actually gets
+into and one kind of Python installation where the reasoning would not hold.
