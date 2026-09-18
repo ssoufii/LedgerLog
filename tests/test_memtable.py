@@ -1,8 +1,9 @@
 """Tests for the skip list backing the memtable, and the tombstone layer above it.
 
 Covers story M2.1 (insert, search, delete, sorted iteration, and correctness
-against a reference sorted structure) and story M2.2 (a delete records a
-tombstone instead of removing the key).
+against a reference sorted structure), story M2.2 (a delete records a tombstone
+instead of removing the key), and the prototype that validates the story M2.3
+concurrency decision.
 
 The M2.2 tests matter most where they check what did *not* happen: a delete at
 the key-value layer has to leave the node in place, and the cheapest way to fake
@@ -19,16 +20,23 @@ alone is enough to satisfy search and iteration. Checking the express lanes
 directly is the only way to catch a linking bug before it turns into a wrong
 answer on some later, larger input.
 
-Concurrency is not exercised here, and that is deliberate rather than an
-omission: neither story makes a thread-safety claim, since neither
-``SkipList`` nor ``Memtable`` carries a lock, so there is nothing to verify yet.
-Stories M2.3 and M2.4 add the concurrency strategy and the multi-threaded stress
-test that CLAUDE.md requires of it.
+The M2.1 and M2.2 tests are single threaded, because neither story makes a
+thread-safety claim. The M2.3 tests at the bottom of this module are a different
+thing again, and the distinction matters when reading them: they do not verify a
+guarantee ``SkipList`` makes, because it still makes none. They are the spike's
+prototype, and their job is to check that the premises the M2.3 decision rests
+on are actually true of this code, so that M2.4 builds its lock on a foundation
+that has been measured rather than assumed. M2.4 is what turns them into a
+guarantee, with the sustained stress test CLAUDE.md requires of one.
 """
 
 from __future__ import annotations
 
+import contextlib
 import random
+import sys
+import threading
+from collections.abc import Callable, Iterator
 
 import pytest
 from hypothesis import HealthCheck, given, settings
@@ -42,6 +50,7 @@ from ledgerlog.memtable import (
     Memtable,
     MemtableEntry,
     SkipList,
+    _Node,
 )
 
 
@@ -854,3 +863,511 @@ def test_arbitrary_put_delete_sequences_match_a_tombstone_aware_reference(
     ]
     assert list(memtable.keys()) == sorted(reference)
     assert_structure_is_sound(memtable._skiplist)
+
+
+# ---------------------------------------------------------------------------
+# Story M2.3: prototype validating the concurrency decision
+#
+# The decision (see memtable.py's "Concurrency strategy" section) is a single
+# writer lock plus a lock-free read path, with correctness coming from the order
+# the writer publishes its stores in. These tests are the "only as much
+# prototype code as needed" part of the spike: they check the four premises that
+# argument rests on, and they prototype the writer lock here in the test module
+# rather than in SkipList, because adding it to SkipList is story M2.4's job and
+# a spike that quietly shipped the implementation would leave nothing to review.
+# ---------------------------------------------------------------------------
+
+SPIKE_KEY_COUNT = 1500
+"""Keys the spike's writer thread inserts while readers run against it.
+
+Large enough that the writer is still going long after the readers start, which
+is the only state in which the readers are testing anything, and small enough
+that the whole module stays fast.
+"""
+
+SPIKE_READER_COUNT = 4
+"""Reader threads run against the single writer."""
+
+THREAD_JOIN_TIMEOUT = 60.0
+"""Seconds to wait for a spike thread before calling it stuck.
+
+A test that deadlocks should fail with a readable message rather than hang a CI
+run until something else kills it, so every join is bounded.
+"""
+
+EVENT_WAIT_TIMEOUT = 10.0
+"""Seconds to wait on a handoff between spike threads before calling it blocked.
+
+Generous on purpose. The blocking this bounds is a reader stuck behind the
+writer's lock, which never clears on its own, so a slow machine cannot turn into
+a false failure by being slow.
+"""
+
+
+def spike_value_for(key: bytes) -> bytes:
+    """Return the one value a given key is ever stored with during the spike.
+
+    Deriving the value from the key is what lets a reader check what it read
+    without coordinating with the writer: any answer other than this value or
+    ``None`` means the read saw something that was never written.
+    """
+    return b"value-for-" + key
+
+
+@contextlib.contextmanager
+def forced_thread_interleaving(interval: float = 1e-6) -> Iterator[None]:
+    """Shorten the interpreter's thread switch interval for the duration.
+
+    Left at its default, a thread usually runs for milliseconds before being
+    switched out, so a writer can finish a whole insert between two of a
+    reader's steps and the interleavings the decision is about would hardly ever
+    be sampled. Cutting the interval forces switches inside the linking loop,
+    which is where a publication-order mistake would show up.
+    """
+    previous = sys.getswitchinterval()
+    sys.setswitchinterval(interval)
+    try:
+        yield
+    finally:
+        sys.setswitchinterval(previous)
+
+
+def start_together(parties: int) -> threading.Barrier:
+    """Return a barrier that releases the spike's threads at the same moment.
+
+    Without it the writer, which is started first, can get most of the way
+    through its inserts before a reader thread is scheduled at all, and the test
+    would then be reading a structure nobody is writing to while still reporting
+    a pass. The barrier is what makes the overlap assertion below meaningful
+    rather than hopeful.
+    """
+    return threading.Barrier(parties, timeout=EVENT_WAIT_TIMEOUT)
+
+
+def assert_readers_overlapped_the_writer(
+    reader_operations: list[int], sizes_at_first_read: list[int]
+) -> None:
+    """Assert the readers really did run against a structure still being built.
+
+    A concurrency test's most likely failure is not a wrong answer but a silent
+    loss of concurrency: if the readers only start once the writer is done, every
+    assertion inside them still passes and the test goes green while testing
+    nothing. Checking both that each reader got work in and that at least one of
+    them saw the structure only part built is what closes that hole.
+    """
+    assert all(count > 0 for count in reader_operations), "a reader thread never ran"
+    assert min(sizes_at_first_read) < SPIKE_KEY_COUNT // 2, (
+        f"every reader started after the writer had already inserted "
+        f"{min(sizes_at_first_read)} of {SPIKE_KEY_COUNT} keys, so nothing was read "
+        f"concurrently with a write"
+    )
+
+
+def run_in_threads(targets: list[Callable[[], None]]) -> None:
+    """Run each callable in its own thread and re-raise on the main thread.
+
+    An assertion that fails inside a thread is otherwise printed to stderr and
+    forgotten, leaving the test green. That is the usual way a concurrency test
+    ends up asserting nothing at all, so failures are collected and re-raised
+    here, and a thread that never finishes is reported as stuck rather than
+    hanging the run.
+    """
+    failures: list[Exception] = []
+    failures_lock = threading.Lock()
+
+    def guarded(target: Callable[[], None]) -> Callable[[], None]:
+        def run() -> None:
+            try:
+                target()
+            except Exception as error:
+                with failures_lock:
+                    failures.append(error)
+
+        return run
+
+    # Daemon threads, so that the join timeout below is the whole story. A
+    # non-daemon thread that is stuck would be reported here and then hang the
+    # interpreter again on the way out, because shutdown joins it with no
+    # timeout, turning a failed test into a hung test run.
+    threads = [threading.Thread(target=guarded(target), daemon=True) for target in targets]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(THREAD_JOIN_TIMEOUT)
+
+    # Failures first: a thread that is still running is very often a thread
+    # waiting on a handoff from one that already died, so reporting the stuck
+    # thread ahead of the exception would hide the reason it is stuck.
+    if failures:
+        raise failures[0]
+
+    stuck = [thread for thread in threads if thread.is_alive()]
+    assert not stuck, f"{len(stuck)} thread(s) did not finish within {THREAD_JOIN_TIMEOUT}s"
+
+
+class PrototypeLockedWriter:
+    """The writer half of the M2.3 decision, prototyped around an unlocked SkipList.
+
+    Every mutating call takes one lock for the whole call, which is the
+    granularity the decision settles on. Readers are deliberately given no way
+    in here: they are expected to call the skip list directly and take nothing,
+    and a test that made them go through this wrapper would be testing a design
+    nobody proposed.
+    """
+
+    def __init__(self, skiplist: SkipList) -> None:
+        self._skiplist = skiplist
+        self._lock = threading.Lock()
+
+    @property
+    def lock(self) -> threading.Lock:
+        """The writer lock, exposed so a test can hold it and watch readers proceed."""
+        return self._lock
+
+    def insert(self, key: bytes, value: bytes) -> None:
+        """Insert under the lock, as :meth:`SkipList.insert` will once M2.4 lands."""
+        with self._lock:
+            self._skiplist.insert(key, value)
+
+
+def iterate_nodes(skiplist: SkipList) -> list[_Node]:
+    """Return every node on level 0, which is the chain that holds all of them."""
+    nodes: list[_Node] = []
+    node = skiplist._head.forward[0]
+    while node is not None:
+        nodes.append(node)
+        node = node.forward[0]
+    return nodes
+
+
+def assert_every_level_is_ascending(skiplist: SkipList) -> None:
+    """Assert each level is sorted and duplicate free, without the size checks.
+
+    This is the part of :func:`assert_structure_is_sound` that has to hold at
+    every single instant, including halfway through an insert. The rest of that
+    function does not: the cached size is bumped after linking, and the reported
+    level after that, so a mid-flight snapshot legitimately disagrees with both.
+    """
+    for index in range(skiplist.max_level):
+        chain: list[bytes] = []
+        node = skiplist._head.forward[index]
+        while node is not None:
+            chain.append(node.key)
+            node = node.forward[index]
+
+        assert chain == sorted(chain), f"level {index} is not in ascending key order"
+        assert len(chain) == len(set(chain)), f"level {index} holds a duplicate key"
+
+
+class PublicationSpy(list):
+    """A node's ``forward`` list that reports every store a writer makes into it.
+
+    Wrapping the list is what makes the check happen at the instant of
+    publication. The alternative, inspecting the structure after the insert
+    returns, cannot tell a writer that linked a node correctly from one that
+    published it before filling it in, because both leave the same final state
+    and only the second is a bug.
+    """
+
+    def __init__(
+        self,
+        items: list[_Node | None],
+        before_store: Callable[[list[_Node | None], int, _Node | None], None],
+        after_store: Callable[[], None],
+    ) -> None:
+        super().__init__(items)
+        self.before_store = before_store
+        self.after_store = after_store
+
+    def __setitem__(self, index: int, value: _Node | None) -> None:
+        self.before_store(self, index, value)
+        super().__setitem__(index, value)
+        self.after_store()
+
+
+def test_spike_a_node_is_fully_linked_at_a_level_before_anything_points_at_it() -> None:
+    """Premises 1 and 3: publication order, and the level bump coming last.
+
+    The list is built with every node at level 1, then one node is forced to the
+    full height, so all six of its links are published in a single insert and the
+    order they happen in is observable.
+    """
+    skiplist = SkipList(max_level=6, rng=_NeverPromote())
+    for key in [b"a", b"c", b"e", b"g"]:
+        skiplist.insert(key, spike_value_for(key))
+    assert skiplist.level == 1
+
+    stores: list[tuple[int, int]] = []
+
+    def before_store(target: list[_Node | None], index: int, value: _Node | None) -> None:
+        assert isinstance(value, _Node), "the insert published something that is not a node"
+        # Premise 1: the node already points at the successor it is taking over,
+        # so a reader that reaches it here finds it whole rather than dangling.
+        assert value.forward[index] is target[index], (
+            f"node {value.key!r} was published at level {index} before its own "
+            f"forward pointer for that level was set"
+        )
+        # Premise 3: record the lane being linked and the level the structure
+        # still reported at that moment, so the bump can be placed afterwards.
+        stores.append((index, skiplist.level))
+
+    def after_store() -> None:
+        assert_every_level_is_ascending(skiplist)
+
+    for node in [skiplist._head, *iterate_nodes(skiplist)]:
+        node.forward = PublicationSpy(node.forward, before_store, after_store)
+
+    skiplist._rng = _AlwaysPromote()
+    skiplist.insert(b"d", spike_value_for(b"d"))
+
+    assert [index for index, _ in stores] == [0, 1, 2, 3, 4, 5], (
+        "levels were not linked from the bottom upwards"
+    )
+    assert {level for _, level in stores} == {1}, (
+        "the reported level rose before the new top lane had been linked"
+    )
+    assert skiplist.level == 6
+    assert_structure_is_sound(skiplist)
+    assert skiplist.search(b"d") == spike_value_for(b"d")
+
+
+def test_spike_an_unlinked_node_still_leads_back_into_the_live_list() -> None:
+    """Premise 4: a removed node keeps its forward pointers rather than dropping them.
+
+    This is what stops a reader that had already stepped onto a node from
+    walking off the end when that node is unlinked underneath it.
+    """
+    skiplist = SkipList()
+    for key in [b"a", b"b", b"c", b"d"]:
+        skiplist.insert(key, spike_value_for(key))
+
+    stranded = skiplist._find_node(b"b")
+    assert stranded is not None
+    assert skiplist.delete(b"b") is True
+
+    walked: list[bytes] = []
+    node: _Node | None = stranded
+    while node is not None:
+        walked.append(node.key)
+        node = node.forward[0]
+
+    assert walked == [b"b", b"c", b"d"], "an unlinked node no longer leads into the live list"
+
+
+def test_spike_a_reader_never_sees_a_wrong_value_while_a_writer_inserts() -> None:
+    """Premises 1 and 2 under real threads: reads are correct or absent, never wrong.
+
+    Every key has exactly one value it is ever stored with, so a reader can
+    check its own answer. Anything other than that value or ``None`` means the
+    read observed a node that was not yet whole.
+    """
+    skiplist = SkipList()
+    keys = [f"key{index:05d}".encode() for index in range(SPIKE_KEY_COUNT)]
+    insertion_order = random.Random(20260918).sample(keys, len(keys))
+
+    writer_finished = threading.Event()
+    started = start_together(SPIKE_READER_COUNT + 1)
+    lookups = [0] * SPIKE_READER_COUNT
+    sizes_at_first_lookup = [SPIKE_KEY_COUNT] * SPIKE_READER_COUNT
+
+    def writer() -> None:
+        try:
+            started.wait()
+            for key in insertion_order:
+                skiplist.insert(key, spike_value_for(key))
+        finally:
+            # Set from a finally so that a writer which raises cannot leave the
+            # readers spinning until the join timeout hides the real failure.
+            writer_finished.set()
+
+    def reader_for(slot: int) -> Callable[[], None]:
+        def run() -> None:
+            rng = random.Random(slot)
+            seen = 0
+            started.wait()
+            sizes_at_first_lookup[slot] = len(skiplist)
+            while not writer_finished.is_set():
+                key = rng.choice(keys)
+                found = skiplist.search(key)
+                assert found is None or found == spike_value_for(key), (
+                    f"read of {key!r} returned {found!r}, which was never written"
+                )
+                seen += 1
+            lookups[slot] = seen
+
+        return run
+
+    with forced_thread_interleaving():
+        run_in_threads([writer, *(reader_for(slot) for slot in range(SPIKE_READER_COUNT))])
+
+    assert_readers_overlapped_the_writer(lookups, sizes_at_first_lookup)
+    for key in keys:
+        assert skiplist.search(key) == spike_value_for(key), f"insert of {key!r} was lost"
+    assert len(skiplist) == len(keys)
+    assert_structure_is_sound(skiplist)
+
+
+def test_spike_concurrent_iteration_stays_sorted_while_a_writer_inserts() -> None:
+    """Premise 1 again, from the angle a flush will use: iteration stays ordered.
+
+    A node published before its forward pointer was set would show up here as a
+    snapshot that is out of order or holds a key twice, which is the failure
+    that would matter most later, since a flush streams this iterator straight
+    into an SSTable's data block and would write an unsorted table.
+    """
+    skiplist = SkipList()
+    keys = [f"key{index:05d}".encode() for index in range(SPIKE_KEY_COUNT)]
+    key_set = set(keys)
+    insertion_order = random.Random(4242).sample(keys, len(keys))
+
+    writer_finished = threading.Event()
+    started = start_together(SPIKE_READER_COUNT + 1)
+    snapshots = [0] * SPIKE_READER_COUNT
+    sizes_at_first_snapshot = [SPIKE_KEY_COUNT] * SPIKE_READER_COUNT
+
+    def writer() -> None:
+        try:
+            started.wait()
+            for key in insertion_order:
+                skiplist.insert(key, spike_value_for(key))
+        finally:
+            writer_finished.set()
+
+    def reader_for(slot: int) -> Callable[[], None]:
+        def run() -> None:
+            taken = 0
+            started.wait()
+            sizes_at_first_snapshot[slot] = len(skiplist)
+            while not writer_finished.is_set():
+                # The size is incremented only after a node is fully linked, so
+                # every one of these keys is already on the level 0 chain and a
+                # walk starting now has to reach all of them. A walk that comes
+                # back short ran off a forward pointer that had not been filled
+                # in yet, which is the symptom of a publication-order bug that
+                # sortedness alone cannot see.
+                at_least = len(skiplist)
+                observed = list(skiplist.keys())
+                assert observed == sorted(observed), "iteration yielded keys out of order"
+                assert len(observed) == len(set(observed)), "iteration yielded a key twice"
+                assert set(observed) <= key_set, "iteration yielded a key nobody wrote"
+                assert len(observed) >= at_least, (
+                    f"iteration reached {len(observed)} keys but {at_least} were already "
+                    f"linked when it started, so the walk ended early"
+                )
+                taken += 1
+            snapshots[slot] = taken
+
+        return run
+
+    with forced_thread_interleaving():
+        run_in_threads([writer, *(reader_for(slot) for slot in range(SPIKE_READER_COUNT))])
+
+    assert_readers_overlapped_the_writer(snapshots, sizes_at_first_snapshot)
+    assert list(skiplist.keys()) == sorted(keys)
+    assert_structure_is_sound(skiplist)
+
+
+def test_spike_readers_do_not_wait_on_the_prototype_writer_lock() -> None:
+    """The point of the whole decision: a reader does not queue behind a writer.
+
+    One thread takes the writer lock and holds it. If the read path took that
+    lock too, every reader would stop dead until it was released, so the readers
+    finishing while it is still held is the observable difference between this
+    design and simply wrapping the structure in one mutex.
+    """
+    skiplist = SkipList()
+    keys = [f"key{index:04d}".encode() for index in range(200)]
+    for key in keys:
+        skiplist.insert(key, spike_value_for(key))
+
+    writer = PrototypeLockedWriter(skiplist)
+    lock_held = threading.Event()
+    may_release = threading.Event()
+    readers_done = [threading.Event() for _ in range(SPIKE_READER_COUNT)]
+
+    def hold_the_lock() -> None:
+        with writer.lock:
+            lock_held.set()
+            assert may_release.wait(EVENT_WAIT_TIMEOUT), "the readers never reported finishing"
+
+    def reader_for(slot: int) -> Callable[[], None]:
+        def run() -> None:
+            assert lock_held.wait(EVENT_WAIT_TIMEOUT), "the writer never took its lock"
+            for key in keys:
+                assert skiplist.search(key) == spike_value_for(key)
+            readers_done[slot].set()
+
+        return run
+
+    def release_once_readers_are_done() -> None:
+        try:
+            for slot, done in enumerate(readers_done):
+                assert done.wait(EVENT_WAIT_TIMEOUT), (
+                    f"reader {slot} did not finish its lookups while the writer held the "
+                    f"lock, so the read path is blocking on the writer lock"
+                )
+        finally:
+            # Released from a finally so that a failed assertion above still
+            # frees the holder thread instead of leaving it stuck until its own
+            # timeout, which would bury this message under a second failure.
+            may_release.set()
+
+    run_in_threads(
+        [hold_the_lock, *(reader_for(slot) for slot in range(SPIKE_READER_COUNT))]
+        + [release_once_readers_are_done]
+    )
+
+    assert all(done.is_set() for done in readers_done)
+
+
+def test_spike_the_prototype_writer_lock_lets_two_writers_share_the_structure() -> None:
+    """The writer half: one lock for the whole mutating call is enough.
+
+    Two writer threads with readers alongside. The decision says nothing finer
+    grained is needed, so the check is that a single whole-call lock loses no
+    write and leaves the express lanes sound, which is where an insert racing
+    another insert's relinking would show up.
+
+    The two writers deliberately interleave across the whole key space rather
+    than taking a range each. Given a range each they would spend almost all
+    their time relinking different stretches of the list, so the predecessors
+    one computed would rarely be the ones the other is changing, and the test
+    would pass just as happily with no lock at all. Alternating keys puts them in
+    each other's way constantly, which is the state the lock exists for.
+    """
+    skiplist = SkipList()
+    writer = PrototypeLockedWriter(skiplist)
+    keys = [f"key{index:05d}".encode() for index in range(SPIKE_KEY_COUNT)]
+    shuffled = random.Random(90210).sample(keys, len(keys))
+    first_share = shuffled[0::2]
+    second_share = shuffled[1::2]
+
+    writers_finished = threading.Event()
+    remaining = [2]
+    remaining_lock = threading.Lock()
+
+    def writer_for(share: list[bytes]) -> Callable[[], None]:
+        def run() -> None:
+            try:
+                for key in share:
+                    writer.insert(key, spike_value_for(key))
+            finally:
+                with remaining_lock:
+                    remaining[0] -= 1
+                    if remaining[0] == 0:
+                        writers_finished.set()
+
+        return run
+
+    def reader() -> None:
+        while not writers_finished.is_set():
+            observed = list(skiplist.keys())
+            assert observed == sorted(observed), "iteration yielded keys out of order"
+
+    with forced_thread_interleaving():
+        run_in_threads([writer_for(first_share), writer_for(second_share), reader])
+
+    for key in keys:
+        assert skiplist.search(key) == spike_value_for(key), f"insert of {key!r} was lost"
+    assert len(skiplist) == len(keys)
+    assert_structure_is_sound(skiplist)
