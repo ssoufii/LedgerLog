@@ -1,11 +1,12 @@
 """Memtable: the in-memory sorted structure that holds recent writes.
 
-Scope of this module today (stories M2.1 and M2.2): the skip list itself, as a
-plain sorted container with insert, search, delete and in-order iteration, plus
-the key-value layer above it that turns a delete into a tombstone. Keys are
-compared as bytes, so iteration order is the byte-lexicographic order that
-SSTables are written in later, and a flush can walk this structure front to back
-without re-sorting anything.
+Scope of this module today (stories M2.1, M2.2 and M2.4): the skip list itself,
+as a plain sorted container with insert, search, delete and in-order iteration,
+the key-value layer above it that turns a delete into a tombstone, and the
+locking that lets many readers run against one writer. Keys are compared as
+bytes, so iteration order is the byte-lexicographic order that SSTables are
+written in later, and a flush can walk this structure front to back without
+re-sorting anything.
 
 Two classes, in two layers. :class:`SkipList` is a sorted container and nothing
 more: its :meth:`SkipList.delete` unlinks the node, which is the ordinary
@@ -43,12 +44,12 @@ inside one process and there is no future reader to keep compatible with it.
 
 What is deliberately not here yet:
 
-* Thread safety (story M2.4). Neither :class:`SkipList` nor :class:`Memtable`
-  carries a lock yet, so neither *makes* a concurrency guarantee today, and
-  callers sharing an instance between threads must still synchronize
-  externally. The strategy those locks will follow is decided, and is written
-  down under "Concurrency strategy" below: story M2.3 chose it, and M2.4 adds
-  the lock and the multi-threaded tests that turn it into a promise.
+* Thread-safe *physical* removal. :meth:`SkipList.delete` takes the writer lock
+  like any other mutation, so two writers cannot tear the structure between
+  them, but it is still not safe to run against concurrent readers, for the
+  reason given under "Concurrency strategy" below. The engine never asks it to
+  be: a key-value delete is a tombstone insert, so :class:`Memtable` never
+  unlinks anything.
 * The size accounting that decides when a memtable is full enough to freeze and
   flush (story M6.1). :func:`len` counts records here, which is not the byte
   measure the flush threshold is expressed in.
@@ -76,15 +77,23 @@ which is the cost the skip list exists to avoid. Drawing each node's height from
 a geometric distribution gives the same expected O(log n) shape on average,
 without any node ever needing to be rewritten because of an insert elsewhere.
 
-Concurrency strategy (the story M2.3 decision)
-----------------------------------------------
+Concurrency strategy (chosen in M2.3, implemented in M2.4)
+----------------------------------------------------------
 
 ARCHITECTURE.md section 2 asks that whichever approach is implemented be written
 down here, because this is the part of the engine most likely to hold a subtle
-bug. The approach chosen is: **one lock around the whole mutating path, and no
-lock at all on the read path**. Readers walk the structure while a writer is
+bug. The approach implemented is: **one lock around the whole mutating path, and
+no lock at all on the read path**. Readers walk the structure while a writer is
 linking into it, and what makes that safe is the order in which the writer
 publishes its stores, not readers excluding the writer.
+
+What that buys the caller, stated as the promise the engine may rely on: one
+writer thread may call :meth:`Memtable.put`, :meth:`Memtable.delete` or
+:meth:`SkipList.insert` while any number of reader threads call the lookup and
+iteration methods, with no external synchronization. Two or more writer threads
+are also safe against each other, since they serialize on the lock, though the
+engine only ever runs one (ARCHITECTURE.md section 2), so nothing is tuned for
+that case.
 
 Locking granularity, insert versus search:
 
@@ -95,10 +104,12 @@ Locking granularity, insert versus search:
   other, which is exactly the "single writer at a time" that section 2
   specifies, and the predecessor list a writer computed cannot go stale under
   it, since nothing else can relink anything while it holds the lock.
-* Search, lookup, iteration and :func:`len` take nothing at all. The
-  granularity is zero locks and zero atomic operations. A reader's cost does
-  not depend on whether a write is in flight, and a reader cannot deadlock
-  against a writer because it holds nothing to deadlock with.
+* Search, lookup, iteration and :func:`len` take nothing at all on an
+  interpreter with a GIL, which is every build except a free-threaded one (the
+  second scope limit below is the exception, and the only place a reader ever
+  waits). The granularity is zero locks and zero atomic operations. A reader's
+  cost does not depend on whether a write is in flight, and a reader cannot
+  deadlock against a writer because it holds nothing to deadlock with.
 
 Why not per-node or hand-over-hand locking, the other candidate section 2 names:
 per-node locks exist so that two writers can work on disjoint stretches of the
@@ -113,8 +124,9 @@ Why not a genuinely lock-free scheme: linking a node without a lock needs an
 atomic compare-and-swap over an object reference, and CPython exposes no such
 primitive. Simulating one with a lock is the design above with extra steps.
 
-What the lock-free read side rests on, listed so that M2.4 can test each point
-and a later reader can check they all still hold:
+What the lock-free read side rests on, listed so that a later reader can check
+each point still holds. Every one of them has a test of its own in
+``tests/test_memtable.py``, because an argument like this one rots silently:
 
 1. Publication order. A node's own forward pointer for a level is stored before
    the predecessor at that level is redirected to the node (see
@@ -148,8 +160,8 @@ issued microseconds earlier, and paying for a stronger promise would mean
 serializing every reader behind the writer, which is the thing this milestone
 exists to avoid.
 
-Three scope limits come with the decision and must be carried into M2.4 rather
-than quietly dropped:
+Three scope limits come with the decision, and are limits of the implementation
+too rather than things M2.4 quietly dropped:
 
 * Concurrent *physical* removal is out of scope. Point 4 keeps a reader holding
   a removed node from walking off the end, but it cannot keep that reader from
@@ -157,27 +169,60 @@ than quietly dropped:
   does not have this problem, because :class:`Memtable` never calls
   :meth:`SkipList.delete` (a key-value delete is a tombstone insert), so the
   guarantee is stated for insert and update against concurrent readers, and
-  :meth:`SkipList.delete` stays a single-threaded container operation.
+  :meth:`SkipList.delete` stays a writer-only operation: it takes the lock, so
+  writers are safe against each other, but a reader running alongside it is not
+  covered by anything above.
 * Point 2 is an argument about the GIL build, and nothing stops this package
   being installed on a free-threaded one: ``requires-python`` is a version
   floor, and a free-threaded 3.13 or later (PEP 703) satisfies it while removing
-  the interpreter lock the argument is made from. So M2.4 has to check
-  ``sys._is_gil_enabled()`` where it exists and fall back to taking the writer
-  lock on the read path too, rather than letting a test that happens to pass on
-  the maintainer's interpreter stand in for a guarantee on the user's.
+  the interpreter lock the argument is made from. So the read path checks
+  ``sys._is_gil_enabled()`` once at import (:data:`READS_TAKE_THE_WRITER_LOCK`)
+  and, where the GIL is gone, takes the writer lock on the way through as well.
+  Readers then do queue behind the writer on such a build, which costs exactly
+  the concurrency this milestone is about, and that is the right trade: a
+  guarantee that holds only on the maintainer's interpreter is not a guarantee.
+  Caching the answer at import is safe in the one direction it can move. A
+  free-threaded interpreter may re-enable the GIL later (loading an extension
+  that demands it), never disable it, so a cached "no GIL" can only leave this
+  module locking reads it no longer needs to, and a cached "GIL" cannot go
+  stale.
 * :func:`len` and :attr:`SkipList.level` are approximate while a writer is
-  running: they are read without the lock, so they can be one insert behind.
-  Nothing in the engine branches on them mid-write (the M6.1 flush threshold is
-  checked by the writer, under the lock), so this is a documented limit rather
-  than a problem to fix.
+  running: they are read without the lock on every build, so they can be one
+  insert behind. Both are a single load of an ``int`` attribute, which no build
+  can tear into a value nobody stored, so what a caller can see is an older
+  count and never a wrong one. Nothing in the engine branches on them mid-write
+  (the M6.1 flush threshold is checked by the writer, under the lock), so this
+  is a documented limit rather than a problem to fix.
 """
 
 from __future__ import annotations
 
+import contextlib
 import random
-from collections.abc import Iterator
+import sys
+import threading
+from collections.abc import Callable, Iterator
+from contextlib import AbstractContextManager
 from dataclasses import dataclass
-from typing import NoReturn
+from typing import NoReturn, TypeVar
+
+_T = TypeVar("_T")
+"""What one step of a level 0 walk yields: a key, or a key and its value."""
+
+READS_TAKE_THE_WRITER_LOCK = not getattr(sys, "_is_gil_enabled", lambda: True)()
+"""Whether the read path has to take the writer lock to be safe on this interpreter.
+
+False on a stock CPython build, where the global interpreter lock already makes
+each of the writer's publishing stores indivisible, so readers take nothing.
+True on a free-threaded build (PEP 703), where it does not, and readers fall back
+to the writer's lock. ``sys._is_gil_enabled`` only exists from 3.13, hence the
+default: an interpreter too old to have it is one that cannot drop the GIL.
+
+Read once at import rather than per call. See the "Concurrency strategy" section
+of this module's docstring for why a cached answer cannot become unsafe, and why
+a build that pays for this flag is accepting slower reads in exchange for the
+guarantee holding at all.
+"""
 
 DEFAULT_MAX_LEVEL = 16
 """Highest number of forward pointers any node may have by default.
@@ -232,8 +277,13 @@ class SkipList:
     edit it after insertion and silently move it out of position, leaving a list
     that no longer sorts and searches that miss keys which are present.
 
-    Not thread safe. See this module's docstring for why, and for which story
-    changes that.
+    Safe for one writer thread running against any number of reader threads,
+    with no synchronization required of the caller. Mutating calls serialize on
+    a per-instance lock, so several writer threads are safe against each other
+    too; lookups and iteration take nothing on a stock CPython build.
+    :meth:`delete` is the exception and must not run while readers are in the
+    structure. This module's docstring gives the full argument, the reasons for
+    that exception, and the two things a reader is not promised.
     """
 
     def __init__(
@@ -261,6 +311,23 @@ class SkipList:
         self._max_level = max_level
         self._level_probability = level_probability
         self._rng = rng if rng is not None else random.Random()
+
+        # One lock per instance, covering the whole of every mutating call. Two
+        # memtables (the active one and a frozen one mid-flush, from M6.1 on)
+        # are written independently, so a lock shared between them would make
+        # each wait on the other for nothing.
+        self._lock = threading.Lock()
+
+        # The read path's guard, decided once here rather than branched on at
+        # every lookup: a reusable no-op on a build whose GIL already does the
+        # job, and the writer's own lock on one without it. Holding it as an
+        # object keeps the hot read path to an attribute load, and keeps the
+        # difference between the two builds in one place instead of spread
+        # across every reading method.
+        self._locked_reads = READS_TAKE_THE_WRITER_LOCK
+        self._read_guard: AbstractContextManager[object] = (
+            self._lock if self._locked_reads else contextlib.nullcontext()
+        )
 
         # The head is a sentinel holding no key. It is allocated at full height
         # up front so that promoting a node to a new level never has to grow the
@@ -294,7 +361,8 @@ class SkipList:
         """Report whether ``key`` is present, without returning its value."""
         if not isinstance(key, bytes):
             return False
-        return self._find_node(key) is not None
+        with self._read_guard:
+            return self._find_node(key) is not None
 
     def insert(self, key: bytes, value: bytes) -> None:
         """Store ``value`` under ``key``, replacing any value already there.
@@ -305,33 +373,44 @@ class SkipList:
         happened to stop at. Keeping one node per key also means the length is
         the number of distinct live keys, so measuring the memtable or flushing
         it never has to de-duplicate first.
+
+        Takes this instance's writer lock for the whole call, so a second writer
+        cannot relink a predecessor between the search for it and the stores
+        below that rely on it. Readers are not excluded and do not wait: see
+        this module's docstring for why they still cannot observe a half-linked
+        node.
         """
         _check_key(key)
         _check_value(value)
 
-        predecessors = self._find_predecessors(key)
+        with self._lock:
+            predecessors = self._find_predecessors(key)
 
-        existing = predecessors[0].forward[0]
-        if existing is not None and existing.key == key:
-            existing.value = value
-            return
+            existing = predecessors[0].forward[0]
+            if existing is not None and existing.key == key:
+                existing.value = value
+                return
 
-        level = self._random_level()
-        node = _Node(key, value, level)
+            level = self._random_level()
+            node = _Node(key, value, level)
 
-        # Link the new node in one level at a time. The node's own forward
-        # pointer for a level is set before the predecessor at that level is
-        # redirected to it, so the node is fully formed at a level by the time
-        # anything points at it there. That ordering is what M2.4 will build its
-        # concurrency argument on; by itself it makes no thread-safety promise.
-        for index in range(level):
-            node.forward[index] = predecessors[index].forward[index]
-            predecessors[index].forward[index] = node
+            # Link the new node in one level at a time. The node's own forward
+            # pointer for a level is set before the predecessor at that level is
+            # redirected to it, so the node is fully formed at a level by the
+            # time anything points at it there. That ordering is what the whole
+            # lock-free read path rests on (premise 1 in the module docstring),
+            # so it is not an incidental way of writing the loop.
+            for index in range(level):
+                node.forward[index] = predecessors[index].forward[index]
+                predecessors[index].forward[index] = node
 
-        if level > self._level:
-            self._level = level
+            # Both of these are published only once the node is reachable. A
+            # reader seeing the raised level finds that lane already linked, and
+            # a reader seeing the new size finds the key already on level 0.
+            if level > self._level:
+                self._level = level
 
-        self._size += 1
+            self._size += 1
 
     def search(self, key: bytes) -> bytes | None:
         """Return the value stored under ``key``, or ``None`` if it is absent.
@@ -342,10 +421,15 @@ class SkipList:
         the same one the WAL draws between a put of an empty value and a delete,
         and it has to survive into the memtable for tombstones (M2.2) to mean
         anything.
+
+        Safe to call from any number of threads while one writer is inserting,
+        and on a stock CPython build it takes no lock to do it, so a lookup
+        never waits on a write it does not depend on.
         """
         _check_key(key)
-        node = self._find_node(key)
-        return None if node is None else node.value
+        with self._read_guard:
+            node = self._find_node(key)
+            return None if node is None else node.value
 
     def delete(self, key: bytes) -> bool:
         """Unlink ``key``'s node and return whether it was there to begin with.
@@ -355,40 +439,53 @@ class SkipList:
         delete, which must leave a tombstone behind so that it shadows an older
         value on disk, is story M2.2 and is layered on top of this rather than
         changing what this method does.
+
+        Takes the writer lock like every other mutation, so writers are safe
+        against each other here. It is still the one method that must not run
+        while readers are walking the structure, because unlinking is the single
+        case the lock-free read path cannot be made to cover: see the scope
+        limits in this module's docstring. Nothing in the engine calls it
+        concurrently, since a key-value delete is a tombstone insert.
         """
         _check_key(key)
 
-        predecessors = self._find_predecessors(key)
+        with self._lock:
+            predecessors = self._find_predecessors(key)
 
-        node = predecessors[0].forward[0]
-        if node is None or node.key != key:
-            return False
+            node = predecessors[0].forward[0]
+            if node is None or node.key != key:
+                return False
 
-        # Only unlink at the levels where this node is actually the predecessor's
-        # successor. A node of height 2 must not be unlinked at level 5, where
-        # some other node is linked instead.
-        for index in range(node.level):
-            if predecessors[index].forward[index] is node:
-                predecessors[index].forward[index] = node.forward[index]
+            # Only unlink at the levels where this node is actually the
+            # predecessor's successor. A node of height 2 must not be unlinked
+            # at level 5, where some other node is linked instead.
+            for index in range(node.level):
+                if predecessors[index].forward[index] is node:
+                    predecessors[index].forward[index] = node.forward[index]
 
-        # Give back any levels the removed node was the only occupant of, so that
-        # a search does not keep paying to descend through empty express lanes
-        # after a large number of deletes.
-        while self._level > 1 and self._head.forward[self._level - 1] is None:
-            self._level -= 1
+            # Give back any levels the removed node was the only occupant of, so
+            # that a search does not keep paying to descend through empty
+            # express lanes after a large number of deletes.
+            while self._level > 1 and self._head.forward[self._level - 1] is None:
+                self._level -= 1
 
-        self._size -= 1
-        return True
+            self._size -= 1
+            return True
 
     def keys(self) -> Iterator[bytes]:
-        """Yield every stored key in ascending byte order."""
-        node = self._head.forward[0]
-        while node is not None:
-            yield node.key
-            node = node.forward[0]
+        """Return an iterator over every stored key, in ascending byte order.
+
+        Safe to run while a writer inserts. Keys the writer adds ahead of the
+        walk may or may not be seen, which is the weaker promise this module's
+        docstring spells out, but the keys that come back are always sorted and
+        were always really stored.
+        """
+        if self._locked_reads:
+            return iter(self._snapshot(self._walk_keys))
+        return self._walk_keys()
 
     def items(self) -> Iterator[tuple[bytes, bytes]]:
-        """Yield every ``(key, value)`` pair in ascending key order.
+        """Return an iterator over every ``(key, value)`` pair, in ascending key order.
 
         Iteration walks level 0, which holds every node, so this is a linear scan
         of a sorted linked list and needs no traversal of the upper levels. This
@@ -396,10 +493,43 @@ class SkipList:
         in key order, so the flush consumes this iterator directly instead of
         sorting a snapshot.
         """
+        if self._locked_reads:
+            return iter(self._snapshot(self._walk_items))
+        return self._walk_items()
+
+    def _walk_keys(self) -> Iterator[bytes]:
+        """Walk level 0 lazily, yielding keys."""
+        node = self._head.forward[0]
+        while node is not None:
+            yield node.key
+            node = node.forward[0]
+
+    def _walk_items(self) -> Iterator[tuple[bytes, bytes]]:
+        """Walk level 0 lazily, yielding key-value pairs."""
         node = self._head.forward[0]
         while node is not None:
             yield node.key, node.value
             node = node.forward[0]
+
+    def _snapshot(self, walk: Callable[[], Iterator[_T]]) -> list[_T]:
+        """Drain ``walk`` into a list under the writer lock, for locked-read builds.
+
+        Two things are going on here, and they answer different questions. The
+        lock is what makes the walk consistent on a build with no GIL to make
+        the writer's stores indivisible. Draining it into a list *before*
+        returning is what keeps that lock off the caller's timeline: a lazy
+        generator holding the lock across its yields would stay holding it for
+        as long as the caller took to consume it, and a caller that inserted
+        while iterating (or abandoned the iterator half way) would deadlock the
+        writer or strand the lock outright.
+
+        The price is a list of every key, paid only on a free-threaded build.
+        That is real, and it is the same price a caller would pay by writing
+        ``list(memtable.keys())`` for safety, which is the alternative if this
+        method does not do it for them.
+        """
+        with self._lock:
+            return list(walk())
 
     def __iter__(self) -> Iterator[bytes]:
         """Iterate keys in ascending byte order, matching :meth:`keys`."""
@@ -565,7 +695,14 @@ class Memtable:
     :meth:`get` for "is there a value", and :meth:`lookup` for "is there a
     record, and what kind".
 
-    Not thread safe, for the reasons in this module's docstring.
+    Carries the same concurrency guarantee as the :class:`SkipList` underneath:
+    one writer thread calling :meth:`put` or :meth:`delete` against any number
+    of reader threads, with no synchronization asked of the caller. It adds no
+    lock of its own, and does not need one, because every mutating call it makes
+    is a single :meth:`SkipList.insert` (a key-value delete writes a tombstone
+    rather than unlinking, so the container's writer-only :meth:`SkipList.delete`
+    is never reached from here). Tagging and decoding happen outside the lock on
+    ``bytes`` objects, which nothing mutates once made.
     """
 
     def __init__(

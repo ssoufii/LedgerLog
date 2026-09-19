@@ -108,3 +108,21 @@ entry and confirm the four things the decision depends on are really true of the
 code, rather than taking them on trust. The notes also record honestly what the
 decision does not cover, including one situation the engine never actually gets
 into and one kind of Python installation where the reasoning would not hold.
+
+## Story M2.4: Concurrent memtable, single writer and concurrent readers
+
+The in-memory table that holds recent writes can now be used from several
+threads at once. One thread adds and updates entries while any number of other
+threads look things up, and the lookups do not have to wait their turn. Only the
+writing side takes a lock, so two writers can never get in each other's way,
+while readers walk the table freely and still see either the old entry or the
+new one, never something half finished.
+
+This matters because the engine reads from this table constantly, and making
+every reader queue behind whatever write happened to be in progress would have
+slowed all of them down for no reason. The work comes with tests that run real
+threads, hammering the table with thousands of reads while writes are going in,
+and then check afterwards that not one write went missing. There is also a
+safety net for a newer kind of Python installation where the usual guarantees do
+not hold, in which readers quietly go back to waiting, because a promise that is
+only true on some machines is not worth making.
