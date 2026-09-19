@@ -126,3 +126,19 @@ and then check afterwards that not one write went missing. There is also a
 safety net for a newer kind of Python installation where the usual guarantees do
 not hold, in which readers quietly go back to waiting, because a promise that is
 only true on some machines is not worth making.
+
+## Story M3.1: Engine write path, WAL then memtable
+
+The two pieces built so far are now joined into something you can actually use:
+a store with set, get and delete. Every change is written to the log file on
+disk first, and only then applied to the fast in-memory table that answers
+reads. That order is the whole point of this story. It means anything you are
+allowed to read back has already been saved, never the other way round.
+
+The same rule covers failure. If writing to the log does not work, for a bad
+value or a full disk, the in-memory table is left exactly as it was, so the
+change simply did not happen instead of half happening. Several threads can use
+the store at once: writers take turns, while readers carry on without waiting.
+Starting the store again after a shutdown does not yet bring back the earlier
+writes, which is the next story's job, but they are safely on disk waiting for
+it.
