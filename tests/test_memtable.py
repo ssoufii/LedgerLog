@@ -28,6 +28,13 @@ prototype, and their job is to check that the premises the M2.3 decision rests
 on are actually true of this code, so that M2.4 builds its lock on a foundation
 that has been measured rather than assumed. M2.4 is what turns them into a
 guarantee, with the sustained stress test CLAUDE.md requires of one.
+
+The M2.4 tests in the last section are that guarantee. They differ from the
+spike's in where the lock lives: the spike wrapped an unlocked ``SkipList`` in a
+prototype writer defined in this module, while these call ``SkipList`` and
+``Memtable`` exactly as the engine will and rely on the locking inside them. All
+of them use real threads, because a single-threaded stand-in would let every one
+of the story's acceptance criteria pass without a second thread ever existing.
 """
 
 from __future__ import annotations
@@ -42,11 +49,13 @@ import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
+from ledgerlog import memtable as memtable_module
 from ledgerlog.memtable import (
     _TAG_DELETE,
     _TAG_PUT,
     DEFAULT_LEVEL_PROBABILITY,
     DEFAULT_MAX_LEVEL,
+    READS_TAKE_THE_WRITER_LOCK,
     Memtable,
     MemtableEntry,
     SkipList,
@@ -945,7 +954,9 @@ def start_together(parties: int) -> threading.Barrier:
 
 
 def assert_readers_overlapped_the_writer(
-    reader_operations: list[int], sizes_at_first_read: list[int]
+    reader_operations: list[int],
+    sizes_at_first_read: list[int],
+    total_keys: int = SPIKE_KEY_COUNT,
 ) -> None:
     """Assert the readers really did run against a structure still being built.
 
@@ -954,11 +965,14 @@ def assert_readers_overlapped_the_writer(
     assertion inside them still passes and the test goes green while testing
     nothing. Checking both that each reader got work in and that at least one of
     them saw the structure only part built is what closes that hole.
+
+    ``total_keys`` is how many records the writer will have written by the end,
+    so the M2.4 tests below can reuse this with their own workload sizes.
     """
     assert all(count > 0 for count in reader_operations), "a reader thread never ran"
-    assert min(sizes_at_first_read) < SPIKE_KEY_COUNT // 2, (
+    assert min(sizes_at_first_read) < total_keys // 2, (
         f"every reader started after the writer had already inserted "
-        f"{min(sizes_at_first_read)} of {SPIKE_KEY_COUNT} keys, so nothing was read "
+        f"{min(sizes_at_first_read)} of {total_keys} keys, so nothing was read "
         f"concurrently with a write"
     )
 
@@ -1371,3 +1385,507 @@ def test_spike_the_prototype_writer_lock_lets_two_writers_share_the_structure() 
         assert skiplist.search(key) == spike_value_for(key), f"insert of {key!r} was lost"
     assert len(skiplist) == len(keys)
     assert_structure_is_sound(skiplist)
+
+
+# ---------------------------------------------------------------------------
+# Story M2.4: concurrent memtable, single writer and concurrent readers
+#
+# These run against the locking that now lives inside SkipList, so they test the
+# shipped guarantee rather than a prototype. Each one is built to fail loudly if
+# the lock were removed, or if it were widened to cover the read path, since a
+# concurrency test that would pass either way is the usual way this kind of
+# guarantee quietly stops being true.
+# ---------------------------------------------------------------------------
+
+STRESS_KEY_COUNT = 5000
+"""Records the writer thread produces while the reader threads run against it.
+
+Large enough that the writer is still working long after the readers start, and
+small enough to keep this module a few seconds rather than a minute.
+"""
+
+STRESS_READER_COUNT = 6
+"""Reader threads per stress test, comfortably more than one so that readers are
+contending with each other as well as with the writer."""
+
+BLOCKED_READER_WAIT = 0.25
+"""Seconds to watch a reader that is expected *not* to finish.
+
+Only used where the reader is provably blocked (something else is holding the
+lock it needs), so a slow machine can only make this test more likely to pass
+honestly, never flakily fail. The wait is short because nothing is being waited
+for: it is the length of the observation, not a timeout.
+"""
+
+DELETE_EVERY = 3
+"""One key in this many is deleted by the writer in the memtable stress test.
+
+Deleting some but not all keys is what makes a reader's answer checkable: a
+tombstone for a key outside the delete set would be a record nobody wrote.
+"""
+
+
+def stress_keys(count: int = STRESS_KEY_COUNT) -> list[bytes]:
+    """Return the key space for a stress test, in ascending order."""
+    return [f"key{index:05d}".encode() for index in range(count)]
+
+
+@pytest.mark.skipif(
+    READS_TAKE_THE_WRITER_LOCK,
+    reason="this interpreter has no GIL, so the read path takes the writer lock by design",
+)
+def test_a_held_writer_lock_does_not_stop_readers_from_finishing() -> None:
+    """Criterion 1: a reader does not queue behind a write it does not depend on.
+
+    One thread takes the writer lock and holds it. Every reader has to finish
+    all of its lookups before that thread is allowed to let go, so the test can
+    only pass if the read path takes no lock at all. Replacing the design with a
+    single mutex around the whole structure fails here rather than somewhere
+    subtle later.
+
+    Holding the lock directly, rather than parking a writer mid-insert, is
+    deliberate: it is the strongest version of the situation, since the lock
+    stays held for as long as the readers need instead of for the microseconds
+    an insert takes.
+    """
+    skiplist = SkipList()
+    keys = stress_keys(200)
+    for key in keys:
+        skiplist.insert(key, spike_value_for(key))
+
+    lock_held = threading.Event()
+    may_release = threading.Event()
+    readers_done = [threading.Event() for _ in range(STRESS_READER_COUNT)]
+
+    def hold_the_writer_lock() -> None:
+        with skiplist._lock:
+            lock_held.set()
+            assert may_release.wait(EVENT_WAIT_TIMEOUT), "the readers never reported finishing"
+
+    def reader_for(slot: int) -> Callable[[], None]:
+        def run() -> None:
+            assert lock_held.wait(EVENT_WAIT_TIMEOUT), "the writer lock was never taken"
+            for key in keys:
+                assert skiplist.search(key) == spike_value_for(key)
+                assert key in skiplist
+            assert list(skiplist.keys()) == keys
+            readers_done[slot].set()
+
+        return run
+
+    def release_once_readers_are_done() -> None:
+        try:
+            for slot, done in enumerate(readers_done):
+                assert done.wait(EVENT_WAIT_TIMEOUT), (
+                    f"reader {slot} did not finish while the writer lock was held, so the "
+                    f"read path is waiting on the writer"
+                )
+        finally:
+            # From a finally, so a failure above still frees the holder thread
+            # instead of burying this message under a second, stuck-thread one.
+            may_release.set()
+
+    run_in_threads(
+        [hold_the_writer_lock]
+        + [reader_for(slot) for slot in range(STRESS_READER_COUNT)]
+        + [release_once_readers_are_done]
+    )
+
+    assert all(done.is_set() for done in readers_done)
+    assert_structure_is_sound(skiplist)
+
+
+def test_readers_and_one_writer_stress_the_skip_list_without_losing_a_write() -> None:
+    """Criteria 2 and 3 on the container: sustained load, then every write is there.
+
+    The readers assert on what they see as they see it, which is what catches a
+    torn read, and the main thread asserts afterwards on the whole key space,
+    which is what catches a lost write. Both halves are needed: readers alone
+    would not notice a key that was silently dropped, and the final sweep alone
+    would not notice that a reader had briefly been handed a value nobody wrote.
+    """
+    skiplist = SkipList()
+    keys = stress_keys()
+    insertion_order = random.Random(20260919).sample(keys, len(keys))
+
+    writer_finished = threading.Event()
+    started = start_together(STRESS_READER_COUNT + 1)
+    reader_operations = [0] * STRESS_READER_COUNT
+    sizes_at_first_read = [STRESS_KEY_COUNT] * STRESS_READER_COUNT
+
+    def writer() -> None:
+        try:
+            started.wait()
+            for key in insertion_order:
+                skiplist.insert(key, spike_value_for(key))
+        finally:
+            # From a finally, so a writer that raises cannot leave the readers
+            # spinning until the join timeout hides the real failure.
+            writer_finished.set()
+
+    def reader_for(slot: int) -> Callable[[], None]:
+        def run() -> None:
+            rng = random.Random(slot)
+            done = 0
+            started.wait()
+            sizes_at_first_read[slot] = len(skiplist)
+            while not writer_finished.is_set():
+                key = rng.choice(keys)
+                found = skiplist.search(key)
+                assert found is None or found == spike_value_for(key), (
+                    f"lookup of {key!r} returned {found!r}, which was never written"
+                )
+                # Every so often, walk the structure instead of probing it. A
+                # publication mistake shows up in a walk as a key out of order
+                # or a chain that ends early, neither of which a point lookup
+                # for a key that happens to be elsewhere would ever see.
+                if done % 50 == 0:
+                    linked = len(skiplist)
+                    observed = list(skiplist.keys())
+                    assert observed == sorted(observed), "iteration yielded keys out of order"
+                    assert len(observed) == len(set(observed)), "iteration yielded a key twice"
+                    assert len(observed) >= linked, (
+                        f"iteration reached {len(observed)} keys but {linked} were already "
+                        f"linked when it started, so the walk ended early"
+                    )
+                done += 1
+            reader_operations[slot] = done
+
+        return run
+
+    with forced_thread_interleaving():
+        run_in_threads([writer, *(reader_for(slot) for slot in range(STRESS_READER_COUNT))])
+
+    assert_readers_overlapped_the_writer(
+        reader_operations, sizes_at_first_read, total_keys=STRESS_KEY_COUNT
+    )
+    for key in keys:
+        assert skiplist.search(key) == spike_value_for(key), f"insert of {key!r} was lost"
+    assert len(skiplist) == len(keys)
+    assert list(skiplist.keys()) == keys
+    assert_structure_is_sound(skiplist)
+
+
+def test_readers_and_one_writer_stress_the_memtable_including_tombstones() -> None:
+    """Criteria 2 and 3 at the layer the engine actually writes through.
+
+    The skip list test above covers inserts of new keys. This one adds the two
+    things the engine does that inserts of new keys do not: it overwrites keys
+    (a delete is a tombstone written over the value, which takes the update path
+    inside insert rather than the linking path) and it asks readers to tell a
+    tombstone from an absent record while that is happening.
+
+    A reader here has three honest answers for a key, and one dishonest one. No
+    record, the key's one value, and a tombstone are all fine, in that order over
+    time; a tombstone for a key the writer never deletes is not, and is what a
+    lost or misapplied update would look like.
+    """
+    memtable = Memtable()
+    keys = stress_keys()
+    deleted = {key for index, key in enumerate(keys) if index % DELETE_EVERY == 0}
+    write_order = random.Random(20260920).sample(keys, len(keys))
+
+    writer_finished = threading.Event()
+    started = start_together(STRESS_READER_COUNT + 1)
+    reader_operations = [0] * STRESS_READER_COUNT
+    sizes_at_first_read = [STRESS_KEY_COUNT] * STRESS_READER_COUNT
+
+    def writer() -> None:
+        try:
+            started.wait()
+            for key in write_order:
+                memtable.put(key, spike_value_for(key))
+                if key in deleted:
+                    memtable.delete(key)
+        finally:
+            writer_finished.set()
+
+    def reader_for(slot: int) -> Callable[[], None]:
+        def run() -> None:
+            rng = random.Random(1000 + slot)
+            done = 0
+            started.wait()
+            sizes_at_first_read[slot] = len(memtable)
+            while not writer_finished.is_set():
+                key = rng.choice(keys)
+                entry = memtable.lookup(key)
+                if entry is not None and entry.is_tombstone:
+                    assert key in deleted, f"{key!r} read as deleted but was never deleted"
+                elif entry is not None:
+                    assert entry.value == spike_value_for(key), (
+                        f"lookup of {key!r} returned {entry.value!r}, which was never written"
+                    )
+                    assert memtable.get(key) in (spike_value_for(key), None)
+                if done % 50 == 0:
+                    observed = [record.key for record in memtable.entries()]
+                    assert observed == sorted(observed), "iteration yielded records out of order"
+                    assert len(observed) == len(set(observed)), "iteration yielded a key twice"
+                done += 1
+            reader_operations[slot] = done
+
+        return run
+
+    with forced_thread_interleaving():
+        run_in_threads([writer, *(reader_for(slot) for slot in range(STRESS_READER_COUNT))])
+
+    assert_readers_overlapped_the_writer(
+        reader_operations, sizes_at_first_read, total_keys=STRESS_KEY_COUNT
+    )
+    for key in keys:
+        entry = memtable.lookup(key)
+        assert entry is not None, f"record for {key!r} was lost"
+        if key in deleted:
+            assert entry.is_tombstone, f"delete of {key!r} was lost"
+            assert memtable.get(key) is None
+        else:
+            assert entry.value == spike_value_for(key), f"put of {key!r} was lost"
+    assert len(memtable) == len(keys)
+    assert list(memtable.keys()) == keys
+    assert_structure_is_sound(memtable._skiplist)
+
+
+def test_two_writer_threads_share_the_structure_without_losing_an_insert() -> None:
+    """The writer half of the lock, now that it lives in :meth:`SkipList.insert`.
+
+    The engine runs one writer, so this is not a case it will hit. It is here
+    because it is the test that fails if the lock inside ``insert`` is ever
+    removed: with one writer the lock is unobservable, and every other test in
+    this section would keep passing without it.
+
+    The two writers alternate across the whole key space rather than taking a
+    range each. Given a range each they would mostly be relinking different
+    stretches of the list and could pass with no lock at all; alternating puts
+    them in each other's predecessors constantly, which is the state the lock
+    exists for.
+    """
+    skiplist = SkipList()
+    keys = stress_keys()
+    shuffled = random.Random(20260921).sample(keys, len(keys))
+    shares = [shuffled[0::2], shuffled[1::2]]
+
+    writers_finished = threading.Event()
+    remaining = [len(shares)]
+    remaining_lock = threading.Lock()
+
+    def writer_for(share: list[bytes]) -> Callable[[], None]:
+        def run() -> None:
+            try:
+                for key in share:
+                    skiplist.insert(key, spike_value_for(key))
+            finally:
+                with remaining_lock:
+                    remaining[0] -= 1
+                    if remaining[0] == 0:
+                        writers_finished.set()
+
+        return run
+
+    def reader() -> None:
+        while not writers_finished.is_set():
+            observed = list(skiplist.keys())
+            assert observed == sorted(observed), "iteration yielded keys out of order"
+            assert len(observed) == len(set(observed)), "iteration yielded a key twice"
+
+    with forced_thread_interleaving():
+        run_in_threads([writer_for(share) for share in shares] + [reader])
+
+    for key in keys:
+        assert skiplist.search(key) == spike_value_for(key), f"insert of {key!r} was lost"
+    assert len(skiplist) == len(keys)
+    assert_structure_is_sound(skiplist)
+
+
+def test_every_exit_from_a_mutating_call_releases_the_writer_lock() -> None:
+    """A lock left held would deadlock the whole engine, so check every way out.
+
+    Four exits: a rejected argument, the early return when an existing key is
+    updated, the early return when a delete finds nothing, and an ordinary
+    completed call. Each is followed by a non-blocking acquire, which is the
+    only way to ask "is this lock free" without risking a hang in the test that
+    is checking for one.
+    """
+    skiplist = SkipList()
+
+    def assert_lock_is_free(after: str) -> None:
+        acquired = skiplist._lock.acquire(blocking=False)
+        assert acquired, f"the writer lock was still held after {after}"
+        skiplist._lock.release()
+
+    with pytest.raises(TypeError):
+        skiplist.insert("not bytes", b"value")  # type: ignore[arg-type]
+    assert_lock_is_free("a rejected insert")
+
+    with pytest.raises(TypeError):
+        skiplist.delete("not bytes")  # type: ignore[arg-type]
+    assert_lock_is_free("a rejected delete")
+
+    skiplist.insert(b"key", b"first")
+    assert_lock_is_free("an insert of a new key")
+
+    skiplist.insert(b"key", b"second")
+    assert_lock_is_free("an insert that updated an existing key")
+
+    assert skiplist.delete(b"absent") is False
+    assert_lock_is_free("a delete of an absent key")
+
+    assert skiplist.delete(b"key") is True
+    assert_lock_is_free("a delete that removed a key")
+
+
+def test_a_memtable_write_is_still_usable_from_a_second_thread_afterwards() -> None:
+    """The same check one layer up, where a stranded lock would be hardest to see.
+
+    :class:`Memtable` adds no lock of its own, so this is really asking that it
+    has not grown one by accident, and that a rejected put leaves the skip list
+    underneath it writable from another thread rather than wedged.
+    """
+    memtable = Memtable()
+
+    with pytest.raises(TypeError):
+        memtable.put(b"key", "not bytes")  # type: ignore[arg-type]
+
+    def write_from_another_thread() -> None:
+        memtable.put(b"key", b"value")
+        memtable.delete(b"other")
+
+    run_in_threads([write_from_another_thread])
+
+    assert memtable.get(b"key") == b"value"
+    assert memtable.lookup(b"other") == MemtableEntry(key=b"other", value=None)
+
+
+def test_the_read_path_takes_no_lock_on_an_interpreter_that_has_a_gil() -> None:
+    """The flag that decides all of this is derived, not guessed.
+
+    Asserting on the flag as well as on the guard keeps the two from drifting:
+    a guard that stopped matching the flag would leave the skip test above
+    silently skipping on a build it should run on, or the fallback tests below
+    testing the wrong path.
+
+    ``sys._is_gil_enabled`` only exists from 3.13, and the supported floor is
+    3.11, so the expected value is derived the same way the module derives it.
+    Spelling the fallback out again rather than importing it is the point: an
+    interpreter too old to have the function is one that cannot drop the GIL, so
+    the answer there is that reads need no lock.
+    """
+    gil_is_enabled = getattr(sys, "_is_gil_enabled", lambda: True)()
+    assert READS_TAKE_THE_WRITER_LOCK == (not gil_is_enabled), (
+        "the locked-read flag disagrees with this interpreter's GIL state"
+    )
+
+    skiplist = SkipList()
+    if READS_TAKE_THE_WRITER_LOCK:
+        assert skiplist._read_guard is skiplist._lock
+    else:
+        assert isinstance(skiplist._read_guard, contextlib.nullcontext)
+
+
+def test_a_lookup_takes_the_writer_lock_when_there_is_no_gil(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The free-threaded fallback: without a GIL, readers wait rather than guess.
+
+    The premise the lock-free read path rests on is that each of the writer's
+    publishing stores is indivisible, which is something the GIL provides and a
+    free-threaded build does not. This test cannot remove the GIL, so it sets
+    the flag that stands for its absence and checks the consequence: a lookup
+    started while the writer lock is held does not return until it is released.
+
+    The reader is provably blocked for the whole of the observation window, so
+    a slow machine cannot turn this into a false failure. The wait after the
+    release is bounded separately, and generously, because that one really is a
+    timeout.
+    """
+    monkeypatch.setattr(memtable_module, "READS_TAKE_THE_WRITER_LOCK", True)
+    skiplist = SkipList()
+    skiplist.insert(b"key", spike_value_for(b"key"))
+    assert skiplist._read_guard is skiplist._lock
+
+    reading = threading.Event()
+    returned = threading.Event()
+    found: list[bytes | None] = []
+
+    def reader() -> None:
+        # Announced immediately before the call, so the window below is watching
+        # a lookup that really is under way. Without this the test would also
+        # pass if the reader thread had simply not been scheduled yet, which
+        # proves nothing about the lock.
+        reading.set()
+        found.append(skiplist.search(b"key"))
+        returned.set()
+
+    thread = threading.Thread(target=reader, daemon=True)
+    with skiplist._lock:
+        thread.start()
+        assert reading.wait(EVENT_WAIT_TIMEOUT), "the reader thread never started"
+        assert not returned.wait(BLOCKED_READER_WAIT), (
+            "a lookup completed while the writer lock was held, so the free-threaded "
+            "fallback is not taking the lock"
+        )
+
+    assert returned.wait(EVENT_WAIT_TIMEOUT), "the lookup never finished after the lock was freed"
+    thread.join(THREAD_JOIN_TIMEOUT)
+    assert found == [spike_value_for(b"key")]
+
+
+def test_iteration_does_not_hold_the_writer_lock_when_there_is_no_gil(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The fallback snapshots instead of streaming, so a walk cannot strand the lock.
+
+    A lazily yielding walk that held the lock would keep it for as long as the
+    caller took to consume it, and a caller that wrote to the memtable while
+    iterating would deadlock against itself. Both are caught here by checking
+    the lock is free the moment the iterator is handed back, which is also the
+    only safe way to check: a test that simply tried to write while iterating
+    would hang rather than fail if the lock were held.
+    """
+    monkeypatch.setattr(memtable_module, "READS_TAKE_THE_WRITER_LOCK", True)
+    skiplist = SkipList()
+    keys = stress_keys(50)
+    for key in keys:
+        skiplist.insert(key, spike_value_for(key))
+
+    key_iterator = skiplist.keys()
+    item_iterator = skiplist.items()
+
+    acquired = skiplist._lock.acquire(blocking=False)
+    assert acquired, "iteration handed back an iterator while still holding the writer lock"
+    skiplist._lock.release()
+
+    # Safe now that the lock is known to be free: a snapshot taken before this
+    # write must not show it, which is what proves the walk already happened
+    # rather than being deferred to the first step of the iterator.
+    skiplist.insert(b"zzz-late", spike_value_for(b"zzz-late"))
+
+    assert list(key_iterator) == keys
+    assert list(item_iterator) == [(key, spike_value_for(key)) for key in keys]
+    assert list(skiplist.keys()) == [*keys, b"zzz-late"]
+
+
+def test_the_module_docstring_documents_the_concurrency_approach() -> None:
+    """Criterion 4: the approach is written down where ARCHITECTURE.md asks for it.
+
+    Section 2 of ARCHITECTURE.md requires the chosen approach to be documented
+    in this module, because it is the part of the engine most likely to hold a
+    subtle bug and the code alone does not say why it is shaped this way. A test
+    is a blunt way to hold a doc in place, but the failure it guards against is
+    real: the explanation is the only record of what the lock-free read path
+    depends on, and nothing else would notice if it were dropped.
+    """
+    assert memtable_module.__doc__ is not None
+    # Collapsed to single spaces so that rewrapping a paragraph, which changes
+    # nothing about what it says, cannot fail this test.
+    documented = " ".join(memtable_module.__doc__.split())
+
+    for phrase in [
+        "Concurrency strategy",
+        "one lock around the whole mutating path, and no lock at all on the read path",
+        "sys._is_gil_enabled()",
+        # The granularity sketch the spike was asked for, and the premises the
+        # read path rests on: what a later reader needs in order to check the
+        # design still matches the code.
+        "Locking granularity, insert versus search",
+        "What the lock-free read side rests on",
+    ]:
+        assert phrase in documented, f"the strategy section no longer explains {phrase!r}"
