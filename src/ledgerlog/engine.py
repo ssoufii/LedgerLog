@@ -1,9 +1,12 @@
 """Engine: the write-ahead log and the memtable wired into one key-value store.
 
-Scope of this module today (story M3.1): the write path. A put or a delete is
-appended to the WAL first and applied to the memtable second, and a get answers
-from the memtable. That is the whole engine for now, and it is already a usable
-store: every acknowledged write is in the log before any reader can see it.
+Scope of this module today (stories M3.1 and M3.2): the write path and startup
+recovery. A put or a delete is appended to the WAL first and applied to the
+memtable second, a get answers from the memtable, and opening an engine over an
+existing log replays that log into a fresh memtable before the caller can issue
+anything. That is the whole engine for now, and it is already a complete durable
+store: every acknowledged write is in the log before any reader can see it, and
+a restart brings every one of them back.
 
 Why the WAL comes first, since this ordering is the only reason the module
 exists: the memtable is memory and the log is disk, so the moment a write
@@ -31,6 +34,37 @@ the memtable is never touched. Checking the same things again in this module
 would add a second place for the two layers' ideas of a valid write to drift
 apart, and would make a type error fail in a different step than a size error
 for no reason a caller benefits from.
+
+Startup recovery
+----------------
+
+Opening an engine replays the log at ``wal.log`` into the memtable before the
+constructor returns, so there is no window in which a caller holds an engine
+whose memtable is emptier than its log. That is the whole of the ordering
+argument above, seen from the other end: the write path promises that an
+acknowledged write reached the disk, and replay is what makes that promise worth
+something after the process that made it is gone.
+
+Replay runs before the WAL writer opens, and that order is required rather than
+tidy. :func:`~ledgerlog.wal.replay` truncates the log at the first record it
+cannot trust, so it has to be the log's only user while it runs (see its
+docstring). Opening the writer first would put an appender behind a truncation
+that never saw its records.
+
+A torn tail is discarded rather than repaired, which is :func:`replay`'s
+behavior and ARCHITECTURE.md section 1's rule, and it costs the engine nothing
+it promised: a record left half-written is a record whose write never returned,
+so no caller was ever told it happened. What the engine adds is that the
+discarding is reported instead of silent. :attr:`LedgerLog.recovery` carries how
+many records came back and, if the log was damaged, where replay stopped and
+why, because an operator restarting after a crash has a real question about
+whether the machine lost the tail of a log or is losing writes generally, and an
+engine that quietly dropped the evidence could not answer it.
+
+A log whose header is missing, foreign, or of an unknown version stops the open
+with an exception and nothing is truncated. Recovery declines to guess at a file
+it cannot parse, for the reason ``wal.py`` gives: the one response worse than
+refusing to recover from such a file is destroying it.
 
 Concurrency
 -----------
@@ -60,28 +94,30 @@ there is no cycle for two threads to deadlock around.
 
 What is deliberately not here yet:
 
-* Startup replay (story M3.2). Opening an engine over an existing WAL appends
-  to that log without reading it back, so writes from a previous run are on
-  disk but not in the new memtable, and a get will not find them. Until M3.2
-  lands, this engine is durable in the sense that the log holds every
-  acknowledged write, not in the sense that a restart recovers them.
 * Flushing the memtable to an SSTable and everything downstream of it
   (milestones 4 and up), so the memtable grows without bound and every read is
-  answered from memory.
+  answered from memory. The same bound applies to recovery: the log is replayed
+  in full because nothing yet trims it, so startup cost and memory both grow
+  with the log until a flush exists to cut it back (milestone 6).
 """
 
 from __future__ import annotations
 
 import os
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
 from ledgerlog.memtable import Memtable
 from ledgerlog.wal import (
     DEFAULT_FSYNC_INTERVAL_SECONDS,
+    FILE_HEADER_SIZE,
     FsyncPolicy,
+    WalFormatError,
+    WalOp,
     WalWriter,
+    replay,
 )
 
 WAL_FILENAME = "wal.log"
@@ -95,14 +131,41 @@ matching log.
 """
 
 
+@dataclass(frozen=True)
+class RecoveryReport:
+    """What the replay at startup found in the log, and what it did about it.
+
+    A summary rather than the :class:`~ledgerlog.wal.ReplayResult` it is built
+    from, for one reason: that result holds every record it read, and an engine
+    that kept it would pin a second copy of the whole replayed log in memory for
+    as long as it stayed open. The memtable already holds the state those records
+    add up to, so what is worth keeping is the count and the damage, not the
+    bytes.
+
+    Frozen because it describes an event that is over by the time any caller can
+    look at it.
+    """
+
+    records_replayed: int
+    end_offset: int
+    stopped_at: int | None
+    reason: str | None
+
+    @property
+    def is_intact(self) -> bool:
+        """True if the whole log parsed, with no tail discarded."""
+        return self.stopped_at is None
+
+
 class LedgerLog:
     """A durable key-value store over a write-ahead log and an in-memory table.
 
     Keys and values are ``bytes``. Every :meth:`put` and :meth:`delete` is
     appended to the log before it is applied to the memtable, so a write is on
-    disk before any reader can observe it. See this module's docstring for why
-    that ordering is the guarantee the class exists to provide, and for what a
-    restart does not yet recover.
+    disk before any reader can observe it, and opening an engine over an
+    existing directory replays that log so a restart recovers every write the
+    log holds. See this module's docstring for why that ordering is the
+    guarantee the class exists to provide.
 
     Safe to use from several threads: writes serialize on one lock and reads
     take none.
@@ -126,6 +189,14 @@ class LedgerLog:
         default is :attr:`~ledgerlog.wal.FsyncPolicy.ALWAYS` for the reason the
         writer defaults to it: an acknowledged write should be on the disk unless
         the caller has explicitly asked to trade that away.
+
+        If the directory already holds a log, it is replayed into the memtable
+        here, before the writer opens and before the constructor returns. The
+        constructor is the right place for it precisely because it is the one
+        moment no caller has a reference to the engine yet: recovery that ran
+        lazily, on the first get, would have to define what a get racing it
+        should see, and there is no answer to that which is both simple and
+        correct.
         """
         self._directory = Path(directory)
         self._directory.mkdir(parents=True, exist_ok=True)
@@ -133,6 +204,7 @@ class LedgerLog:
         self._write_lock = threading.Lock()
         self._closed = False
         self._memtable = Memtable()
+        self._recovery = self._replay_existing_log()
         self._wal = WalWriter(
             self._directory / WAL_FILENAME,
             fsync_policy=fsync_policy,
@@ -153,6 +225,16 @@ class LedgerLog:
     def fsync_policy(self) -> FsyncPolicy:
         """Policy deciding when appended log bytes are forced onto the disk."""
         return self._wal.fsync_policy
+
+    @property
+    def recovery(self) -> RecoveryReport:
+        """What the replay at startup found in this engine's log.
+
+        Reports zero records and an intact log for a directory that had no log
+        to replay, which is the honest description of that case: a new engine
+        recovered everything there was.
+        """
+        return self._recovery
 
     @property
     def closed(self) -> bool:
@@ -239,6 +321,60 @@ class LedgerLog:
         tb: TracebackType | None,
     ) -> None:
         self.close()
+
+    def _replay_existing_log(self) -> RecoveryReport:
+        """Replay the directory's log into the memtable, and report what came back.
+
+        Called once, from the constructor, with the memtable freshly built and
+        the WAL writer not yet open. Both matter: replaying into a memtable that
+        already held entries would let a previous run's records overwrite a
+        newer state, and replaying while a writer is open would truncate a log
+        underneath an appender.
+
+        Records are applied in the order they were written, and a later record
+        for a key simply overwrites an earlier one, which is what makes replay
+        reconstruct the state the log describes rather than merely its contents.
+        A DELETE replays as a tombstone rather than as a removal, exactly as the
+        original delete did, so a recovered delete keeps the shadowing behavior
+        that ARCHITECTURE.md section 3 depends on once there are older layers
+        below.
+
+        A missing log is not an error and not a special case worth much: a first
+        run has nothing to recover, and the writer will create the file a moment
+        later.
+        """
+        path = self._directory / WAL_FILENAME
+        if not path.exists():
+            return RecoveryReport(
+                records_replayed=0,
+                end_offset=FILE_HEADER_SIZE,
+                stopped_at=None,
+                reason=None,
+            )
+
+        result = replay(path)
+        for record in result.records:
+            if record.op is WalOp.PUT:
+                self._memtable.put(record.key, record.value)
+            elif record.op is WalOp.DELETE:
+                self._memtable.delete(record.key)
+            else:
+                # Unreachable today: the reader rejects any op byte that is not
+                # a WalOp before a record gets this far. It raises rather than
+                # falling through to the delete branch so that a future op added
+                # to the enum has to be given a replay rule here, instead of
+                # quietly recovering as a deletion of its key.
+                raise WalFormatError(
+                    f"WAL record at byte offset {record.offset} carries op {record.op!r}, "
+                    "which startup replay has no rule for"
+                )
+
+        return RecoveryReport(
+            records_replayed=len(result.records),
+            end_offset=result.end_offset,
+            stopped_at=result.stopped_at,
+            reason=result.reason,
+        )
 
     def _check_open(self) -> None:
         """Raise if the engine has been closed.
