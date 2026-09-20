@@ -142,3 +142,20 @@ the store at once: writers take turns, while readers carry on without waiting.
 Starting the store again after a shutdown does not yet bring back the earlier
 writes, which is the next story's job, but they are safely on disk waiting for
 it.
+
+## Story M3.2: Crash recovery: replay WAL into a fresh memtable on startup
+
+Starting the store back up now reads its log file from the beginning and
+rebuilds everything that was saved before, so a restart brings back the writes
+the previous run had accepted. Deletions come back as deletions rather than
+simply going missing, and this all finishes before the store will answer a
+single question, so the first read after a restart already sees the full
+picture.
+
+If the program was stopped in the middle of writing, the last entry in the log
+can be left half finished. The store notices that, keeps everything written
+before it, throws away the incomplete piece, and tidies the file so it can be
+written to again. It also reports what it found, so someone restarting after a
+crash can tell whether a little was lost at the very end or whether the disk is
+in worse shape than that. This is the point where the store stops being merely
+careful about saving data and actually survives being killed.
