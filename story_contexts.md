@@ -165,3 +165,9 @@ careful about saving data and actually survives being killed.
 When the store's in-memory table gets full, its contents now get written out to a sorted file on disk, with deletions recorded alongside the values rather than left out. Because everything in the file is in order, a later reader can find a key without reading the whole thing.
 
 Alongside the data, the writer builds a small guide that notes the position of every sixty-fourth key. Looking something up means checking the guide for the nearest earlier key and then reading forward a little, which keeps the guide small enough to hold in memory even when the file itself is far too big for that. The file is written under a temporary name and only moved into place once it is complete, so a crash partway through leaves no half-finished file where the store would look for a real one.
+
+## Story M4.2: SSTable footer with format version and section offsets
+
+Each sorted file on disk now ends with a short summary block, written after everything else it describes. The summary says which version of the file format was used and exactly where each part of the file begins and ends, so a program opening the file can jump straight to the part it needs instead of reading from the start to find it.
+
+The summary is also what makes a file count as finished. It is the last thing written, and it carries a marker and a small checksum, so a file left behind by a crash halfway through writing is recognised as unfinished rather than being read as though it were complete. The tests chop a real file off at every possible length and confirm that not one of those partial files is ever accepted.

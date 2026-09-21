@@ -1,12 +1,13 @@
 """SSTable: the immutable, sorted, on-disk form a frozen memtable is flushed into.
 
-Scope of this module today (story M4.1): framing a record for the data block,
-streaming a sorted run of records into a file while building a sparse index from
-the offsets that stream produces, and reading those two sections back. The
-footer that records the format version and the section offsets is M4.2, the
-reader that drives a lookup from that footer is M4.3, and the bloom filter
-section is written here as an empty placeholder whose real contents land in
-M5.3.
+Scope of this module today (stories M4.1 and M4.2): framing a record for the
+data block, streaming a sorted run of records into a file while building a
+sparse index from the offsets that stream produces, reading those two sections
+back, and committing the file with a fixed size footer that records the format
+version and where every section starts and ends. The reader that drives a lookup
+from that footer is M4.3, rejecting a footer whose offsets point outside the file
+is M4.4, and the bloom filter section is written here as an empty placeholder
+whose real contents land in M5.3.
 
 On-disk layout (little endian, no padding), with the sections this story writes::
 
@@ -14,6 +15,16 @@ On-disk layout (little endian, no padding), with the sections this story writes:
     [ data block:   record record record ... ]
     [ sparse index: 4B entry count, then entry entry ... ]
     [ bloom filter placeholder: 4B section length, currently zero ]
+    [ footer ]
+
+On-disk footer layout, a fixed size trailer::
+
+    [ 8B data block offset ][ 8B data block end ]
+    [ 8B sparse index offset ][ 8B sparse index end ]
+    [ 8B bloom filter offset ][ 8B bloom filter end ]
+    [ 8B record count ][ 1B format version ]
+    [ 4B CRC32 over the 57 bytes above ]
+    [ 8B footer magic ]
 
 On-disk record layout::
 
@@ -25,15 +36,38 @@ On-disk sparse index entry layout::
 
     [ 4B key length ][ key ][ 8B absolute byte offset into the data block ]
 
-Why a file header carries the version even though the footer will carry one
-too: CLAUDE.md asks that a change to an on-disk layout be detectable rather than
-silently misread, and this story introduces a layout. A file whose first bytes
-are not this magic is not an SSTable at all, which is a different failure from a
-file that is one this build cannot parse, and neither is a question a reader
-should have to answer by seeking to the end of a file whose end may not have
-been written yet. Once M4.2 adds the footer, the footer is the commit point (a
-file is only a complete SSTable once it is there, per ARCHITECTURE.md section 6)
-and the header is what says the bytes in front of it are ours to read.
+Why a file header carries the version even though the footer carries one too:
+CLAUDE.md asks that a change to an on-disk layout be detectable rather than
+silently misread. A file whose first bytes are not this magic is not an SSTable
+at all, which is a different failure from a file that is one this build cannot
+parse, and neither is a question a reader should have to answer by seeking to
+the end of a file whose end may not have been written yet. The footer is the
+commit point (a file is only a complete SSTable once it is there, per
+ARCHITECTURE.md section 6) and the header is what says the bytes in front of it
+are ours to read.
+
+Why the footer is fixed size and ends with its own magic: a reader has to find
+the footer before it can be told where anything is, and the only position it
+knows without reading the file is the end. A fixed size trailer is therefore
+seekable from the end in one step, and the magic is the last thing written so
+that its presence is evidence the bytes in front of it are a whole footer and
+not the tail of a data block that a crashed flush stopped in the middle of.
+A CRC over the fields backs that up for the case the magic alone cannot rule
+out: a crash can land the blocks of one write out of order, so a file can end
+with the right eight bytes while the offsets before them were never stored.
+
+Why the footer repeats offsets the reader could otherwise recompute: it could
+not. The data block's start is fixed by the header, but nothing in the file says
+where it ends, and a reader that guessed would decode index bytes as records.
+Each boundary is recorded once, as an absolute offset, so a lookup seeks instead
+of scanning, which is the whole point of the section for the sparse index.
+
+Why adding the footer did not bump the format version: a file without a footer
+was never a complete SSTable under this format (the footer is the commit point),
+so there are no valid version 1 files with the older shape for a bumped version
+to protect. Version 1 is the layout in this docstring, whole. A later change to
+the shape of a section that complete tables already carry is what the version
+byte is for, and that one does bump it.
 
 Why the record length prefix is not checksummed the way a WAL record's is: the
 two formats are written under different rules. A WAL record is appended live,
@@ -60,6 +94,7 @@ from __future__ import annotations
 
 import os
 import struct
+import zlib
 from bisect import bisect_right
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
@@ -78,6 +113,14 @@ reports it rather than parsing bytes whose meaning it is guessing at.
 SSTABLE_MAGIC = b"LEDGRSST"
 """Fixed marker at the start of every SSTable file. Eight bytes, no terminator."""
 
+SSTABLE_FOOTER_MAGIC = b"LEDGRFTR"
+"""Fixed marker at the very end of every complete SSTable file.
+
+Different bytes from :data:`SSTABLE_MAGIC` so that a file consisting of nothing
+but a header cannot be mistaken for one that ends in a footer, which is exactly
+the file a flush that died early leaves behind.
+"""
+
 _FILE_HEADER_FORMAT = "<8sB"
 _RECORD_LENGTH_FORMAT = "<I"
 _RECORD_PAYLOAD_HEADER_FORMAT = "<BI"
@@ -85,6 +128,9 @@ _INDEX_COUNT_FORMAT = "<I"
 _INDEX_ENTRY_HEADER_FORMAT = "<I"
 _INDEX_ENTRY_OFFSET_FORMAT = "<Q"
 _BLOOM_PLACEHOLDER_FORMAT = "<I"
+_FOOTER_FIELDS_FORMAT = "<7QB"
+_FOOTER_CHECKSUM_FORMAT = "<I"
+_FOOTER_MAGIC_FORMAT = "<8s"
 
 FILE_HEADER_SIZE = struct.calcsize(_FILE_HEADER_FORMAT)
 RECORD_LENGTH_SIZE = struct.calcsize(_RECORD_LENGTH_FORMAT)
@@ -93,6 +139,16 @@ INDEX_COUNT_SIZE = struct.calcsize(_INDEX_COUNT_FORMAT)
 INDEX_ENTRY_HEADER_SIZE = struct.calcsize(_INDEX_ENTRY_HEADER_FORMAT)
 INDEX_ENTRY_OFFSET_SIZE = struct.calcsize(_INDEX_ENTRY_OFFSET_FORMAT)
 BLOOM_PLACEHOLDER_SIZE = struct.calcsize(_BLOOM_PLACEHOLDER_FORMAT)
+FOOTER_FIELDS_SIZE = struct.calcsize(_FOOTER_FIELDS_FORMAT)
+FOOTER_CHECKSUM_SIZE = struct.calcsize(_FOOTER_CHECKSUM_FORMAT)
+FOOTER_MAGIC_SIZE = struct.calcsize(_FOOTER_MAGIC_FORMAT)
+FOOTER_SIZE = FOOTER_FIELDS_SIZE + FOOTER_CHECKSUM_SIZE + FOOTER_MAGIC_SIZE
+"""Total size of the footer in bytes.
+
+Fixed, and part of the format rather than a detail of this implementation: a
+reader finds the footer by seeking this far back from the end of the file, so
+the number has to be knowable without having read anything.
+"""
 
 MAX_RECORD_PAYLOAD_SIZE = 64 * 1024 * 1024
 """Largest record payload the format allows, in bytes.
@@ -189,6 +245,22 @@ class SSTableIndexError(SSTableFormatError):
     points outside the data block, or keys that are not in ascending order: each
     means the index cannot be the one the writer produced, and a binary search
     over it would return a confidently wrong offset rather than fail.
+    """
+
+
+class SSTableFooterError(SSTableFormatError):
+    """Raised when a file's footer cannot be read as the footer the writer produces."""
+
+
+class SSTableIncompleteError(SSTableFooterError):
+    """Raised when a file has no fully written footer, so it is not a complete SSTable.
+
+    This is the shape a flush killed partway through leaves behind, and per
+    ARCHITECTURE.md section 6 the right response to it is to discard the file and
+    recover its writes from the WAL, not to read what did land. It is separate
+    from :class:`SSTableUnsupportedVersionError` because that one says the file is
+    a complete table written by a different build, which is a table whose data is
+    real and whose reader is missing, the opposite problem.
     """
 
 
@@ -602,15 +674,221 @@ class SparseIndex:
 
 
 @dataclass(frozen=True)
+class SSTableFooter:
+    """The fixed size trailer that makes a file a complete SSTable.
+
+    Written last, after the data block, the sparse index and the bloom filter
+    section, and it is the commit point per ARCHITECTURE.md section 6: a file
+    without one is a flush that did not finish, whatever bytes it does hold.
+
+    It carries the format version a second time, after the header's copy, because
+    the two answer different questions at different moments. The header's version
+    is read going forwards, before any record is parsed. The footer's is read by a
+    reader that seeked to the end, and having it there means that reader can tell
+    which layout the offsets it is about to use were written in without first
+    trusting the front of the file, which is the part the footer's own validity
+    says nothing about.
+
+    Offsets are ends as well as starts rather than starts alone, even though the
+    sections are contiguous today. A section's extent is what every bounds check
+    in this module is made against, and deriving the end of one section from the
+    start of the next assumes an adjacency the format does not otherwise promise,
+    which would quietly turn a padded or reordered future layout into silently
+    misread bytes.
+    """
+
+    data_block_offset: int
+    data_block_end: int
+    index_offset: int
+    index_end: int
+    bloom_filter_offset: int
+    bloom_filter_end: int
+    record_count: int
+    format_version: int = SSTABLE_FORMAT_VERSION
+
+    def encode(self) -> bytes:
+        """Return the on-disk bytes of the footer.
+
+        The checksum covers every field including the version byte, so a damaged
+        version is caught here rather than being reported as a file written by
+        some other build.
+        """
+        for name, value in (
+            ("data_block_offset", self.data_block_offset),
+            ("data_block_end", self.data_block_end),
+            ("index_offset", self.index_offset),
+            ("index_end", self.index_end),
+            ("bloom_filter_offset", self.bloom_filter_offset),
+            ("bloom_filter_end", self.bloom_filter_end),
+            ("record_count", self.record_count),
+        ):
+            if value < 0:
+                raise SSTableFooterError(f"footer field {name} is negative ({value})")
+        if not 0 <= self.format_version <= 0xFF:
+            raise SSTableFooterError(
+                f"SSTable format version {self.format_version} does not fit in one byte"
+            )
+
+        fields = struct.pack(
+            _FOOTER_FIELDS_FORMAT,
+            self.data_block_offset,
+            self.data_block_end,
+            self.index_offset,
+            self.index_end,
+            self.bloom_filter_offset,
+            self.bloom_filter_end,
+            self.record_count,
+            self.format_version,
+        )
+        checksum = zlib.crc32(fields) & 0xFFFFFFFF
+        return (
+            fields
+            + struct.pack(_FOOTER_CHECKSUM_FORMAT, checksum)
+            + struct.pack(_FOOTER_MAGIC_FORMAT, SSTABLE_FOOTER_MAGIC)
+        )
+
+    @classmethod
+    def decode(cls, raw: bytes) -> SSTableFooter:
+        """Decode exactly :data:`FOOTER_SIZE` bytes into a footer.
+
+        A missing magic or a failed checksum is reported as an incomplete table
+        rather than as corruption, because both are what an interrupted write
+        produces and neither can be told apart from one by looking. The version
+        this returns is not judged here: deciding whether a version is one this
+        build can act on belongs to the reader (M4.3), which is the thing that
+        would act on it.
+
+        Section boundaries are checked for internal consistency, since offsets
+        that run backwards cannot be the writer's and would otherwise be handed
+        to a seek. Whether they fall inside the file is M4.4's check, which needs
+        a file to measure them against and so cannot be made from these bytes.
+        """
+        if len(raw) != FOOTER_SIZE:
+            raise SSTableIncompleteError(
+                f"footer is {len(raw)} bytes, expected exactly {FOOTER_SIZE}"
+            )
+
+        (found_magic,) = struct.unpack(_FOOTER_MAGIC_FORMAT, raw[-FOOTER_MAGIC_SIZE:])
+        if found_magic != SSTABLE_FOOTER_MAGIC:
+            raise SSTableIncompleteError(
+                f"SSTable footer magic mismatch: found {found_magic!r}, expected "
+                f"{SSTABLE_FOOTER_MAGIC!r}, so the footer was never fully written"
+            )
+
+        fields = raw[:FOOTER_FIELDS_SIZE]
+        (found_checksum,) = struct.unpack(
+            _FOOTER_CHECKSUM_FORMAT,
+            raw[FOOTER_FIELDS_SIZE : FOOTER_FIELDS_SIZE + FOOTER_CHECKSUM_SIZE],
+        )
+        expected_checksum = zlib.crc32(fields) & 0xFFFFFFFF
+        if found_checksum != expected_checksum:
+            raise SSTableIncompleteError(
+                f"SSTable footer checksum mismatch: found {found_checksum:#010x}, computed "
+                f"{expected_checksum:#010x}, so the footer did not land whole"
+            )
+
+        (
+            data_block_offset,
+            data_block_end,
+            index_offset,
+            index_end,
+            bloom_filter_offset,
+            bloom_filter_end,
+            record_count,
+            format_version,
+        ) = struct.unpack(_FOOTER_FIELDS_FORMAT, fields)
+
+        footer = cls(
+            data_block_offset=data_block_offset,
+            data_block_end=data_block_end,
+            index_offset=index_offset,
+            index_end=index_end,
+            bloom_filter_offset=bloom_filter_offset,
+            bloom_filter_end=bloom_filter_end,
+            record_count=record_count,
+            format_version=format_version,
+        )
+        footer._validate_section_order()
+        return footer
+
+    def _validate_section_order(self) -> None:
+        """Raise unless every section starts after the header and ends at or after its start."""
+        boundaries = (
+            ("data block", self.data_block_offset, self.data_block_end),
+            ("sparse index", self.index_offset, self.index_end),
+            ("bloom filter", self.bloom_filter_offset, self.bloom_filter_end),
+        )
+        for name, start, end in boundaries:
+            if start < FILE_HEADER_SIZE:
+                raise SSTableFooterError(
+                    f"footer puts the {name} section at offset {start}, inside the "
+                    f"{FILE_HEADER_SIZE} byte file header"
+                )
+            if end < start:
+                raise SSTableFooterError(
+                    f"footer ends the {name} section at offset {end}, before it starts at {start}"
+                )
+
+
+def read_footer(stream: BinaryIO, *, file_size: int | None = None) -> SSTableFooter:
+    """Read the footer of the SSTable open on ``stream``.
+
+    ``file_size`` is taken as given when passed and measured by seeking to the
+    end otherwise, so a caller that already knows it does not pay a second seek.
+    The stream is left at the start of the footer.
+
+    A file shorter than a header plus a footer cannot hold both, so it is
+    reported as incomplete before any offset is read off it: that check is what
+    keeps the seek below from landing at a negative position on a file that a
+    crash left a few bytes long.
+    """
+    if file_size is None:
+        file_size = stream.seek(0, os.SEEK_END)
+    smallest_complete_table = FILE_HEADER_SIZE + FOOTER_SIZE
+    if file_size < smallest_complete_table:
+        raise SSTableIncompleteError(
+            f"file is {file_size} bytes, smaller than the {smallest_complete_table} bytes a "
+            "table with a header and a footer needs, so no footer was fully written"
+        )
+
+    footer_offset = file_size - FOOTER_SIZE
+    stream.seek(footer_offset)
+    raw = stream.read(FOOTER_SIZE)
+    if len(raw) < FOOTER_SIZE:
+        raise SSTableIncompleteError(
+            f"read {len(raw)} of {FOOTER_SIZE} footer bytes at offset {footer_offset}"
+        )
+    stream.seek(footer_offset)
+    return SSTableFooter.decode(raw)
+
+
+def is_complete_sstable(path: str | os.PathLike[str]) -> bool:
+    """True if ``path`` is a file whose footer was fully written.
+
+    The question startup asks of every file in a data directory (M9), which is
+    why it answers with a bool rather than raising: a partial table is an
+    expected thing to find after a crash, not an error in the caller. A file that
+    cannot be opened at all is still an error, because that is the filesystem
+    saying something the engine should not paper over.
+    """
+    with open(path, "rb") as handle:
+        try:
+            read_footer(handle)
+        except SSTableFooterError:
+            return False
+    return True
+
+
+@dataclass(frozen=True)
 class SSTableLayout:
     """Where each section of a finished SSTable lives, and what it holds.
 
-    Returned by :meth:`SSTableWriter.finish`. Until M4.2 writes a footer, this is
-    how a caller learns the extents it needs to read the file back, and once the
-    footer exists it is what the footer is written from. The sparse index is
-    carried here as the object rather than as an offset alone because the writer
-    built it in memory on the way past, and making the caller decode from disk
-    what the writer already has would be work done twice.
+    Returned by :meth:`SSTableWriter.finish`. It is what the footer is written
+    from, and it says the same thing the footer does plus the two things the
+    footer has no reason to carry: the path, and the sparse index as an object.
+    The index is here because the writer built it in memory on the way past, and
+    making the caller decode from disk what the writer already has would be work
+    done twice.
     """
 
     path: Path
@@ -621,6 +899,8 @@ class SSTableLayout:
     index_end: int
     bloom_filter_offset: int
     bloom_filter_end: int
+    footer_offset: int
+    footer_end: int
     record_count: int
     index: SparseIndex
 
@@ -628,6 +908,20 @@ class SSTableLayout:
     def data_block_size(self) -> int:
         """Size of the data block in bytes."""
         return self.data_block_end - self.data_block_offset
+
+    @property
+    def footer(self) -> SSTableFooter:
+        """The footer that was written at :attr:`footer_offset`."""
+        return SSTableFooter(
+            data_block_offset=self.data_block_offset,
+            data_block_end=self.data_block_end,
+            index_offset=self.index_offset,
+            index_end=self.index_end,
+            bloom_filter_offset=self.bloom_filter_offset,
+            bloom_filter_end=self.bloom_filter_end,
+            record_count=self.record_count,
+            format_version=self.format_version,
+        )
 
 
 def _fsync_directory(path: Path) -> None:
@@ -670,7 +964,7 @@ class SSTableWriter:
     Writes go to a temporary file in the destination directory and are moved to
     the final path by :meth:`finish` with an atomic rename, so the destination
     either does not exist or is a complete table. ARCHITECTURE.md section 6 makes
-    the footer the commit point, and it still is inside the file (M4.2); the
+    the footer the commit point, and it still is inside the file; the
     rename adds that a crashed flush leaves its debris under a temporary name
     where a reader is not looking for a table, rather than leaving a half table
     at the name the engine will try to open. The temporary file is in the same
@@ -796,11 +1090,16 @@ class SSTableWriter:
         """Write the remaining sections, sync, and move the table to its final path.
 
         The bloom filter section is written as a zero length placeholder. Its
-        position in the layout is fixed now, between the index and the footer
-        M4.2 adds, so that M5.3 can fill it in without moving anything else. A
-        placeholder with an explicit length rather than no section at all means a
-        reader is never guessing whether the bytes at that offset are a filter or
-        the start of something else.
+        position in the layout is fixed, between the index and the footer, so
+        that M5.3 can fill it in without moving anything else. A placeholder with
+        an explicit length rather than no section at all means a reader is never
+        guessing whether the bytes at that offset are a filter or the start of
+        something else.
+
+        The footer goes last, after every section it describes, which is what
+        makes it the commit point: it cannot be written until the offsets it
+        records are facts, and until it is there the file answers no to
+        :func:`is_complete_sstable`.
 
         The file's bytes are forced to disk before the rename and the directory
         entry is forced after it, so a table that appears at its final path is
@@ -819,6 +1118,19 @@ class SSTableWriter:
             index_end = self._file.tell()
             self._file.write(struct.pack(_BLOOM_PLACEHOLDER_FORMAT, 0))
             bloom_filter_end = self._file.tell()
+
+            footer = SSTableFooter(
+                data_block_offset=self._data_block_offset,
+                data_block_end=data_block_end,
+                index_offset=data_block_end,
+                index_end=index_end,
+                bloom_filter_offset=index_end,
+                bloom_filter_end=bloom_filter_end,
+                record_count=self._record_count,
+            )
+            footer_offset = bloom_filter_end
+            self._file.write(footer.encode())
+            footer_end = self._file.tell()
 
             self._file.flush()
             os.fsync(self._file.fileno())
@@ -854,6 +1166,8 @@ class SSTableWriter:
             index_end=index_end,
             bloom_filter_offset=index_end,
             bloom_filter_end=bloom_filter_end,
+            footer_offset=footer_offset,
+            footer_end=footer_end,
             record_count=self._record_count,
             index=index,
         )
