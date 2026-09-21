@@ -159,3 +159,9 @@ written to again. It also reports what it found, so someone restarting after a
 crash can tell whether a little was lost at the very end or whether the disk is
 in worse shape than that. This is the point where the store stops being merely
 careful about saving data and actually survives being killed.
+
+## Story M4.1: SSTable writer: data block plus sparse index
+
+When the store's in-memory table gets full, its contents now get written out to a sorted file on disk, with deletions recorded alongside the values rather than left out. Because everything in the file is in order, a later reader can find a key without reading the whole thing.
+
+Alongside the data, the writer builds a small guide that notes the position of every sixty-fourth key. Looking something up means checking the guide for the nearest earlier key and then reading forward a little, which keeps the guide small enough to hold in memory even when the file itself is far too big for that. The file is written under a temporary name and only moved into place once it is complete, so a crash partway through leaves no half-finished file where the store would look for a real one.
