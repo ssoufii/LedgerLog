@@ -1,8 +1,15 @@
 """Tests for the SSTable data block, the sparse index built alongside it, the writer and the reader.
 
 Covers story M4.1 (SSTable writer: data block plus sparse index), story M4.2
-(footer with format version and section offsets) and story M4.3 (reader: footer
-parse, index binary search, key scan).
+(footer with format version and section offsets), story M4.3 (reader: footer
+parse, index binary search, key scan) and story M4.4 (corrupt footer detection
+on read).
+
+The M4.4 tests are about which answer a damaged file gets, not only that it is
+refused, so they assert on the verdict and the error type rather than on a bare
+failure. A check that called every unreadable file the same thing would pass a
+test that only demanded rejection, and would still be the bug the story is
+about: a table another build wrote correctly is not garbage to be deleted.
 
 The reader tests watch where the reader reads, not only what it returns. Two of
 M4.3's criteria are claims about access pattern rather than about answers: the
@@ -62,6 +69,7 @@ from ledgerlog.sstable import (
     SSTABLE_MAGIC,
     IndexEntry,
     SparseIndex,
+    SSTableCorruptFooterError,
     SSTableFooter,
     SSTableFooterError,
     SSTableFormatError,
@@ -72,11 +80,13 @@ from ledgerlog.sstable import (
     SSTableLayout,
     SSTableOp,
     SSTableReader,
+    SSTableStatus,
     SSTableTruncatedRecordError,
     SSTableUnsupportedVersionError,
     SSTableWriter,
     encode_file_header,
     encode_record,
+    inspect_sstable,
     is_complete_sstable,
     iter_records,
     read_file_header,
@@ -1521,3 +1531,330 @@ def test_random_corruption_never_escapes_the_format_errors(tmp_path: Path) -> No
         except SSTableFormatError:
             # The decided outcome: the reader said no rather than guessing.
             continue
+
+
+# Story M4.4: corrupt footer detection on read.
+
+
+def stamped_with_version(layout: SSTableLayout, version: int) -> bytes:
+    """Return the table's bytes restamped with ``version`` in both the header and the footer.
+
+    Both, because a table written by another build would carry that build's
+    version in each place, and a file with two different stamps is a damaged one
+    rather than a foreign one. The tests that want the mismatch make it
+    deliberately, one stamp at a time.
+    """
+    raw = bytearray(replaced_footer(layout, format_version=version))
+    raw[:FILE_HEADER_SIZE] = encode_file_header(version)
+    return bytes(raw)
+
+
+# Acceptance criterion: a file truncated before its footer was written raises a
+# clear invalid/incomplete SSTable error rather than crashing on an out of
+# bounds read.
+
+
+def test_every_truncation_of_a_table_is_refused_as_incomplete(tmp_path: Path) -> None:
+    """Every length, not a chosen few.
+
+    The lengths where a bounds check would be off by one are exactly the ones
+    nobody picks by hand, and the claim is about a file cut at whatever byte the
+    crash happened to reach, not about a convenient one.
+    """
+    path = tmp_path / "whole.sst"
+    layout = build_table(path, 12, interval=4)
+    whole = path.read_bytes()
+    assert len(whole) == layout.footer_end
+
+    partial = tmp_path / "partial.sst"
+    for length in range(len(whole)):
+        partial.write_bytes(whole[:length])
+        verdict = inspect_sstable(partial)
+        assert verdict.status is SSTableStatus.INCOMPLETE, f"accepted a {length} byte table"
+        assert verdict.is_complete is False
+        assert verdict.reason
+        with pytest.raises(SSTableIncompleteError):
+            SSTableReader.open(partial)
+
+    partial.write_bytes(whole)
+    assert inspect_sstable(partial).status is SSTableStatus.VALID
+
+
+def test_a_flush_stopped_before_its_footer_is_incomplete_not_corrupt(tmp_path: Path) -> None:
+    """The crash mid flush shape from ARCHITECTURE.md section 6, taken off a live writer.
+
+    Records are pushed to disk first so the file under test really holds data
+    with no footer behind it, which is what the recovery rule is about. An
+    unflushed buffer would make the same assertion pass for the weaker reason
+    that the file is still empty.
+    """
+    path = tmp_path / "inflight.sst"
+    with SSTableWriter(path) as writer:
+        for index in range(8):
+            writer.add_put(keyed(index), valued(index))
+        writer._file.flush()
+
+        verdict = inspect_sstable(writer.temp_path)
+        assert verdict.status is SSTableStatus.INCOMPLETE
+        assert verdict.footer is None
+        with pytest.raises(SSTableIncompleteError):
+            SSTableReader.open(writer.temp_path)
+
+        writer.finish()
+
+    assert inspect_sstable(path).status is SSTableStatus.VALID
+
+
+def test_a_file_that_is_not_an_sstable_is_reported_as_incomplete(tmp_path: Path) -> None:
+    path = tmp_path / "notatable.sst"
+    path.write_bytes(b"this file belongs to something else entirely" * 8)
+
+    verdict = inspect_sstable(path)
+    assert verdict.status is SSTableStatus.INCOMPLETE
+    assert verdict.footer is None
+    assert is_complete_sstable(path) is False
+
+
+def test_an_empty_file_is_judged_rather_than_raised_on(tmp_path: Path) -> None:
+    empty = tmp_path / "empty.sst"
+    empty.write_bytes(b"")
+
+    assert inspect_sstable(empty).status is SSTableStatus.INCOMPLETE
+    assert is_complete_sstable(empty) is False
+
+
+def test_a_missing_file_raises_rather_than_returning_a_verdict(tmp_path: Path) -> None:
+    """The filesystem refusing to open a file is not a statement about a table's contents."""
+    with pytest.raises(FileNotFoundError):
+        inspect_sstable(tmp_path / "absent.sst")
+
+
+# Acceptance criterion: a file with a corrupted footer, for example offsets
+# pointing outside the file, is detected and rejected rather than silently
+# returning wrong data.
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "data_block_offset",
+        "data_block_end",
+        "index_offset",
+        "index_end",
+        "bloom_filter_offset",
+        "bloom_filter_end",
+    ],
+)
+def test_a_footer_offset_outside_the_file_is_rejected_as_corrupt(
+    tmp_path: Path, field: str
+) -> None:
+    """Every offset, including the bloom filter placeholder nothing reads until M5.3.
+
+    A section that is not read yet is still evidence about the footer: no run of
+    this writer produces one that points past the end of the file, so a footer
+    that does cannot be describing these bytes, and the offsets that are read
+    are no more trustworthy than the one that gave it away.
+    """
+    layout = build_table(tmp_path / f"bad_{field}.sst", 10, interval=4)
+    damaged = tmp_path / f"bad_{field}_copy.sst"
+    damaged.write_bytes(replaced_footer(layout, **{field: 1 << 40}))
+
+    verdict = inspect_sstable(damaged)
+    assert verdict.status is SSTableStatus.CORRUPT
+    assert verdict.is_complete is False
+    with pytest.raises(SSTableCorruptFooterError):
+        SSTableReader.open(damaged)
+
+
+def test_a_corrupt_footer_is_not_reported_as_a_complete_table(tmp_path: Path) -> None:
+    """The failure this story is about: a checksum that passes over offsets that lie.
+
+    Re-encoding the footer recomputes its checksum, so nothing here is wrong
+    about the bytes having arrived intact, and the magic is untouched. Only the
+    file itself contradicts the offsets, which is why the check that catches
+    this needs the file's size rather than the footer's fields alone.
+    """
+    layout = build_table(tmp_path / "liar.sst", 10, interval=4)
+    damaged = tmp_path / "liar_copy.sst"
+    damaged.write_bytes(replaced_footer(layout, index_offset=1 << 30, index_end=1 << 30))
+
+    assert is_complete_sstable(damaged) is False
+    verdict = inspect_sstable(damaged)
+    assert verdict.status is SSTableStatus.CORRUPT
+    assert "outside the" in (verdict.reason or "")
+
+
+def test_a_section_one_byte_past_the_last_legal_offset_is_corrupt(tmp_path: Path) -> None:
+    """Both sides of the boundary, since a check that is off by one passes either alone."""
+    layout = build_table(tmp_path / "boundary.sst", 10, interval=4)
+    footer_offset = layout.path.stat().st_size - FOOTER_SIZE
+    # A real table's last section ends exactly where the footer begins, which is
+    # the legal extreme the check has to accept.
+    assert layout.bloom_filter_end == footer_offset
+    assert inspect_sstable(layout.path).status is SSTableStatus.VALID
+
+    overlapping = tmp_path / "boundary_copy.sst"
+    overlapping.write_bytes(replaced_footer(layout, bloom_filter_end=footer_offset + 1))
+    assert inspect_sstable(overlapping).status is SSTableStatus.CORRUPT
+
+
+def test_a_footer_section_running_backwards_is_corrupt(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "backwards.sst", 10, interval=4)
+    damaged = tmp_path / "backwards_copy.sst"
+    damaged.write_bytes(replaced_footer(layout, index_end=layout.index_offset - 1))
+
+    assert inspect_sstable(damaged).status is SSTableStatus.CORRUPT
+    with pytest.raises(SSTableCorruptFooterError):
+        SSTableReader.open(damaged)
+
+
+def test_a_committed_table_whose_header_was_damaged_is_corrupt(tmp_path: Path) -> None:
+    """A whole footer over a header that is not ours means damage after the commit."""
+    layout = build_table(tmp_path / "badhead.sst", 10, interval=4)
+    damaged = tmp_path / "badhead_copy.sst"
+    raw = bytearray(layout.path.read_bytes())
+    raw[: len(SSTABLE_MAGIC)] = b"NOTASSTB"
+    damaged.write_bytes(bytes(raw))
+
+    verdict = inspect_sstable(damaged)
+    assert verdict.status is SSTableStatus.CORRUPT
+    # The footer did land, so it is reported alongside the rejection rather than
+    # dropped: which table this was is the part an operator has to work from.
+    assert verdict.footer == layout.footer
+    with pytest.raises(SSTableHeaderError):
+        SSTableReader.open(damaged)
+
+
+# Acceptance criterion: detection distinguishes a file that was never validly
+# written from a real table in a format version this build does not know.
+
+
+def test_a_table_from_another_build_is_complete_but_not_readable(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "future.sst", 10, interval=4)
+    future = tmp_path / "future_copy.sst"
+    future.write_bytes(stamped_with_version(layout, SSTABLE_FORMAT_VERSION + 1))
+
+    verdict = inspect_sstable(future)
+    assert verdict.status is SSTableStatus.UNSUPPORTED_VERSION
+    assert verdict.is_valid is False
+    # Complete, so a discovery pass must not clear it away as debris: its footer
+    # landed, which means the writes behind it were committed by another build.
+    assert verdict.is_complete is True
+    assert is_complete_sstable(future) is True
+    assert verdict.footer is not None
+    assert verdict.footer.format_version == SSTABLE_FORMAT_VERSION + 1
+    with pytest.raises(SSTableUnsupportedVersionError):
+        SSTableReader.open(future)
+
+
+def test_an_unwritten_footer_and_an_unknown_version_get_different_verdicts(
+    tmp_path: Path,
+) -> None:
+    """The criterion's distinction, asserted as a difference rather than one case at a time."""
+    layout = build_table(tmp_path / "pair.sst", 10, interval=4)
+    truncated = tmp_path / "pair_truncated.sst"
+    truncated.write_bytes(layout.path.read_bytes()[:-1])
+    future = tmp_path / "pair_future.sst"
+    future.write_bytes(stamped_with_version(layout, SSTABLE_FORMAT_VERSION + 5))
+
+    never_written = inspect_sstable(truncated)
+    other_build = inspect_sstable(future)
+
+    assert never_written.status is SSTableStatus.INCOMPLETE
+    assert other_build.status is SSTableStatus.UNSUPPORTED_VERSION
+    assert never_written.is_complete is False
+    assert other_build.is_complete is True
+
+
+def test_a_header_version_this_build_does_not_know_is_a_version_verdict(tmp_path: Path) -> None:
+    """A footer this build understands does not make the rest of the file its layout."""
+    layout = build_table(tmp_path / "headver.sst", 10, interval=4)
+    damaged = tmp_path / "headver_copy.sst"
+    raw = bytearray(layout.path.read_bytes())
+    raw[:FILE_HEADER_SIZE] = encode_file_header(SSTABLE_FORMAT_VERSION + 3)
+    damaged.write_bytes(bytes(raw))
+
+    assert inspect_sstable(damaged).status is SSTableStatus.UNSUPPORTED_VERSION
+    with pytest.raises(SSTableUnsupportedVersionError):
+        SSTableReader.open(damaged)
+
+
+# The verdict itself: what a valid file reports, and that inspecting costs no
+# descriptors, since discovery runs this over every file in a data directory.
+
+
+def test_a_finished_table_inspects_as_valid(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "good.sst", 10, interval=4)
+    verdict = inspect_sstable(layout.path)
+
+    assert verdict.status is SSTableStatus.VALID
+    assert verdict.is_valid is True
+    assert verdict.is_complete is True
+    assert verdict.reason is None
+    assert verdict.footer == layout.footer
+    assert verdict.path == layout.path
+
+
+def test_inspecting_a_file_leaves_no_open_descriptor(tmp_path: Path) -> None:
+    """Every way out of the inspection releases the handle, rejections included."""
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        pytest.skip("descriptor table is not readable on this platform")
+
+    layout = build_table(tmp_path / "handles3.sst", 10, interval=4)
+    truncated = tmp_path / "handles3_truncated.sst"
+    truncated.write_bytes(layout.path.read_bytes()[:-1])
+    corrupt = tmp_path / "handles3_corrupt.sst"
+    corrupt.write_bytes(replaced_footer(layout, index_end=1 << 40))
+    future = tmp_path / "handles3_future.sst"
+    future.write_bytes(stamped_with_version(layout, SSTABLE_FORMAT_VERSION + 1))
+
+    before = len(os.listdir(fd_dir))
+    for candidate in (layout.path, truncated, corrupt, future):
+        inspect_sstable(candidate)
+    assert len(os.listdir(fd_dir)) == before
+
+
+def test_the_verdict_and_the_reader_agree_on_randomly_damaged_tables(tmp_path: Path) -> None:
+    """A verdict that disagreed with the reader would be worse than no verdict.
+
+    Discovery acts on the verdict, so a file called valid here that the reader
+    then refuses would hand the engine a table it cannot open, and a file
+    rejected here that would have read fine is data thrown away. Half the trials
+    aim at the footer so both sides of the agreement are exercised rather than
+    left to the seed, which is fixed so a failure is reproducible.
+    """
+    layout = build_table(tmp_path / "agree.sst", 120, interval=8)
+    raw = layout.path.read_bytes()
+    damaged = tmp_path / "agree_copy.sst"
+    random_bytes = random.Random(20260923)
+    seen: set[SSTableStatus] = set()
+
+    for trial in range(200):
+        buf = bytearray(raw)
+        region = range(len(raw) - FOOTER_SIZE, len(raw)) if trial % 2 else range(len(raw))
+        for _ in range(random_bytes.randint(1, 6)):
+            buf[random_bytes.choice(region)] = random_bytes.randrange(256)
+        damaged.write_bytes(bytes(buf))
+
+        verdict = inspect_sstable(damaged)
+        seen.add(verdict.status)
+        try:
+            SSTableReader.open(damaged).close()
+        except SSTableFormatError as error:
+            failure: SSTableFormatError | None = error
+        else:
+            failure = None
+
+        if verdict.status is SSTableStatus.VALID:
+            # The reader may still refuse over a section's contents, a damaged
+            # index or record, which the frame check does not look at. What it
+            # must not do is refuse over the frame the verdict just approved.
+            assert not isinstance(failure, (SSTableFooterError, SSTableHeaderError)), (
+                f"called the file valid, but the reader raised {failure!r}"
+            )
+        else:
+            assert failure is not None, f"{verdict.status} but the reader opened the file"
+
+    assert SSTableStatus.VALID in seen
+    assert SSTableStatus.INCOMPLETE in seen

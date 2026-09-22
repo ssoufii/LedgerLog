@@ -1,13 +1,13 @@
 """SSTable: the immutable, sorted, on-disk form a frozen memtable is flushed into.
 
-Scope of this module today (stories M4.1 through M4.3): framing a record for the
+Scope of this module today (stories M4.1 through M4.4): framing a record for the
 data block, streaming a sorted run of records into a file while building a
 sparse index from the offsets that stream produces, committing the file with a
 fixed size footer that records the format version and where every section starts
-and ends, and reading a key back out of a finished table by way of that footer.
-Deciding that a file whose footer is missing or whose offsets point outside it
-must be discarded as an invalid table is M4.4, and the bloom filter section is
-written here as an empty placeholder whose real contents land in M5.3.
+and ends, reading a key back out of a finished table by way of that footer, and
+judging whether a file found on disk is a complete table at all. The bloom
+filter section is written here as an empty placeholder whose real contents land
+in M5.3.
 
 On-disk layout (little endian, no padding), with the sections this story writes::
 
@@ -69,6 +69,19 @@ to protect. Version 1 is the layout in this docstring, whole. A later change to
 the shape of a section that complete tables already carry is what the version
 byte is for, and that one does bump it.
 
+Why a file that cannot be opened is sorted into three outcomes rather than just
+refused: the three call for different responses, and only one of them names a
+file the engine may throw away. A file with no valid footer was never committed,
+so per ARCHITECTURE.md section 6 the writes behind it are still in the WAL and
+discarding it loses nothing. A footer that landed whole and still places a
+section outside the file holding it cannot be one this writer produced, so
+something rewrote the file after the fact and none of what its offsets point at
+can be trusted. A footer that is whole and consistent but carries a version this
+build does not know belongs to a table another build committed correctly, whose
+data is real and whose reader is the part that is missing. Collapsing that last
+case into the first is how an engine deletes a good table on the way past, which
+is why :func:`inspect_sstable` names the outcome instead of answering yes or no.
+
 Why the record length prefix is not checksummed the way a WAL record's is: the
 two formats are written under different rules. A WAL record is appended live,
 one at a time, at the moment a write is acknowledged, so the process can die
@@ -98,7 +111,7 @@ import zlib
 from bisect import bisect_right
 from collections.abc import Iterable, Iterator
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import Enum, IntEnum
 from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO
@@ -261,6 +274,21 @@ class SSTableIncompleteError(SSTableFooterError):
     from :class:`SSTableUnsupportedVersionError` because that one says the file is
     a complete table written by a different build, which is a table whose data is
     real and whose reader is missing, the opposite problem.
+    """
+
+
+class SSTableCorruptFooterError(SSTableFooterError):
+    """Raised when a whole footer describes a file that cannot exist.
+
+    Separate from :class:`SSTableIncompleteError` because the two say different
+    things about how the file got this way. An incomplete table stopped before
+    its footer, which is what an interrupted flush leaves and is therefore an
+    ordinary thing to find after a crash. A corrupt footer passed both its magic
+    and its checksum, so those bytes did land whole, and it still puts a section
+    outside the file that carries it or ends a section before it starts. No
+    sequence of writes this module performs produces that, so the file was
+    changed by something else, and reading it would mean taking offsets from a
+    footer that demonstrably does not describe the bytes in front of it.
     """
 
 
@@ -760,8 +788,9 @@ class SSTableFooter:
 
         Section boundaries are checked for internal consistency, since offsets
         that run backwards cannot be the writer's and would otherwise be handed
-        to a seek. Whether they fall inside the file is M4.4's check, which needs
-        a file to measure them against and so cannot be made from these bytes.
+        to a seek. Whether they fall inside the file is
+        :func:`validate_footer_sections`'s check, which needs a file to measure
+        them against and so cannot be made from these bytes.
         """
         if len(raw) != FOOTER_SIZE:
             raise SSTableIncompleteError(
@@ -820,18 +849,46 @@ class SSTableFooter:
         )
         for name, start, end in boundaries:
             if start < FILE_HEADER_SIZE:
-                raise SSTableFooterError(
+                raise SSTableCorruptFooterError(
                     f"footer puts the {name} section at offset {start}, inside the "
                     f"{FILE_HEADER_SIZE} byte file header"
                 )
             if end < start:
-                raise SSTableFooterError(
+                raise SSTableCorruptFooterError(
                     f"footer ends the {name} section at offset {end}, before it starts at {start}"
                 )
 
 
+def validate_footer_sections(footer: SSTableFooter, *, file_size: int) -> None:
+    """Raise unless every section ``footer`` describes fits inside a file this size.
+
+    :meth:`SSTableFooter.decode` checks the fields against each other, which is
+    all the bytes of a footer can answer on their own. This is the other half of
+    the question and it needs the file: an offset that is internally consistent
+    can still land past the end of the file, and following one would seek outside
+    the table and size a read by a number nobody wrote. Doing it here, once,
+    rather than at each place a section is about to be read, is what makes that
+    true of sections this build does not read yet: the bloom filter placeholder
+    is checked like the others, because what is being decided is whether the
+    footer can be the writer's at all, and M5.3 will read that section for real.
+    """
+    footer_offset = file_size - FOOTER_SIZE
+    sections = (
+        ("data block", footer.data_block_offset, footer.data_block_end),
+        ("sparse index", footer.index_offset, footer.index_end),
+        ("bloom filter", footer.bloom_filter_offset, footer.bloom_filter_end),
+    )
+    for name, start, end in sections:
+        if start < FILE_HEADER_SIZE or end < start or end > footer_offset:
+            raise SSTableCorruptFooterError(
+                f"footer places the {name} section at bytes {start} to {end}, outside the "
+                f"{FILE_HEADER_SIZE} to {footer_offset} range this {file_size} byte file can "
+                "hold it in"
+            )
+
+
 def read_footer(stream: BinaryIO, *, file_size: int | None = None) -> SSTableFooter:
-    """Read the footer of the SSTable open on ``stream``.
+    """Read and validate the footer of the SSTable open on ``stream``.
 
     ``file_size`` is taken as given when passed and measured by seeking to the
     end otherwise, so a caller that already knows it does not pay a second seek.
@@ -841,6 +898,12 @@ def read_footer(stream: BinaryIO, *, file_size: int | None = None) -> SSTableFoo
     reported as incomplete before any offset is read off it: that check is what
     keeps the seek below from landing at a negative position on a file that a
     crash left a few bytes long.
+
+    A footer that decodes is then measured against the file through
+    :func:`validate_footer_sections`, so that no caller receives offsets it would
+    have to bounds check itself before using. A footer is only useful for finding
+    sections, and one that points outside its own file is not a footer this
+    writer wrote, whatever its checksum says about the bytes arriving intact.
     """
     if file_size is None:
         file_size = stream.seek(0, os.SEEK_END)
@@ -859,24 +922,144 @@ def read_footer(stream: BinaryIO, *, file_size: int | None = None) -> SSTableFoo
             f"read {len(raw)} of {FOOTER_SIZE} footer bytes at offset {footer_offset}"
         )
     stream.seek(footer_offset)
-    return SSTableFooter.decode(raw)
+    footer = SSTableFooter.decode(raw)
+    validate_footer_sections(footer, file_size=file_size)
+    return footer
+
+
+class SSTableStatus(Enum):
+    """What :func:`inspect_sstable` concluded about one file.
+
+    ``VALID`` is a complete table this build can read. ``INCOMPLETE`` is a file
+    with no whole footer, which is what an interrupted flush leaves and what
+    ARCHITECTURE.md section 6 says to discard in favor of the WAL. ``CORRUPT`` is
+    a whole footer describing a file that cannot be, or a committed table whose
+    header was damaged afterwards. ``UNSUPPORTED_VERSION`` is a table another
+    build committed properly in a layout this one does not know, which is the one
+    rejection that is not a reason to delete anything.
+    """
+
+    VALID = "valid"
+    INCOMPLETE = "incomplete"
+    CORRUPT = "corrupt"
+    UNSUPPORTED_VERSION = "unsupported_version"
+
+
+@dataclass(frozen=True)
+class SSTableInspection:
+    """The verdict on one file, with the evidence behind it.
+
+    ``footer`` is filled in whenever one was read whole, which includes the
+    unsupported version case: a caller deciding what to do with such a file wants
+    to know which version it claims, and this is what says so.
+
+    ``reason`` carries the message of the error that decided a rejection, so that
+    an operator reading a startup log is told which check the file failed rather
+    than only that it failed one.
+    """
+
+    path: Path
+    status: SSTableStatus
+    reason: str | None = None
+    footer: SSTableFooter | None = None
+
+    @property
+    def is_valid(self) -> bool:
+        """True if this build can read the file as a complete SSTable."""
+        return self.status is SSTableStatus.VALID
+
+    @property
+    def is_complete(self) -> bool:
+        """True if a committed table is there, whether or not this build can read it.
+
+        An unsupported version counts as complete: its footer landed, which is
+        the commit point, so the data is real and only the reader for it is
+        missing. That is the distinction that decides whether a file may be
+        thrown away, so it is answered here rather than left to every caller to
+        rebuild out of the status.
+        """
+        return self.status in (SSTableStatus.VALID, SSTableStatus.UNSUPPORTED_VERSION)
+
+
+def inspect_sstable(path: str | os.PathLike[str]) -> SSTableInspection:
+    """Decide whether ``path`` holds a table this build can read, and say why not.
+
+    This is the question startup asks of every file in a data directory (M9), and
+    it answers with a verdict rather than by raising because a partial table is
+    an expected thing to find after a crash, not a mistake by the caller. A file
+    that cannot be opened at all is still an error, because that is the
+    filesystem saying something the engine should not paper over.
+
+    The checks are made in the order the reader makes them, so that a file called
+    valid here is one :class:`SSTableReader` can open and a file rejected here is
+    one it would refuse. Anything else would be worse than no check at all: a
+    discovery pass would hand the engine tables that then fail to open, or
+    quietly drop tables that would have read fine.
+
+    What is examined is the frame of the file: that a footer landed whole, that
+    the sections it names fit inside the file, that the header is one of ours,
+    and that the version stamps are ones this build knows. What is not examined
+    is the content of those sections, because the format gives nothing to examine
+    it with: there is no checksum over the data block, so a table whose records
+    were rewritten under a footer that still matches reads as valid here. Finding
+    that would not be a stricter version of this check, it would be a different
+    format.
+    """
+    # Opened through a context manager so the descriptor is released on every
+    # path out, including the ones that end in a rejection rather than a raise.
+    with open(path, "rb") as handle:
+        return _inspect_stream(handle, Path(path))
+
+
+def _inspect_stream(stream: BinaryIO, path: Path) -> SSTableInspection:
+    """Classify the file open on ``stream``, turning each typed failure into a status."""
+    try:
+        footer = read_footer(stream)
+    except SSTableIncompleteError as error:
+        # Checked before its parent class below, since an incomplete table is a
+        # footer error and the two verdicts are not interchangeable.
+        return SSTableInspection(path=path, status=SSTableStatus.INCOMPLETE, reason=str(error))
+    except SSTableFooterError as error:
+        return SSTableInspection(path=path, status=SSTableStatus.CORRUPT, reason=str(error))
+
+    if footer.format_version != SSTABLE_FORMAT_VERSION:
+        return SSTableInspection(
+            path=path,
+            status=SSTableStatus.UNSUPPORTED_VERSION,
+            reason=str(SSTableUnsupportedVersionError(footer.format_version)),
+            footer=footer,
+        )
+
+    stream.seek(0)
+    try:
+        read_file_header(stream)
+    except SSTableUnsupportedVersionError as error:
+        return SSTableInspection(
+            path=path,
+            status=SSTableStatus.UNSUPPORTED_VERSION,
+            reason=str(error),
+            footer=footer,
+        )
+    except SSTableHeaderError as error:
+        # A whole footer with a header that is not ours means the file was
+        # committed and then damaged at the front, which is corruption rather
+        # than a write that never finished.
+        return SSTableInspection(
+            path=path, status=SSTableStatus.CORRUPT, reason=str(error), footer=footer
+        )
+    return SSTableInspection(path=path, status=SSTableStatus.VALID, footer=footer)
 
 
 def is_complete_sstable(path: str | os.PathLike[str]) -> bool:
-    """True if ``path`` is a file whose footer was fully written.
+    """True if ``path`` holds a committed table, whether or not this build reads it.
 
-    The question startup asks of every file in a data directory (M9), which is
-    why it answers with a bool rather than raising: a partial table is an
-    expected thing to find after a crash, not an error in the caller. A file that
-    cannot be opened at all is still an error, because that is the filesystem
-    saying something the engine should not paper over.
+    The yes-or-no form of :func:`inspect_sstable`, for callers that only want the
+    commit point's answer. A table stamped with a version this build does not
+    know still counts: it was committed, and whether this build can parse it is
+    the separate question the inspection's status answers. A footer that never
+    landed and one that points outside its own file both count as no.
     """
-    with open(path, "rb") as handle:
-        try:
-            read_footer(handle)
-        except SSTableFooterError:
-            return False
-    return True
+    return inspect_sstable(path).is_complete
 
 
 @dataclass(frozen=True)
@@ -1270,11 +1453,12 @@ class SSTableReader:
 
     What this reader does not do is decide the fate of a file it cannot open. It
     raises, with the distinction that matters preserved (an incomplete table, a
-    table in a version it does not know, an index that cannot be the writer's),
-    and M4.4 is where discovery turns those into a discard decision. The bounds
-    checks below are narrower than that story's: they cover the two sections
-    this reader actually reads, because a length taken off a damaged disk must
-    not be handed to ``read`` before it is known to fit in the file.
+    footer that cannot describe this file, a table in a version it does not know,
+    an index that cannot be the writer's), and :func:`inspect_sstable` is what
+    turns those into the verdict a discovery pass acts on. The bounds checks the
+    offsets go through before any of them reaches a seek are
+    :func:`read_footer`'s, because a length taken off a damaged disk must not be
+    handed to ``read`` before it is known to fit in the file.
     """
 
     def __init__(
@@ -1308,12 +1492,6 @@ class SSTableReader:
 
         stream.seek(0)
         read_file_header(stream)
-
-        footer_offset = file_size - FOOTER_SIZE
-        self._check_section(
-            "data block", footer.data_block_offset, footer.data_block_end, footer_offset
-        )
-        self._check_section("sparse index", footer.index_offset, footer.index_end, footer_offset)
 
         raw_index = self._read_section("sparse index", footer.index_offset, footer.index_end)
         self._index = SparseIndex.decode(
@@ -1411,25 +1589,13 @@ class SSTableReader:
         if self._closed:
             raise ValueError("cannot read from a closed SSTableReader")
 
-    def _check_section(self, name: str, start: int, end: int, limit: int) -> None:
-        """Raise unless the section lies between the file header and ``limit``.
-
-        ``limit`` is where the footer begins, which is the last byte of the file
-        a section is allowed to reach. The footer's own decode already rejects a
-        section that starts inside the header or ends before it starts; what it
-        cannot check is the file, because it has only the bytes of the footer to
-        work from. Doing it here, before anything is read, is what keeps a
-        corrupted offset from turning into a seek past the end of the file or a
-        read sized by a number nobody wrote.
-        """
-        if start < FILE_HEADER_SIZE or end < start or end > limit:
-            raise SSTableFooterError(
-                f"footer places the {name} section at bytes {start} to {end}, outside the "
-                f"{FILE_HEADER_SIZE} to {limit} range this file can hold it in"
-            )
-
     def _read_section(self, name: str, start: int, end: int) -> bytes:
-        """Read a bounds-checked section's bytes, insisting on all of them."""
+        """Read a bounds-checked section's bytes, insisting on all of them.
+
+        The bounds are :func:`read_footer`'s, already applied by the time this
+        runs. The short read below is therefore not the bounds check itself but
+        the case it cannot cover: a file that shrank between the two reads.
+        """
         length = end - start
         self._stream.seek(start)
         raw = self._stream.read(length)
