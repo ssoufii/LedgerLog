@@ -171,3 +171,9 @@ Alongside the data, the writer builds a small guide that notes the position of e
 Each sorted file on disk now ends with a short summary block, written after everything else it describes. The summary says which version of the file format was used and exactly where each part of the file begins and ends, so a program opening the file can jump straight to the part it needs instead of reading from the start to find it.
 
 The summary is also what makes a file count as finished. It is the last thing written, and it carries a marker and a small checksum, so a file left behind by a crash halfway through writing is recognised as unfinished rather than being read as though it were complete. The tests chop a real file off at every possible length and confirm that not one of those partial files is ever accepted.
+
+## Story M4.3: SSTable reader: footer parse, index binary search, key scan
+
+The sorted files the store writes to disk can now be read back. To find a key, the reader starts at the summary block at the end of the file, which tells it where each part lives, then uses the small guide of every sixty-fourth key to jump close to where the key would be, and reads forward a short way from there. If it passes a key that sorts after the one it wants, it stops, because the file is in order and the key cannot be further on.
+
+That means looking something up costs a jump and a few records read, not a pass over the whole file, and the tests check this by watching which parts of the file are actually touched rather than only checking the answer. A deleted key comes back marked as deleted rather than simply missing, which matters because an older file may still hold the value it replaced. Files written by a future version of the format, cut off partway, or damaged are refused with a clear explanation instead of being read as though they were fine, and a test confirms that by scribbling random bytes over a real file a few hundred times.
