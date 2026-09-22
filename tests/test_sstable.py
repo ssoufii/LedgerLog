@@ -1,7 +1,15 @@
-"""Tests for the SSTable data block, the sparse index built alongside it, and the writer.
+"""Tests for the SSTable data block, the sparse index built alongside it, the writer and the reader.
 
-Covers story M4.1 (SSTable writer: data block plus sparse index) and story M4.2
-(footer with format version and section offsets).
+Covers story M4.1 (SSTable writer: data block plus sparse index), story M4.2
+(footer with format version and section offsets) and story M4.3 (reader: footer
+parse, index binary search, key scan).
+
+The reader tests watch where the reader reads, not only what it returns. Two of
+M4.3's criteria are claims about access pattern rather than about answers: the
+footer has to be parsed before anything else, and a miss must not cost a pass
+over the file. A returned value cannot tell a binary search from a full scan
+that happened to agree with it, so those tests wrap the file in a stream that
+records every read and assert against the positions.
 
 The layout tests decode what landed on disk with plain ``struct`` calls rather
 than with this module's own decoder, because what they are checking is that the
@@ -26,9 +34,11 @@ ones nobody thinks to pick by hand.
 from __future__ import annotations
 
 import os
+import random
 import struct
 import zlib
 from pathlib import Path
+from typing import BinaryIO
 
 import pytest
 
@@ -54,15 +64,18 @@ from ledgerlog.sstable import (
     SparseIndex,
     SSTableFooter,
     SSTableFooterError,
+    SSTableFormatError,
     SSTableHeaderError,
     SSTableIncompleteError,
     SSTableIndexError,
     SSTableInvalidRecordError,
     SSTableLayout,
     SSTableOp,
+    SSTableReader,
     SSTableTruncatedRecordError,
     SSTableUnsupportedVersionError,
     SSTableWriter,
+    encode_file_header,
     encode_record,
     is_complete_sstable,
     iter_records,
@@ -1020,3 +1033,491 @@ def test_a_damaged_version_byte_fails_the_footer_checksum() -> None:
 
     with pytest.raises(SSTableIncompleteError, match="checksum mismatch"):
         SSTableFooter.decode(bytes(raw))
+
+
+# Story M4.3: the reader.
+
+
+VALUE_SIZE = 16
+"""Fixed value width, so a record's encoded size is arithmetic rather than a measurement."""
+
+RECORD_SIZE = RECORD_LENGTH_SIZE + RECORD_PAYLOAD_HEADER_SIZE + len(keyed(0)) + VALUE_SIZE
+"""Encoded size of one put built by :func:`valued`, which is the largest record here.
+
+The tombstones :func:`build_table` mixes in are shorter, so a scan bound
+expressed as a count of these bytes is an upper bound on any run of records.
+"""
+
+
+def valued(index: int) -> bytes:
+    """Return a fixed width value, so every record in a table is the same size."""
+    return f"value{index:011d}".encode()
+
+
+class RecordingStream:
+    """A binary stream wrapper that remembers the position and size of every read.
+
+    The reader is handed one of these instead of a plain file when the thing
+    being checked is which bytes it touched. Delegates the three operations the
+    reader and the record iterator use (read, seek, tell) and nothing else, so a
+    reader that reached for some other file operation would fail here rather
+    than quietly escaping the instrumentation.
+    """
+
+    def __init__(self, inner: BinaryIO) -> None:
+        self._inner = inner
+        self.reads: list[tuple[int, int]] = []
+
+    @property
+    def bytes_read(self) -> int:
+        """Total bytes handed back by every read so far."""
+        return sum(length for _, length in self.reads)
+
+    def forget(self) -> None:
+        """Drop the recorded reads, so a later assertion covers one operation only."""
+        self.reads.clear()
+
+    def read(self, size: int = -1) -> bytes:
+        position = self._inner.tell()
+        data = self._inner.read(size)
+        self.reads.append((position, len(data)))
+        return data
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        return self._inner.seek(offset, whence)
+
+    def tell(self) -> int:
+        return self._inner.tell()
+
+    def close(self) -> None:
+        self._inner.close()
+
+
+def build_table(path: Path, count: int, *, interval: int = DEFAULT_INDEX_INTERVAL) -> SSTableLayout:
+    """Write a table of ``count`` fixed size records, every seventh one a tombstone."""
+    records: list[tuple[bytes, bytes | None]] = [
+        (keyed(index), None if index % 7 == 0 else valued(index)) for index in range(count)
+    ]
+    return write_sstable(path, records, index_interval=interval)
+
+
+def read_record_offsets(layout: SSTableLayout) -> list[int]:
+    """Return the byte offset every record in the table starts at."""
+    with open(layout.path, "rb") as handle:
+        return [
+            record.offset
+            for record in iter_records(
+                handle,
+                start_offset=layout.data_block_offset,
+                end_offset=layout.data_block_end,
+            )
+        ]
+
+
+def replaced_footer(layout: SSTableLayout, **changes: int) -> bytes:
+    """Return the table's bytes with its footer re-encoded, ``changes`` applied.
+
+    The checksum is recomputed by the encoder, so the damage under test is the
+    changed field itself rather than a footer that fails its checksum first and
+    never reaches the check being exercised.
+    """
+    fields = {
+        "data_block_offset": layout.data_block_offset,
+        "data_block_end": layout.data_block_end,
+        "index_offset": layout.index_offset,
+        "index_end": layout.index_end,
+        "bloom_filter_offset": layout.bloom_filter_offset,
+        "bloom_filter_end": layout.bloom_filter_end,
+        "record_count": layout.record_count,
+        "format_version": layout.format_version,
+    }
+    fields.update(changes)
+    raw = layout.path.read_bytes()
+    return raw[:-FOOTER_SIZE] + SSTableFooter(**fields).encode()
+
+
+# Acceptance criterion: reading a key that exists returns its value, or its
+# tombstone marker.
+
+
+@pytest.mark.parametrize("interval", [1, 3, 8, DEFAULT_INDEX_INTERVAL])
+def test_every_written_key_reads_back_through_the_reader(tmp_path: Path, interval: int) -> None:
+    count = 200
+    layout = build_table(tmp_path / f"all_{interval}.sst", count, interval=interval)
+
+    with SSTableReader.open(layout.path) as reader:
+        for index in range(count):
+            record = reader.lookup(keyed(index))
+            assert record is not None, f"{keyed(index)!r} should be in the table"
+            assert record.key == keyed(index)
+            if index % 7 == 0:
+                assert record.is_tombstone
+                assert record.value is None
+            else:
+                assert record.value == valued(index)
+
+
+def test_a_tombstone_is_returned_as_a_record_not_as_not_found(tmp_path: Path) -> None:
+    """The two answers mean different things to the read path, so they cannot collapse."""
+    layout = write_sstable(tmp_path / "tomb.sst", [(b"gone", None), (b"here", b"value")])
+
+    with SSTableReader.open(layout.path) as reader:
+        deleted = reader.lookup(b"gone")
+        assert deleted is not None
+        assert deleted.is_tombstone
+        assert reader.lookup(b"never-written") is None
+
+
+def test_a_tombstone_and_a_put_of_an_empty_value_read_back_differently(tmp_path: Path) -> None:
+    layout = write_sstable(tmp_path / "empty.sst", [(b"blank", b""), (b"deleted", None)])
+
+    with SSTableReader.open(layout.path) as reader:
+        blank = reader.lookup(b"blank")
+        deleted = reader.lookup(b"deleted")
+        assert blank is not None and blank.value == b""
+        assert blank.is_tombstone is False
+        assert deleted is not None and deleted.is_tombstone
+
+
+def test_binary_keys_and_values_read_back_unchanged(tmp_path: Path) -> None:
+    records: list[tuple[bytes, bytes | None]] = [
+        (b"\x00\x01", b"\xff\xfe"),
+        (b"\x00\x02", b""),
+        (b"\x7f", bytes(range(256))),
+        (b"\xff", None),
+    ]
+    layout = write_sstable(tmp_path / "binary.sst", records, index_interval=2)
+
+    with SSTableReader.open(layout.path) as reader:
+        for key, value in records:
+            found = reader.lookup(key)
+            assert found is not None, f"{key!r} should be in the table"
+            assert found.value == value
+
+
+def test_a_single_record_table_is_readable(tmp_path: Path) -> None:
+    layout = write_sstable(tmp_path / "one.sst", [(b"only", b"record")])
+
+    with SSTableReader.open(layout.path) as reader:
+        found = reader.lookup(b"only")
+        assert found is not None and found.value == b"record"
+        assert reader.record_count == 1
+
+
+# Acceptance criterion: a key the table does not hold is reported as not found,
+# without scanning the entire file.
+
+
+def test_absent_keys_are_reported_as_not_found(tmp_path: Path) -> None:
+    layout = write_sstable(
+        tmp_path / "absent.sst", [(b"bravo", b"2"), (b"delta", b"4"), (b"foxtrot", b"6")]
+    )
+
+    with SSTableReader.open(layout.path) as reader:
+        assert reader.lookup(b"alpha") is None  # before every key
+        assert reader.lookup(b"charlie") is None  # between two keys
+        assert reader.lookup(b"zulu") is None  # after every key
+        assert reader.lookup(b"bravo ") is None  # a prefix extension of a key that exists
+
+
+def test_an_empty_table_reports_every_key_as_not_found(tmp_path: Path) -> None:
+    layout = write_sstable(tmp_path / "none.sst", [])
+
+    with SSTableReader.open(layout.path) as reader:
+        assert reader.record_count == 0
+        assert reader.lookup(b"anything") is None
+
+
+def test_a_miss_reads_far_less_than_the_data_block(tmp_path: Path) -> None:
+    """The bound is one index interval of records, which is what the index buys."""
+    interval = 16
+    layout = build_table(tmp_path / "miss.sst", 512, interval=interval)
+
+    with open(layout.path, "rb") as handle:
+        stream = RecordingStream(handle)
+        reader = SSTableReader(stream, path=layout.path)
+        stream.forget()
+
+        # A key that sorts between two written keys, in the middle of the table.
+        assert reader.lookup(b"key00255x") is None
+
+        # One interval of records, plus the first record past the target, which
+        # is the one whose greater key ends the scan. Tombstones are shorter
+        # than puts, so a bound built from the larger of the two holds.
+        assert stream.bytes_read <= (interval + 1) * RECORD_SIZE
+        assert stream.bytes_read < layout.data_block_size // 4
+
+
+def test_a_key_below_the_first_indexed_key_is_answered_without_reading_the_block(
+    tmp_path: Path,
+) -> None:
+    """The first record is always indexed, so sorting before it settles the question."""
+    layout = build_table(tmp_path / "below.sst", 128, interval=8)
+
+    with open(layout.path, "rb") as handle:
+        stream = RecordingStream(handle)
+        reader = SSTableReader(stream, path=layout.path)
+        stream.forget()
+
+        assert reader.lookup(b"aaa") is None
+        assert stream.reads == []
+
+
+def test_a_hit_stops_at_the_record_it_found(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "stop.sst", 512, interval=64)
+
+    with open(layout.path, "rb") as handle:
+        stream = RecordingStream(handle)
+        reader = SSTableReader(stream, path=layout.path)
+        stream.forget()
+
+        found = reader.lookup(keyed(1))
+        assert found is not None
+        # The scan starts at the first record and stops at the second, so it
+        # never reaches the third whatever the interval is.
+        assert stream.bytes_read <= 2 * RECORD_SIZE
+
+
+# Acceptance criterion: the reader parses the footer first, then binary searches
+# the sparse index for the nearest offset at or below the target key, then scans
+# forward from there.
+
+
+def test_the_footer_is_the_first_thing_the_reader_reads(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "footer_first.sst", 300, interval=8)
+    file_size = layout.path.stat().st_size
+
+    with open(layout.path, "rb") as handle:
+        stream = RecordingStream(handle)
+        SSTableReader(stream, path=layout.path)
+
+        first_position, first_length = stream.reads[0]
+        assert (first_position, first_length) == (file_size - FOOTER_SIZE, FOOTER_SIZE)
+
+
+def test_the_scan_starts_at_the_offset_the_index_search_returned(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "scan_start.sst", 300, interval=8)
+    target = keyed(197)
+    expected_start = layout.index.offset_for(target)
+    assert expected_start is not None
+
+    with open(layout.path, "rb") as handle:
+        stream = RecordingStream(handle)
+        reader = SSTableReader(stream, path=layout.path)
+        stream.forget()
+
+        found = reader.lookup(target)
+        assert found is not None and found.value == valued(197)
+        assert stream.reads[0][0] == expected_start
+        # Which is a later offset than the block's start: the search skipped the
+        # records in front of it rather than scanning from the beginning.
+        assert expected_start > layout.data_block_offset
+
+
+def test_the_reader_uses_the_index_it_decoded_from_the_file(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "index.sst", 300, interval=8)
+
+    with SSTableReader.open(layout.path) as reader:
+        assert reader.index.entries == layout.index.entries
+        assert reader.footer == layout.footer
+        assert reader.path == layout.path
+
+
+def test_reads_are_bounded_by_the_data_block_even_for_a_key_past_the_last_one(
+    tmp_path: Path,
+) -> None:
+    """A key above every record must not walk into the index section behind the block."""
+    layout = build_table(tmp_path / "past_end.sst", 100, interval=8)
+
+    with open(layout.path, "rb") as handle:
+        stream = RecordingStream(handle)
+        reader = SSTableReader(stream, path=layout.path)
+        stream.forget()
+
+        assert reader.lookup(b"zzzzzzzz") is None
+        for position, length in stream.reads:
+            assert position + length <= layout.data_block_end
+
+
+# Acceptance criterion: a footer whose format version the reader does not
+# recognize is rejected with a clear error.
+
+
+def test_a_footer_version_the_reader_does_not_know_is_rejected(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "future_footer.sst", 10, interval=4)
+    foreign = tmp_path / "future_footer_copy.sst"
+    foreign.write_bytes(replaced_footer(layout, format_version=SSTABLE_FORMAT_VERSION + 1))
+
+    with pytest.raises(SSTableUnsupportedVersionError) as caught:
+        SSTableReader.open(foreign)
+    assert caught.value.found_version == SSTABLE_FORMAT_VERSION + 1
+    assert "not supported by this build" in str(caught.value)
+
+
+def test_a_header_version_the_reader_does_not_know_is_rejected(tmp_path: Path) -> None:
+    """Checked as well as the footer's: the header is what the records are framed by."""
+    layout = build_table(tmp_path / "future_header.sst", 10, interval=4)
+    foreign = tmp_path / "future_header_copy.sst"
+    raw = layout.path.read_bytes()
+    foreign.write_bytes(encode_file_header(SSTABLE_FORMAT_VERSION + 1) + raw[FILE_HEADER_SIZE:])
+
+    with pytest.raises(SSTableUnsupportedVersionError, match="not supported by this build"):
+        SSTableReader.open(foreign)
+
+
+def test_a_file_that_is_not_an_sstable_is_rejected_as_such(tmp_path: Path) -> None:
+    """A different failure from an unknown version, and reported as one."""
+    layout = build_table(tmp_path / "foreign_magic.sst", 10, interval=4)
+    foreign = tmp_path / "foreign_magic_copy.sst"
+    raw = bytearray(layout.path.read_bytes())
+    raw[:8] = b"NOTASSTB"
+    foreign.write_bytes(bytes(raw))
+
+    with pytest.raises(SSTableHeaderError, match="magic mismatch"):
+        SSTableReader.open(foreign)
+
+
+# Bounds checking and handle hygiene, which every one of the criteria above
+# rests on: the reader takes its offsets from bytes on disk, so none of them may
+# be used to seek or to size a read before they are known to fit in the file.
+
+
+def test_a_table_whose_footer_never_landed_cannot_be_opened(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "partial.sst", 10, interval=4)
+    partial = tmp_path / "partial_copy.sst"
+    partial.write_bytes(layout.path.read_bytes()[:-1])
+
+    with pytest.raises(SSTableIncompleteError):
+        SSTableReader.open(partial)
+
+
+@pytest.mark.parametrize("field", ["index_end", "data_block_end"])
+def test_a_section_reaching_past_the_footer_is_rejected_before_it_is_read(
+    tmp_path: Path, field: str
+) -> None:
+    layout = build_table(tmp_path / f"overrun_{field}.sst", 10, interval=4)
+    damaged = tmp_path / f"overrun_{field}_copy.sst"
+    damaged.write_bytes(replaced_footer(layout, **{field: 1 << 40}))
+
+    with pytest.raises(SSTableFooterError, match="outside the"):
+        SSTableReader.open(damaged)
+
+
+def test_an_index_offset_outside_the_data_block_is_rejected(tmp_path: Path) -> None:
+    """The index's own bounds check, reached through the reader rather than directly."""
+    layout = build_table(tmp_path / "bad_index.sst", 10, interval=4)
+    damaged = tmp_path / "bad_index_copy.sst"
+    # Shrinking the recorded data block leaves the index pointing past its end.
+    damaged.write_bytes(replaced_footer(layout, data_block_end=layout.data_block_offset + 1))
+
+    with pytest.raises(SSTableIndexError):
+        SSTableReader.open(damaged)
+
+
+def test_opening_a_table_that_cannot_be_parsed_leaves_no_open_descriptor(tmp_path: Path) -> None:
+    """A caller who never received a reader has nothing to close, so open() must."""
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        pytest.skip("descriptor table is not readable on this platform")
+
+    layout = build_table(tmp_path / "leak.sst", 10, interval=4)
+    partial = tmp_path / "leak_partial.sst"
+    partial.write_bytes(layout.path.read_bytes()[:-1])
+
+    before = len(os.listdir(fd_dir))
+    with pytest.raises(SSTableIncompleteError):
+        SSTableReader.open(partial)
+    assert len(os.listdir(fd_dir)) == before
+
+
+def test_the_reader_closes_the_handle_it_opened(tmp_path: Path) -> None:
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        pytest.skip("descriptor table is not readable on this platform")
+
+    layout = build_table(tmp_path / "closed.sst", 10, interval=4)
+    before = len(os.listdir(fd_dir))
+    with SSTableReader.open(layout.path) as reader:
+        assert reader.lookup(keyed(1)) is not None
+    assert reader.closed
+    assert len(os.listdir(fd_dir)) == before
+    # Closing twice is a no-op rather than an error on an already released handle.
+    reader.close()
+
+
+def test_a_reader_does_not_close_a_stream_it_was_lent(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "lent.sst", 10, interval=4)
+
+    with open(layout.path, "rb") as handle:
+        reader = SSTableReader(handle, path=layout.path)
+        reader.close()
+        assert handle.closed is False
+        # The lender's handle is still usable, which is the point of lending it.
+        assert handle.seek(0) == 0
+
+
+def test_lookup_after_close_is_refused(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "after_close.sst", 10, interval=4)
+    reader = SSTableReader.open(layout.path)
+    reader.close()
+
+    with pytest.raises(ValueError, match="closed SSTableReader"):
+        reader.lookup(keyed(1))
+
+
+def test_lookup_rejects_a_key_that_is_not_bytes(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "typed.sst", 10, interval=4)
+
+    with SSTableReader.open(layout.path) as reader:
+        with pytest.raises(TypeError, match="key must be bytes"):
+            reader.lookup("key00001")  # type: ignore[arg-type]
+
+
+def test_a_damaged_record_inside_the_scan_is_reported_rather_than_returned(tmp_path: Path) -> None:
+    """A corrupt length in the block being scanned must raise, not produce a record."""
+    layout = build_table(tmp_path / "damaged.sst", 32, interval=8)
+    damaged = tmp_path / "damaged_copy.sst"
+    raw = bytearray(layout.path.read_bytes())
+    # Overwrite the length prefix of the second record with an absurd one. Its
+    # offset is taken from the file rather than computed, since a tombstone and
+    # a put are not the same size.
+    second = read_record_offsets(layout)[1]
+    raw[second : second + RECORD_LENGTH_SIZE] = struct.pack("<I", 0xFFFFFFF0)
+    damaged.write_bytes(bytes(raw))
+
+    with SSTableReader.open(damaged) as reader:
+        with pytest.raises(SSTableInvalidRecordError):
+            reader.lookup(keyed(5))
+
+
+def test_random_corruption_never_escapes_the_format_errors(tmp_path: Path) -> None:
+    """Flip bytes all over a real table and insist every outcome is a decided one.
+
+    The reader takes every offset and length it uses off the disk, so the claim
+    worth testing is not that a particular field is checked but that no
+    combination of damaged ones gets past the checks: each trial must end in a
+    typed format error or in a parse that stayed inside the file. A crash, a
+    hang, or an allocation sized by a corrupted length would show up here as
+    something other than :class:`SSTableFormatError`.
+
+    Seeded, so a failure is reproducible rather than a Tuesday's luck. Reads hit
+    the page cache, which is what keeps a couple of hundred trials cheap.
+    """
+    layout = build_table(tmp_path / "fuzz.sst", 200, interval=8)
+    raw = layout.path.read_bytes()
+    damaged = tmp_path / "fuzz_copy.sst"
+    random_bytes = random.Random(20260922)
+
+    for _ in range(200):
+        buf = bytearray(raw)
+        for _ in range(random_bytes.randint(1, 6)):
+            buf[random_bytes.randrange(len(buf))] = random_bytes.randrange(256)
+        damaged.write_bytes(bytes(buf))
+
+        try:
+            with SSTableReader.open(damaged) as reader:
+                for key in (keyed(0), keyed(100), keyed(199), b"aaa", b"zzz"):
+                    reader.lookup(key)
+        except SSTableFormatError:
+            # The decided outcome: the reader said no rather than guessing.
+            continue

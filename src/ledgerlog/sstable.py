@@ -1,13 +1,13 @@
 """SSTable: the immutable, sorted, on-disk form a frozen memtable is flushed into.
 
-Scope of this module today (stories M4.1 and M4.2): framing a record for the
+Scope of this module today (stories M4.1 through M4.3): framing a record for the
 data block, streaming a sorted run of records into a file while building a
-sparse index from the offsets that stream produces, reading those two sections
-back, and committing the file with a fixed size footer that records the format
-version and where every section starts and ends. The reader that drives a lookup
-from that footer is M4.3, rejecting a footer whose offsets point outside the file
-is M4.4, and the bloom filter section is written here as an empty placeholder
-whose real contents land in M5.3.
+sparse index from the offsets that stream produces, committing the file with a
+fixed size footer that records the format version and where every section starts
+and ends, and reading a key back out of a finished table by way of that footer.
+Deciding that a file whose footer is missing or whose offsets point outside it
+must be discarded as an invalid table is M4.4, and the bloom filter section is
+written here as an empty placeholder whose real contents land in M5.3.
 
 On-disk layout (little endian, no padding), with the sections this story writes::
 
@@ -1237,3 +1237,215 @@ def write_sstable(
         for key, value in records:
             writer.add(key, value)
         return writer.finish()
+
+
+class SSTableReader:
+    """Answers lookups against one finished SSTable file.
+
+    The read path is the one ARCHITECTURE.md section 5 describes for a single
+    table: parse the footer, binary search the sparse index for the greatest
+    indexed key at or below the target, then scan the data block forward from
+    that offset. The scan stops at the first key greater than the target, since
+    the block is sorted and no later record can hold the key, so a lookup reads
+    one index interval of records at most, plus the one that ends the scan,
+    whether it hits or misses. That bound, not the search itself, is the reason
+    the index exists: without it every miss would cost a pass over the table.
+
+    The footer is read first because nothing else in the file can be located
+    until it has been: the data block's end, and therefore where the scan has to
+    stop, is recorded there and nowhere else. The header is validated straight
+    after, before any record is decoded, so that a file this build cannot parse
+    is reported as such rather than being half read.
+
+    The sparse index is decoded once, at open, and kept resident. It is the one
+    section small enough to hold for the life of the reader (one key in N), and
+    holding it is what makes a lookup one seek and a short scan rather than a
+    walk of the file. The data block is never held: it is the part that does not
+    fit, which is the whole premise of the format.
+
+    The reader owns the stream's position, and a lookup moves it. Two lookups
+    cannot be interleaved on one reader for the same reason two record iterators
+    cannot share a handle, so a caller wanting concurrent lookups opens a reader
+    per thread rather than sharing one.
+
+    What this reader does not do is decide the fate of a file it cannot open. It
+    raises, with the distinction that matters preserved (an incomplete table, a
+    table in a version it does not know, an index that cannot be the writer's),
+    and M4.4 is where discovery turns those into a discard decision. The bounds
+    checks below are narrower than that story's: they cover the two sections
+    this reader actually reads, because a length taken off a damaged disk must
+    not be handed to ``read`` before it is known to fit in the file.
+    """
+
+    def __init__(
+        self,
+        stream: BinaryIO,
+        *,
+        path: str | os.PathLike[str] | None = None,
+        owns_stream: bool = False,
+    ) -> None:
+        """Parse the table open on ``stream`` and keep it ready for lookups.
+
+        Taking a stream rather than a path, with :meth:`open` as the classmethod
+        that supplies one, keeps ownership explicit: a reader built here reads a
+        handle somebody else opened and will not close it unless told to, which
+        is what lets a caller layer something over the handle (a counter, a
+        cache) or hand the same file to two readers.
+
+        ``path`` is carried for error messages and for callers tracking which
+        table a reader belongs to. It is not opened or resolved here.
+        """
+        self._stream = stream
+        self._path = Path(path) if path is not None else None
+        self._owns_stream = owns_stream
+        self._closed = False
+
+        file_size = stream.seek(0, os.SEEK_END)
+        footer = read_footer(stream, file_size=file_size)
+        if footer.format_version != SSTABLE_FORMAT_VERSION:
+            raise SSTableUnsupportedVersionError(footer.format_version)
+        self._footer = footer
+
+        stream.seek(0)
+        read_file_header(stream)
+
+        footer_offset = file_size - FOOTER_SIZE
+        self._check_section(
+            "data block", footer.data_block_offset, footer.data_block_end, footer_offset
+        )
+        self._check_section("sparse index", footer.index_offset, footer.index_end, footer_offset)
+
+        raw_index = self._read_section("sparse index", footer.index_offset, footer.index_end)
+        self._index = SparseIndex.decode(
+            raw_index,
+            data_block_start=footer.data_block_offset,
+            data_block_end=footer.data_block_end,
+        )
+
+    @classmethod
+    def open(cls, path: str | os.PathLike[str]) -> SSTableReader:
+        """Open the SSTable at ``path`` and return a reader that owns its handle.
+
+        The handle is closed if parsing fails, so a file that turns out not to be
+        a complete table leaves no descriptor behind for a caller who never got
+        an object to close.
+        """
+        # The builtin, not this classmethod: a method body resolves names
+        # against module and builtin scope, never against the class body.
+        stream = open(path, "rb")
+        try:
+            return cls(stream, path=path, owns_stream=True)
+        except BaseException:
+            stream.close()
+            raise
+
+    @property
+    def path(self) -> Path | None:
+        """Path this table was opened from, when the caller supplied one."""
+        return self._path
+
+    @property
+    def footer(self) -> SSTableFooter:
+        """The footer this reader parsed, which is where every section's extent comes from."""
+        return self._footer
+
+    @property
+    def index(self) -> SparseIndex:
+        """The sparse index decoded from the file, held resident for lookups."""
+        return self._index
+
+    @property
+    def record_count(self) -> int:
+        """Number of records in the data block, as the footer reports it."""
+        return self._footer.record_count
+
+    @property
+    def closed(self) -> bool:
+        """True once :meth:`close` has been called."""
+        return self._closed
+
+    def lookup(self, key: bytes) -> SSTableRecord | None:
+        """Return the record stored for ``key``, or ``None`` if this table has none.
+
+        A returned record whose value is ``None`` is a tombstone, which is a
+        different answer from ``None`` here: the table says the key was deleted,
+        and per ARCHITECTURE.md section 5 that has to stop the read path rather
+        than let an older table's value for the key surface. Collapsing the two
+        into one return value is exactly the bug the distinction exists to
+        prevent, so the record is handed back whole and the caller decides.
+        """
+        if not isinstance(key, bytes):
+            raise TypeError(f"key must be bytes, got {type(key).__name__}")
+        self._ensure_open()
+
+        start = self._index.offset_for(key)
+        if start is None:
+            # The first record is always indexed, so a key below every indexed
+            # key is below every key in the table. No scan can find it.
+            return None
+
+        for record in iter_records(
+            self._stream, start_offset=start, end_offset=self._footer.data_block_end
+        ):
+            if record.key == key:
+                return record
+            if record.key > key:
+                # Records ascend, so the target would have been passed by now.
+                return None
+        return None
+
+    def close(self) -> None:
+        """Release the stream if this reader owns it. Safe to call more than once.
+
+        A reader built over a caller's stream leaves it open, because closing a
+        handle this object was only lent would break whoever lent it.
+        """
+        if self._closed:
+            return
+        self._closed = True
+        if self._owns_stream:
+            self._stream.close()
+
+    def _ensure_open(self) -> None:
+        """Raise if the reader has been closed, rather than reading a dead handle."""
+        if self._closed:
+            raise ValueError("cannot read from a closed SSTableReader")
+
+    def _check_section(self, name: str, start: int, end: int, limit: int) -> None:
+        """Raise unless the section lies between the file header and ``limit``.
+
+        ``limit`` is where the footer begins, which is the last byte of the file
+        a section is allowed to reach. The footer's own decode already rejects a
+        section that starts inside the header or ends before it starts; what it
+        cannot check is the file, because it has only the bytes of the footer to
+        work from. Doing it here, before anything is read, is what keeps a
+        corrupted offset from turning into a seek past the end of the file or a
+        read sized by a number nobody wrote.
+        """
+        if start < FILE_HEADER_SIZE or end < start or end > limit:
+            raise SSTableFooterError(
+                f"footer places the {name} section at bytes {start} to {end}, outside the "
+                f"{FILE_HEADER_SIZE} to {limit} range this file can hold it in"
+            )
+
+    def _read_section(self, name: str, start: int, end: int) -> bytes:
+        """Read a bounds-checked section's bytes, insisting on all of them."""
+        length = end - start
+        self._stream.seek(start)
+        raw = self._stream.read(length)
+        if len(raw) < length:
+            raise SSTableFooterError(
+                f"read {len(raw)} of {length} bytes of the {name} section at offset {start}"
+            )
+        return raw
+
+    def __enter__(self) -> SSTableReader:
+        return self
+
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        self.close()
