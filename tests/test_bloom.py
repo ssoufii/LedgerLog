@@ -42,15 +42,30 @@ import math
 import os
 import pathlib
 import random
+import struct
 import subprocess
 import sys
 import threading
+import zlib
 
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
 
-from ledgerlog.bloom import BloomFilter, optimal_bit_count, optimal_hash_count
+from ledgerlog.bloom import (
+    BLOOM_CHECKSUM_SIZE,
+    BLOOM_FORMAT_VERSION,
+    BLOOM_HEADER_SIZE,
+    BLOOM_MAGIC,
+    BloomChecksumError,
+    BloomFilter,
+    BloomFormatError,
+    BloomHeaderError,
+    BloomTruncatedError,
+    BloomUnsupportedVersionError,
+    optimal_bit_count,
+    optimal_hash_count,
+)
 
 # ---------------------------------------------------------------------------
 # Criterion 1: sizing from a target rate and an expected key count
@@ -543,3 +558,367 @@ def test_the_module_imports_nothing_outside_the_standard_library() -> None:
         name for name in imported if name not in sys.stdlib_module_names and name != "ledgerlog"
     }
     assert not third_party, f"bloom.py imports non-standard-library modules: {sorted(third_party)}"
+
+
+# ---------------------------------------------------------------------------
+# Story M5.2: serialize and deserialize, with a format version
+#
+# The round-trip criterion is written as "identical query behavior", not
+# "identical bytes", and the tests follow that wording. Behavior is what the
+# read path depends on, and a format that preserved the bit array while losing
+# m or k would compare equal byte for byte on the array and still answer
+# differently, because the probe positions are computed from m and k rather
+# than stored. So the round trip is checked by querying, over keys that were
+# added and keys that were not, and the geometry is checked separately.
+#
+# The rejection tests enumerate damage rather than sampling it: every
+# truncation length and every single-bit flip. A blob is small, the checks are
+# cheap, and the alternative (a handful of hand-picked corruptions) tests the
+# cases somebody thought of, which is the wrong set when the question is
+# whether any surviving path can produce a filter with wrong behavior.
+# ---------------------------------------------------------------------------
+
+
+def _round_trip(bloom: BloomFilter) -> BloomFilter:
+    return BloomFilter.deserialize(bloom.serialize())
+
+
+def _reseal(body: bytes) -> bytes:
+    """Re-checksum a tampered blob, so a test exercises a check other than the CRC.
+
+    Without this, every mutation would stop at the checksum and the field
+    validation behind it would never run in a test at all.
+    """
+    return body + struct.pack("<I", zlib.crc32(body))
+
+
+def _small_filter() -> BloomFilter:
+    """A filter small enough to enumerate every byte of, holding known keys."""
+    bloom = BloomFilter.for_target(expected_keys=20, false_positive_rate=0.01)
+    for index in range(20):
+        bloom.add(f"key-{index}".encode())
+    return bloom
+
+
+@given(
+    keys=st.lists(st.binary(max_size=40), max_size=60),
+    probes=st.lists(st.binary(max_size=40), max_size=60),
+    rate=st.sampled_from([0.5, 0.1, 0.01, 0.001]),
+)
+@settings(max_examples=60, deadline=None, suppress_health_check=[HealthCheck.too_slow])
+def test_a_round_trip_answers_identically_for_every_key(
+    keys: list[bytes], probes: list[bytes], rate: float
+) -> None:
+    """Criterion 1, as a property: same answer before and after, added or not.
+
+    The probe list is independent of the added keys, so it covers both sides of
+    the filter's asymmetry. Present keys catch an array that was mangled in
+    transit, and absent keys catch geometry that was not carried across: a
+    filter rebuilt with the wrong m or k lands on different bits and starts
+    disagreeing on absent keys long before it loses a present one.
+    """
+    original = BloomFilter.for_target(expected_keys=max(1, len(keys)), false_positive_rate=rate)
+    for key in keys:
+        original.add(key)
+
+    restored = _round_trip(original)
+
+    for key in keys:
+        assert restored.might_contain(key) is True
+    for probe in probes + keys:
+        assert restored.might_contain(probe) == original.might_contain(probe)
+
+
+def test_a_round_trip_preserves_the_geometry_and_the_recorded_metadata() -> None:
+    """The stored fields come back as themselves, not merely compatible."""
+    original = _small_filter()
+
+    restored = _round_trip(original)
+
+    assert restored.bit_count == original.bit_count
+    assert restored.hash_count == original.hash_count
+    assert restored.byte_count == original.byte_count
+    assert restored.bits == original.bits
+    assert restored.added_count == original.added_count
+    assert restored.target_false_positive_rate == pytest.approx(0.01)
+
+
+def test_a_round_trip_is_byte_stable() -> None:
+    """Serializing a restored filter reproduces the blob it was restored from.
+
+    Not required by the criteria, but it is what makes a stored filter
+    comparable across a flush and a compaction that rewrites it unchanged.
+    """
+    blob = _small_filter().serialize()
+
+    assert BloomFilter.deserialize(blob).serialize() == blob
+
+
+def test_an_empty_filter_round_trips() -> None:
+    """The degenerate case an SSTable of no keys would store."""
+    original = BloomFilter.for_target(expected_keys=100, false_positive_rate=0.01)
+
+    restored = _round_trip(original)
+
+    assert restored.set_bit_count == 0
+    assert restored.added_count == 0
+    assert restored.might_contain(b"anything") is False
+
+
+def test_a_filter_sized_directly_round_trips_with_no_recorded_rate() -> None:
+    """A filter built without a target keeps "not recorded" rather than inventing one.
+
+    Zero doubles as that sentinel in the format, so this is the test that it is
+    read back as absent and not as a target rate of zero.
+    """
+    original = BloomFilter(bit_count=1024, hash_count=5)
+    original.add(b"present")
+
+    restored = _round_trip(original)
+
+    assert restored.target_false_positive_rate is None
+    assert restored.might_contain(b"present") is True
+
+
+def test_a_single_bit_filter_round_trips() -> None:
+    """The smallest legal geometry, where the array is one byte holding one bit."""
+    original = BloomFilter(bit_count=1, hash_count=1)
+    original.add(b"k")
+
+    restored = _round_trip(original)
+
+    assert restored.bit_count == 1
+    assert restored.byte_count == 1
+    assert restored.might_contain(b"k") is True
+
+
+def test_a_serialized_filter_survives_a_file_and_a_separate_process(
+    tmp_path: pathlib.Path,
+) -> None:
+    """The point of the format: a filter written by one process, used by another.
+
+    M5.3 stores these bytes in an SSTable, and ARCHITECTURE.md section 6 has
+    that file outliving the process that wrote it. A round trip inside one
+    interpreter would not catch a format that smuggled process-local state
+    across, so the blob is written to a real file and queried from a child.
+    """
+    original = _small_filter()
+    probes = [b"key-3", b"key-19", b"absent-a", b"absent-b", b""]
+    blob_path = tmp_path / "filter.bloom"
+    blob_path.write_bytes(original.serialize())
+
+    program = (
+        "import pathlib\n"
+        "from ledgerlog.bloom import BloomFilter\n"
+        f"blob = pathlib.Path({str(blob_path)!r}).read_bytes()\n"
+        "f = BloomFilter.deserialize(blob)\n"
+        f"print([f.might_contain(k) for k in {probes!r}])\n"
+    )
+    env = dict(os.environ)
+    # A seed the parent almost certainly does not share, so a filter that
+    # depended on one would answer differently here.
+    env["PYTHONHASHSEED"] = "424242"
+    env["PYTHONPATH"] = os.pathsep.join(
+        path for path in (_package_search_path(), env.get("PYTHONPATH", "")) if path
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", program],
+        capture_output=True,
+        text=True,
+        check=True,
+        env=env,
+    )
+
+    assert ast.literal_eval(completed.stdout.strip()) == [
+        original.might_contain(probe) for probe in probes
+    ]
+
+
+# --- the version field ------------------------------------------------------
+
+
+def test_the_serialized_form_carries_the_magic_and_the_version_where_documented() -> None:
+    """Criterion 2, checked at the documented offsets rather than by round trip.
+
+    A round trip would pass just as well if the version were never written, so
+    the byte is read out of the blob at the position the module docstring
+    promises, which is the position another implementation would look at.
+    """
+    blob = _small_filter().serialize()
+
+    assert blob[:8] == BLOOM_MAGIC
+    assert blob[8] == BLOOM_FORMAT_VERSION
+    assert len(blob) == BLOOM_HEADER_SIZE + _small_filter().byte_count + BLOOM_CHECKSUM_SIZE
+
+
+@pytest.mark.parametrize("other_version", [0, 2, 99, 255])
+def test_a_blob_stamped_with_another_format_version_is_refused(other_version: int) -> None:
+    """An unknown version is reported as such, not parsed on the guess that it matches.
+
+    The blob is re-checksummed after the version is changed, so this reaches
+    the version check instead of stopping at a CRC mismatch: the case being
+    tested is a well-formed file from a different build, not a damaged one.
+    """
+    original = _small_filter().serialize()
+    body = bytearray(original[:-BLOOM_CHECKSUM_SIZE])
+    body[8] = other_version
+
+    with pytest.raises(BloomUnsupportedVersionError) as caught:
+        BloomFilter.deserialize(_reseal(bytes(body)))
+
+    assert caught.value.found_version == other_version
+    assert caught.value.expected_version == BLOOM_FORMAT_VERSION
+
+
+def test_bytes_that_are_not_a_filter_are_refused_as_a_header_problem() -> None:
+    """Reading the wrong offset must not look like a damaged filter.
+
+    M5.3 locates this section from an SSTable footer, so bytes from elsewhere
+    in the file are the realistic wrong input, and the error should say they
+    are not a filter rather than that a filter arrived damaged.
+    """
+    not_a_filter = _reseal(b"\x00" * (BLOOM_HEADER_SIZE + 24))
+
+    with pytest.raises(BloomHeaderError):
+        BloomFilter.deserialize(not_a_filter)
+
+
+# --- truncated and corrupted blobs ------------------------------------------
+
+
+def test_every_truncation_of_a_blob_is_refused() -> None:
+    """Criterion 3, enumerated: no prefix of a valid blob deserializes.
+
+    This is the shape a write cut off partway leaves behind, and the danger is
+    specific: a prefix that still parsed would hand back a filter with a short
+    bit array, which reads as cleared bits, which is a false negative.
+    """
+    blob = _small_filter().serialize()
+
+    for length in range(len(blob)):
+        with pytest.raises(BloomFormatError):
+            BloomFilter.deserialize(blob[:length])
+
+
+def test_every_single_bit_corruption_of_a_blob_is_refused() -> None:
+    """Criterion 3, enumerated: no flipped bit anywhere produces a usable filter.
+
+    Every byte is covered, the bit array included. A flipped array bit changes
+    no structure at all, so without the checksum this is precisely the damage
+    that would load cleanly and answer "definitely absent" for a key the table
+    holds.
+    """
+    blob = _small_filter().serialize()
+
+    for position in range(len(blob)):
+        for bit in range(8):
+            damaged = bytearray(blob)
+            damaged[position] ^= 1 << bit
+            with pytest.raises(BloomFormatError):
+                BloomFilter.deserialize(bytes(damaged))
+
+
+def test_a_blob_with_extra_bytes_appended_is_refused() -> None:
+    """Trailing bytes mean the section boundary disagrees with the filter in it."""
+    blob = _small_filter().serialize()
+
+    with pytest.raises(BloomFormatError):
+        BloomFilter.deserialize(blob + b"\x00")
+
+
+@pytest.mark.parametrize("length", [0, 1, BLOOM_HEADER_SIZE, BLOOM_HEADER_SIZE + 3])
+def test_a_blob_too_short_to_hold_a_header_is_refused(length: int) -> None:
+    """Reported as truncated rather than raising out of the struct unpack."""
+    with pytest.raises(BloomTruncatedError):
+        BloomFilter.deserialize(b"\x00" * length)
+
+
+def test_a_declared_array_length_shorter_than_the_bytes_present_is_refused() -> None:
+    """The stored length and the bytes carried must agree, not merely fit."""
+    original = _small_filter().serialize()
+    body = bytearray(original[:-BLOOM_CHECKSUM_SIZE])
+    struct.pack_into("<I", body, BLOOM_HEADER_SIZE - 4, _small_filter().byte_count - 1)
+
+    with pytest.raises(BloomTruncatedError):
+        BloomFilter.deserialize(_reseal(bytes(body)))
+
+
+def test_a_bit_count_that_disagrees_with_the_array_is_refused() -> None:
+    """A checksum-clean blob whose own fields contradict each other is still refused.
+
+    Nothing this module writes produces one, so it means the bytes came from
+    something else. Building the filter anyway would give an array indexed
+    modulo a bit count it does not have, which mislocates every probe.
+    """
+    original = _small_filter().serialize()
+    body = bytearray(original[:-BLOOM_CHECKSUM_SIZE])
+    struct.pack_into("<Q", body, 10, _small_filter().bit_count + 4096)
+
+    with pytest.raises(BloomFormatError):
+        BloomFilter.deserialize(_reseal(bytes(body)))
+
+
+def test_an_absurd_declared_bit_count_is_refused_without_attempting_the_allocation() -> None:
+    """A length read off disk must not be turned into an allocation.
+
+    The declared count here would need well over a hundred gigabytes of backing
+    array. The test passing at all is the evidence: a reader that sized a
+    buffer from the field before checking it would not raise a format error, it
+    would take the process down.
+
+    Which check reports it is deliberately not asserted. The count is refused
+    both by its own range test and by the comparison against the bytes actually
+    carried, and pinning one of them here would turn a redundancy that is worth
+    having into a test failure the day either is rewritten.
+    """
+    original = _small_filter().serialize()
+    body = bytearray(original[:-BLOOM_CHECKSUM_SIZE])
+    struct.pack_into("<Q", body, 10, 1 << 40)
+
+    with pytest.raises(BloomFormatError):
+        BloomFilter.deserialize(_reseal(bytes(body)))
+
+
+def test_a_hash_count_outside_the_supported_range_is_refused() -> None:
+    """``k`` bounds the per-query work, so it is checked like any other stored length."""
+    original = _small_filter().serialize()
+    body = bytearray(original[:-BLOOM_CHECKSUM_SIZE])
+    body[9] = 0
+
+    with pytest.raises(BloomFormatError):
+        BloomFilter.deserialize(_reseal(bytes(body)))
+
+
+def test_a_recorded_target_rate_outside_the_legal_range_is_refused() -> None:
+    """No filter can be sized for a rate at or above one, so the blob is not ours."""
+    original = _small_filter().serialize()
+    body = bytearray(original[:-BLOOM_CHECKSUM_SIZE])
+    struct.pack_into("<d", body, 26, 1.5)
+
+    with pytest.raises(BloomFormatError):
+        BloomFilter.deserialize(_reseal(bytes(body)))
+
+
+def test_a_checksum_mismatch_names_itself_as_damage() -> None:
+    """The distinct error type is the point: damaged is not the same as truncated."""
+    blob = bytearray(_small_filter().serialize())
+    blob[BLOOM_HEADER_SIZE] ^= 0xFF
+
+    with pytest.raises(BloomChecksumError):
+        BloomFilter.deserialize(bytes(blob))
+
+
+@pytest.mark.parametrize("bad_blob", ["not bytes", 17, None, ["a"]])
+def test_a_non_bytes_blob_is_refused(bad_blob: object) -> None:
+    with pytest.raises(TypeError):
+        BloomFilter.deserialize(bad_blob)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("wrapper", [bytes, bytearray, memoryview])
+def test_any_bytes_like_blob_is_accepted(wrapper: object) -> None:
+    """The SSTable reader may hand over a slice of a buffer rather than bytes."""
+    original = _small_filter()
+
+    restored = BloomFilter.deserialize(wrapper(original.serialize()))  # type: ignore[operator]
+
+    assert restored.bits == original.bits
