@@ -50,8 +50,17 @@ from typing import BinaryIO
 import pytest
 
 from ledgerlog import sstable
+from ledgerlog.bloom import (
+    BLOOM_CHECKSUM_SIZE,
+    BLOOM_HEADER_SIZE,
+    BLOOM_MAGIC,
+    BloomChecksumError,
+    BloomFilter,
+    BloomHeaderError,
+    BloomTruncatedError,
+)
 from ledgerlog.sstable import (
-    BLOOM_PLACEHOLDER_SIZE,
+    DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
     DEFAULT_INDEX_INTERVAL,
     FILE_HEADER_SIZE,
     FOOTER_CHECKSUM_SIZE,
@@ -89,6 +98,7 @@ from ledgerlog.sstable import (
     inspect_sstable,
     is_complete_sstable,
     iter_records,
+    read_bloom_filter,
     read_file_header,
     read_footer,
     write_sstable,
@@ -392,18 +402,16 @@ def test_sparse_index_section_matches_the_documented_layout(tmp_path: Path) -> N
     assert decoded[0][1] == layout.data_block_offset
 
 
-def test_bloom_filter_placeholder_is_an_empty_section(tmp_path: Path) -> None:
+def test_bloom_filter_section_sits_between_the_index_and_the_footer(tmp_path: Path) -> None:
     layout = write_sstable(tmp_path / "bloom.sst", [(b"k", b"v")])
     raw = layout.path.read_bytes()
 
     assert layout.bloom_filter_offset == layout.index_end
-    assert layout.bloom_filter_end - layout.bloom_filter_offset == BLOOM_PLACEHOLDER_SIZE
-    (section_length,) = struct.unpack(
-        "<I", raw[layout.bloom_filter_offset : layout.bloom_filter_end]
-    )
-    assert section_length == 0
-    # The placeholder is no longer the last thing in the file: M4.2's footer
-    # follows it, and starts exactly where it ends.
+    section = raw[layout.bloom_filter_offset : layout.bloom_filter_end]
+    assert section[:8] == BLOOM_MAGIC
+    assert len(section) > BLOOM_HEADER_SIZE + BLOOM_CHECKSUM_SIZE
+    # The section is no longer the last thing in the file: M4.2's footer follows
+    # it, and starts exactly where it ends.
     assert layout.footer_offset == layout.bloom_filter_end
     assert layout.footer_end == len(raw)
 
@@ -677,7 +685,7 @@ def test_overwriting_an_existing_table_replaces_it_atomically(tmp_path: Path) ->
 # Story M4.2: the footer.
 #
 # Acceptance criterion: the footer is written last, after the data block, the
-# sparse index and the bloom filter placeholder.
+# sparse index and the bloom filter.
 
 
 def test_footer_is_written_last_after_every_section_it_describes(tmp_path: Path) -> None:
@@ -792,8 +800,7 @@ def test_sections_can_be_located_from_the_footer_alone(tmp_path: Path) -> None:
         ]
 
     assert [entry.key for entry in index] == [keyed(i) for i in range(0, 20, 5)]
-    assert len(bloom_bytes) == BLOOM_PLACEHOLDER_SIZE
-    assert struct.unpack("<I", bloom_bytes)[0] == 0
+    assert all(BloomFilter.deserialize(bloom_bytes).might_contain(key) for key, _ in records)
     assert recovered == records
 
 
@@ -1103,12 +1110,25 @@ class RecordingStream:
         self._inner.close()
 
 
-def build_table(path: Path, count: int, *, interval: int = DEFAULT_INDEX_INTERVAL) -> SSTableLayout:
+def build_table(
+    path: Path,
+    count: int,
+    *,
+    interval: int = DEFAULT_INDEX_INTERVAL,
+    expected_keys: int | None = None,
+    rate: float = DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
+) -> SSTableLayout:
     """Write a table of ``count`` fixed size records, every seventh one a tombstone."""
     records: list[tuple[bytes, bytes | None]] = [
         (keyed(index), None if index % 7 == 0 else valued(index)) for index in range(count)
     ]
-    return write_sstable(path, records, index_interval=interval)
+    return write_sstable(
+        path,
+        records,
+        index_interval=interval,
+        expected_keys=expected_keys,
+        bloom_false_positive_rate=rate,
+    )
 
 
 def read_record_offsets(layout: SSTableLayout) -> list[int]:
@@ -1648,12 +1668,12 @@ def test_a_missing_file_raises_rather_than_returning_a_verdict(tmp_path: Path) -
 def test_a_footer_offset_outside_the_file_is_rejected_as_corrupt(
     tmp_path: Path, field: str
 ) -> None:
-    """Every offset, including the bloom filter placeholder nothing reads until M5.3.
+    """Every offset, including one for a section the caller in hand does not read.
 
-    A section that is not read yet is still evidence about the footer: no run of
-    this writer produces one that points past the end of the file, so a footer
-    that does cannot be describing these bytes, and the offsets that are read
-    are no more trustworthy than the one that gave it away.
+    A section a given caller ignores is still evidence about the footer: no run
+    of this writer produces one that points past the end of the file, so a
+    footer that does cannot be describing these bytes, and the offsets that are
+    read are no more trustworthy than the one that gave it away.
     """
     layout = build_table(tmp_path / f"bad_{field}.sst", 10, interval=4)
     damaged = tmp_path / f"bad_{field}_copy.sst"
@@ -1858,3 +1878,376 @@ def test_the_verdict_and_the_reader_agree_on_randomly_damaged_tables(tmp_path: P
 
     assert SSTableStatus.VALID in seen
     assert SSTableStatus.INCOMPLETE in seen
+
+
+# Story M5.3: the real bloom filter in place of M4's placeholder.
+#
+# The tests below read the filter back out of the file rather than checking the
+# object the writer returns. The criterion is about what a later reader finds at
+# the bloom filter offset, and an in-memory filter that was never serialized
+# would satisfy every membership assertion while the bytes on disk said
+# something else entirely.
+
+
+def bloom_section_bytes(layout: SSTableLayout) -> bytes:
+    """Return the raw bytes of the table's bloom filter section, by footer offsets."""
+    raw = layout.path.read_bytes()
+    return raw[layout.bloom_filter_offset : layout.bloom_filter_end]
+
+
+def stored_bloom_filter(layout: SSTableLayout) -> BloomFilter:
+    """Reopen the table and rebuild its filter the way a reader would.
+
+    Goes through the footer on disk rather than through ``layout``, so what is
+    exercised is the path a process that did not write the table has to take.
+    """
+    with open(layout.path, "rb") as handle:
+        footer = read_footer(handle)
+        return read_bloom_filter(handle, footer)
+
+
+# Acceptance criterion: the stored filter answers possibly-present for every key
+# actually in the table.
+
+
+@pytest.mark.parametrize("expected_keys", [None, 200, 1, 10_000])
+def test_every_key_in_the_table_is_possibly_present_in_the_stored_filter(
+    tmp_path: Path, expected_keys: int | None
+) -> None:
+    """Over both sizing paths, and over a hint that is badly wrong in each direction.
+
+    A hint far below the real count saturates the array and a hint far above it
+    wastes space, and neither may cost a single membership answer: bits are only
+    ever set, so no amount of saturation can turn a key that was added into a
+    key the filter denies.
+    """
+    count = 200
+    layout = build_table(
+        tmp_path / f"filter_{expected_keys}.sst", count, interval=8, expected_keys=expected_keys
+    )
+    stored = stored_bloom_filter(layout)
+
+    missing = [keyed(index) for index in range(count) if not stored.might_contain(keyed(index))]
+    assert missing == []
+
+
+def test_tombstoned_keys_are_in_the_filter_too(tmp_path: Path) -> None:
+    """A delete is an answer, so skipping the table that holds it resurrects the key."""
+    records: list[tuple[bytes, bytes | None]] = [
+        (keyed(0), b"kept"),
+        (keyed(1), None),
+        (keyed(2), None),
+        (keyed(3), b"kept"),
+    ]
+    layout = write_sstable(tmp_path / "tombstones.sst", records)
+    stored = stored_bloom_filter(layout)
+
+    assert all(stored.might_contain(key) for key, _ in records)
+    assert stored.added_count == len(records)
+
+
+def test_keys_of_every_shape_survive_the_round_trip(tmp_path: Path) -> None:
+    """Binary keys, an empty key and a long one, since the filter hashes raw bytes."""
+    keys = [b"", b"\x00", b"\x00\xff\xfe", b"\xff" * 300, "key-é中".encode()]
+    records: list[tuple[bytes, bytes | None]] = [(key, b"v") for key in sorted(keys)]
+    layout = write_sstable(tmp_path / "shapes.sst", records)
+    stored = stored_bloom_filter(layout)
+
+    assert all(stored.might_contain(key) for key in keys)
+
+
+def test_stored_filter_behaves_like_the_one_the_writer_returned(tmp_path: Path) -> None:
+    """Serializing and reloading must not change a single answer, present or absent."""
+    count = 150
+    layout = build_table(tmp_path / "same.sst", count, interval=16, expected_keys=count)
+    stored = stored_bloom_filter(layout)
+    in_memory = layout.bloom_filter
+
+    assert stored.bit_count == in_memory.bit_count
+    assert stored.hash_count == in_memory.hash_count
+    assert stored.bits == in_memory.bits
+    probes = [keyed(index) for index in range(count * 3)]
+    assert [stored.might_contain(key) for key in probes] == [
+        in_memory.might_contain(key) for key in probes
+    ]
+
+
+def test_a_filter_sized_for_the_table_skips_most_absent_keys(tmp_path: Path) -> None:
+    """The filter has to be useful, not merely correct.
+
+    A filter that answered possibly-present to everything would pass every
+    assertion above and skip no table at all, which is the failure this one
+    exists to catch. The bound is deliberately loose (ten times the configured
+    target) because a measured rate over a finite sample is noisy, and what is
+    being checked is that the filter is doing its job at all, not that it hits
+    its target to three decimal places. Measuring the target itself is M5.1's
+    test, against the structure rather than against a file.
+    """
+    count = 2000
+    layout = build_table(tmp_path / "useful.sst", count, interval=32, expected_keys=count)
+    stored = stored_bloom_filter(layout)
+
+    absent = [f"absent{index:05d}".encode() for index in range(5000)]
+    false_positives = sum(1 for key in absent if stored.might_contain(key))
+    measured_rate = false_positives / len(absent)
+    assert measured_rate < DEFAULT_BLOOM_FALSE_POSITIVE_RATE * 10
+
+
+def test_a_tighter_target_rate_buys_a_bigger_filter(tmp_path: Path) -> None:
+    loose = build_table(tmp_path / "loose.sst", 500, expected_keys=500, rate=0.1)
+    tight = build_table(tmp_path / "tight.sst", 500, expected_keys=500, rate=0.001)
+
+    assert len(bloom_section_bytes(tight)) > len(bloom_section_bytes(loose))
+    assert stored_bloom_filter(tight).bit_count > stored_bloom_filter(loose).bit_count
+    assert stored_bloom_filter(loose).target_false_positive_rate == 0.1
+
+
+def test_an_empty_table_stores_a_filter_that_denies_every_key(tmp_path: Path) -> None:
+    """Not an empty section: a reader never has to treat a missing filter as a maybe."""
+    layout = write_sstable(tmp_path / "empty.sst", [])
+    stored = stored_bloom_filter(layout)
+
+    assert layout.record_count == 0
+    assert stored.added_count == 0
+    assert not any(stored.might_contain(keyed(index)) for index in range(100))
+
+
+# Acceptance criterion: the footer's bloom filter offset points to a valid
+# serialized filter.
+
+
+@pytest.mark.parametrize("count", [0, 1, 63, 64, 65, 300])
+def test_the_footer_locates_a_filter_that_deserializes(tmp_path: Path, count: int) -> None:
+    layout = build_table(tmp_path / f"located{count}.sst", count, interval=16)
+    section = bloom_section_bytes(layout)
+
+    assert layout.bloom_filter_offset == layout.index_end
+    assert layout.bloom_filter_end == layout.footer_offset
+    assert section[: len(BLOOM_MAGIC)] == BLOOM_MAGIC
+    assert len(section) == BLOOM_HEADER_SIZE + stored_bloom_filter(layout).byte_count + (
+        BLOOM_CHECKSUM_SIZE
+    )
+    # Straight from the bytes, with no help from the layout the writer returned.
+    assert BloomFilter.deserialize(section).bits == stored_bloom_filter(layout).bits
+
+
+def test_reading_the_filter_needs_nothing_but_the_file(tmp_path: Path) -> None:
+    """read_bloom_filter measures the footer against the file it was handed."""
+    layout = build_table(tmp_path / "standalone.sst", 50, interval=8)
+    with open(layout.path, "rb") as handle:
+        footer = read_footer(handle)
+        first = read_bloom_filter(handle, footer)
+        # A second call on the same handle, to show the read leaves the stream
+        # in a state the next one can work from.
+        second = read_bloom_filter(handle, footer)
+
+    assert first.bits == second.bits
+
+
+def test_a_footer_pointing_the_filter_at_another_section_is_refused(tmp_path: Path) -> None:
+    """The blob's own magic is what catches an offset that survived the footer's checks."""
+    layout = build_table(tmp_path / "misdirected.sst", 40, interval=8)
+    damaged = tmp_path / "misdirected_copy.sst"
+    damaged.write_bytes(
+        replaced_footer(
+            layout,
+            bloom_filter_offset=layout.data_block_offset,
+            bloom_filter_end=layout.data_block_end,
+        )
+    )
+
+    with open(damaged, "rb") as handle:
+        footer = read_footer(handle)
+        with pytest.raises(BloomHeaderError):
+            read_bloom_filter(handle, footer)
+
+
+def test_a_footer_shortening_the_filter_section_is_refused(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "short.sst", 40, interval=8)
+    damaged = tmp_path / "short_copy.sst"
+    damaged.write_bytes(
+        replaced_footer(layout, bloom_filter_end=layout.bloom_filter_offset + BLOOM_HEADER_SIZE)
+    )
+
+    with open(damaged, "rb") as handle:
+        footer = read_footer(handle)
+        with pytest.raises(BloomTruncatedError):
+            read_bloom_filter(handle, footer)
+
+
+def test_a_filter_offset_outside_the_file_is_refused_before_any_read(tmp_path: Path) -> None:
+    """A length taken off a damaged footer must not reach a read call.
+
+    The bounds check is the footer's, applied again here rather than assumed, so
+    that a caller holding a footer from anywhere cannot turn ``1 << 40`` into an
+    allocation.
+    """
+    layout = build_table(tmp_path / "outside.sst", 20, interval=8)
+    damaged = tmp_path / "outside_copy.sst"
+    damaged.write_bytes(replaced_footer(layout, bloom_filter_end=1 << 40))
+
+    with open(damaged, "rb") as handle:
+        footer = SSTableFooter.decode(damaged.read_bytes()[-FOOTER_SIZE:])
+        with pytest.raises(SSTableCorruptFooterError):
+            read_bloom_filter(handle, footer)
+
+
+@pytest.mark.parametrize("flip_at", [0, 12, -8])
+def test_a_damaged_filter_section_is_refused_rather_than_answered_from(
+    tmp_path: Path, flip_at: int
+) -> None:
+    """The one failure this format cannot detect after the fact, caught before it happens.
+
+    A flipped bit inside a bloom filter is invisible to structure: every
+    arrangement of bits is a legal filter. Left unchecked it would show up as a
+    key the filter denies, the read path would skip the table holding that key
+    (ARCHITECTURE.md section 5), and the value would be gone with nothing
+    raised. The blob's checksum is what turns that into a refusal.
+    """
+    layout = build_table(tmp_path / f"flip{flip_at}.sst", 60, interval=8)
+    raw = bytearray(layout.path.read_bytes())
+    position = (
+        layout.bloom_filter_offset + flip_at if flip_at >= 0 else layout.bloom_filter_end + flip_at
+    )
+    raw[position] ^= 0x01
+    damaged = tmp_path / f"flip{flip_at}_copy.sst"
+    damaged.write_bytes(bytes(raw))
+
+    with open(damaged, "rb") as handle:
+        footer = read_footer(handle)
+        with pytest.raises((BloomChecksumError, BloomHeaderError)):
+            read_bloom_filter(handle, footer)
+
+
+# Acceptance criterion: M4's writer and reader round-trip behavior is unchanged
+# by the real filter replacing the placeholder.
+
+
+@pytest.mark.parametrize("interval", [1, 5, DEFAULT_INDEX_INTERVAL])
+def test_the_reader_still_finds_every_key_with_a_real_filter_stored(
+    tmp_path: Path, interval: int
+) -> None:
+    count = 120
+    layout = build_table(tmp_path / f"unchanged{interval}.sst", count, interval=interval)
+
+    with SSTableReader.open(layout.path) as reader:
+        for index in range(count):
+            record = reader.lookup(keyed(index))
+            assert record is not None
+            assert record.is_tombstone is (index % 7 == 0)
+            if not record.is_tombstone:
+                assert record.value == valued(index)
+        assert reader.lookup(b"absent") is None
+    assert inspect_sstable(layout.path).status is SSTableStatus.VALID
+
+
+def test_the_filter_never_denies_a_key_the_reader_can_find(tmp_path: Path) -> None:
+    """The invariant the read path will rest on in M7, checked against the reader itself.
+
+    If a table's filter ever says "definitely absent" for a key the table's own
+    reader returns a record for, then M7's skip would drop a live value. That is
+    a statement about the two together, so it is checked against both rather
+    than against either one's idea of what the table holds.
+    """
+    count = 300
+    layout = build_table(tmp_path / "agreement.sst", count, interval=16, expected_keys=count)
+    stored = stored_bloom_filter(layout)
+
+    with SSTableReader.open(layout.path) as reader:
+        for index in range(count * 2):
+            key = keyed(index)
+            if reader.lookup(key) is not None:
+                assert stored.might_contain(key), f"filter denies {key!r} the reader returned"
+
+
+# The format version the filled-in section cost, per CLAUDE.md's rule that a
+# change to a stored layout is carried by a version byte rather than made
+# quietly.
+
+
+def test_the_format_version_moved_past_the_placeholder_layout() -> None:
+    assert SSTABLE_FORMAT_VERSION > 1
+
+
+def test_a_table_in_the_placeholder_version_is_unsupported_and_not_corrupt(
+    tmp_path: Path,
+) -> None:
+    """The distinction M4.4 drew, applied to this build's own predecessor.
+
+    A version 1 table was committed correctly; what changed is that the bytes at
+    its bloom filter offset mean something else now. Calling that corruption
+    would invite an engine to delete a table whose data is real.
+    """
+    layout = build_table(tmp_path / "v1.sst", 20, interval=8)
+    older = tmp_path / "v1_copy.sst"
+    older.write_bytes(stamped_with_version(layout, 1))
+
+    verdict = inspect_sstable(older)
+    assert verdict.status is SSTableStatus.UNSUPPORTED_VERSION
+    assert verdict.is_complete is True
+    with pytest.raises(SSTableUnsupportedVersionError):
+        SSTableReader.open(older).close()
+
+
+# Sizing arguments.
+
+
+def test_expected_keys_sizes_the_filter_without_holding_the_keys(tmp_path: Path) -> None:
+    """The hint's whole purpose: a streaming writer that keeps nothing per key."""
+    path = tmp_path / "streamed.sst"
+    with SSTableWriter(path, expected_keys=64) as writer:
+        assert writer.expected_keys == 64
+        for index in range(64):
+            writer.add_put(keyed(index), b"v")
+        assert writer._pending_keys is None
+        layout = writer.finish()
+
+    stored = stored_bloom_filter(layout)
+    assert all(stored.might_contain(keyed(index)) for index in range(64))
+
+
+def test_without_a_hint_the_filter_is_sized_from_the_real_count(tmp_path: Path) -> None:
+    hinted = build_table(tmp_path / "hinted.sst", 500, expected_keys=500)
+    unhinted = build_table(tmp_path / "unhinted.sst", 500)
+
+    assert stored_bloom_filter(hinted).bit_count == stored_bloom_filter(unhinted).bit_count
+    assert stored_bloom_filter(unhinted).added_count == 500
+
+
+@pytest.mark.parametrize("rate", [0.0, 1.0, -0.5, 2.0])
+def test_an_impossible_target_rate_is_refused_when_the_writer_opens(
+    tmp_path: Path, rate: float
+) -> None:
+    """At open, not at finish, so a whole table is not streamed before the complaint."""
+    with pytest.raises(ValueError):
+        SSTableWriter(tmp_path / "bad_rate.sst", bloom_false_positive_rate=rate)
+    assert list(os.listdir(tmp_path)) == []
+
+
+def test_a_non_numeric_target_rate_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(TypeError):
+        SSTableWriter(tmp_path / "bad_rate.sst", bloom_false_positive_rate="tight")  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("expected_keys", [-1, True, 1.5])
+def test_an_unusable_expected_key_count_is_refused(tmp_path: Path, expected_keys: object) -> None:
+    with pytest.raises((TypeError, ValueError)):
+        SSTableWriter(tmp_path / "bad_hint.sst", expected_keys=expected_keys)  # type: ignore[arg-type]
+
+
+def test_zero_expected_keys_is_not_the_same_as_no_hint(tmp_path: Path) -> None:
+    """Zero says the caller counted and found nothing, which a flush legitimately does."""
+    with SSTableWriter(tmp_path / "counted_zero.sst", expected_keys=0) as writer:
+        assert writer.expected_keys == 0
+        layout = writer.finish()
+
+    assert layout.record_count == 0
+    assert stored_bloom_filter(layout).added_count == 0
+
+
+def test_the_default_target_rate_is_what_an_unconfigured_table_carries(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "default_rate.sst", 100)
+
+    assert (
+        stored_bloom_filter(layout).target_false_positive_rate == DEFAULT_BLOOM_FALSE_POSITIVE_RATE
+    )

@@ -1,20 +1,19 @@
 """SSTable: the immutable, sorted, on-disk form a frozen memtable is flushed into.
 
-Scope of this module today (stories M4.1 through M4.4): framing a record for the
-data block, streaming a sorted run of records into a file while building a
-sparse index from the offsets that stream produces, committing the file with a
-fixed size footer that records the format version and where every section starts
-and ends, reading a key back out of a finished table by way of that footer, and
-judging whether a file found on disk is a complete table at all. The bloom
-filter section is written here as an empty placeholder whose real contents land
-in M5.3.
+Scope of this module today (stories M4.1 through M4.4, plus M5.3): framing a
+record for the data block, streaming a sorted run of records into a file while
+building a sparse index from the offsets that stream produces and a bloom filter
+from the keys, committing the file with a fixed size footer that records the
+format version and where every section starts and ends, reading a key back out
+of a finished table by way of that footer, and judging whether a file found on
+disk is a complete table at all.
 
 On-disk layout (little endian, no padding), with the sections this story writes::
 
     [ 8B magic ][ 1B format version ]
     [ data block:   record record record ... ]
     [ sparse index: 4B entry count, then entry entry ... ]
-    [ bloom filter placeholder: 4B section length, currently zero ]
+    [ bloom filter: one serialized ledgerlog.bloom blob, self-describing ]
     [ footer ]
 
 On-disk footer layout, a fixed size trailer::
@@ -64,10 +63,34 @@ of scanning, which is the whole point of the section for the sparse index.
 
 Why adding the footer did not bump the format version: a file without a footer
 was never a complete SSTable under this format (the footer is the commit point),
-so there are no valid version 1 files with the older shape for a bumped version
-to protect. Version 1 is the layout in this docstring, whole. A later change to
-the shape of a section that complete tables already carry is what the version
-byte is for, and that one does bump it.
+so there were no valid version 1 files with the older shape for a bumped version
+to protect. A later change to the shape of a section that complete tables
+already carry is what the version byte is for, and that one does bump it.
+
+Why filling the bloom filter section in did bump it, to version 2: that is the
+change just described. A version 1 table was committed with a four byte
+placeholder at the bloom filter offset, and the bytes at that offset now mean a
+serialized filter instead. Nothing distinguishes the two by inspection at the
+section level, since a placeholder is a legal length prefix and the reader that
+wants a filter would hand those four bytes to
+:meth:`~ledgerlog.bloom.BloomFilter.deserialize` and get a truncation error that
+says nothing about which format it is looking at. The version byte is what
+answers that, and per CLAUDE.md it has to move rather than let the meaning of
+stored bytes change underneath it. A version 1 table is therefore reported as an
+unsupported version, not as damage, which is the outcome
+:func:`inspect_sstable` already distinguishes: it was committed correctly, and
+this build is the part that no longer matches.
+
+Why the bloom filter is stored as one self-contained blob rather than as fields
+spread into the footer: the failure a bloom filter can cause is the one failure
+this format cannot detect after the fact. A filter rebuilt from the wrong or
+damaged bytes can answer "definitely absent" for a key the table holds, the read
+path skips the table on the strength of that (ARCHITECTURE.md section 5), and
+the value is gone with nothing raised. ``ledgerlog.bloom``'s blob carries its own
+magic, length and checksum for exactly that reason, so storing it verbatim keeps
+that protection instead of replacing it with the footer's word for where the
+bits are. It also keeps the two formats versioned separately, which is what lets
+the bit order change without moving an SSTable's sections, or the reverse.
 
 Why a file that cannot be opened is sorted into three outcomes rather than just
 refused: the three call for different responses, and only one of them names a
@@ -116,7 +139,9 @@ from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO
 
-SSTABLE_FORMAT_VERSION = 1
+from ledgerlog.bloom import BloomFilter
+
+SSTABLE_FORMAT_VERSION = 2
 """Version of the layout described in this module's docstring.
 
 Stamped into every SSTable's file header. A build that reads a different number
@@ -140,7 +165,6 @@ _RECORD_PAYLOAD_HEADER_FORMAT = "<BI"
 _INDEX_COUNT_FORMAT = "<I"
 _INDEX_ENTRY_HEADER_FORMAT = "<I"
 _INDEX_ENTRY_OFFSET_FORMAT = "<Q"
-_BLOOM_PLACEHOLDER_FORMAT = "<I"
 _FOOTER_FIELDS_FORMAT = "<7QB"
 _FOOTER_CHECKSUM_FORMAT = "<I"
 _FOOTER_MAGIC_FORMAT = "<8s"
@@ -151,7 +175,6 @@ RECORD_PAYLOAD_HEADER_SIZE = struct.calcsize(_RECORD_PAYLOAD_HEADER_FORMAT)
 INDEX_COUNT_SIZE = struct.calcsize(_INDEX_COUNT_FORMAT)
 INDEX_ENTRY_HEADER_SIZE = struct.calcsize(_INDEX_ENTRY_HEADER_FORMAT)
 INDEX_ENTRY_OFFSET_SIZE = struct.calcsize(_INDEX_ENTRY_OFFSET_FORMAT)
-BLOOM_PLACEHOLDER_SIZE = struct.calcsize(_BLOOM_PLACEHOLDER_FORMAT)
 FOOTER_FIELDS_SIZE = struct.calcsize(_FOOTER_FIELDS_FORMAT)
 FOOTER_CHECKSUM_SIZE = struct.calcsize(_FOOTER_CHECKSUM_FORMAT)
 FOOTER_MAGIC_SIZE = struct.calcsize(_FOOTER_MAGIC_FORMAT)
@@ -182,6 +205,19 @@ table while bounding the scan at 63 records, which for the record sizes this
 engine targets is a small number of sequential bytes off a page or two. The real
 value belongs to the tuning spike in M10, which will pick it from measurements
 rather than from this reasoning.
+"""
+
+DEFAULT_BLOOM_FALSE_POSITIVE_RATE = 0.01
+"""Default target false-positive rate for the bloom filter a table carries.
+
+One in a hundred, which costs about ten bits per key and seven hash probes per
+query. The trade-off, per ARCHITECTURE.md section 3, is the size of the filter
+against how often a read opens a table that cannot hold the key: halving the
+rate costs roughly another 1.44 bits per key, and each halving saves half of an
+already small number of wasted lookups, so the returns fall off quickly on the
+accuracy side while the memory cost keeps climbing linearly. Like the index
+interval above, the real value belongs to the M10 tuning spike, which will pick
+it from a measured read amplification rather than from this reasoning.
 """
 
 
@@ -867,10 +903,10 @@ def validate_footer_sections(footer: SSTableFooter, *, file_size: int) -> None:
     the question and it needs the file: an offset that is internally consistent
     can still land past the end of the file, and following one would seek outside
     the table and size a read by a number nobody wrote. Doing it here, once,
-    rather than at each place a section is about to be read, is what makes that
-    true of sections this build does not read yet: the bloom filter placeholder
-    is checked like the others, because what is being decided is whether the
-    footer can be the writer's at all, and M5.3 will read that section for real.
+    rather than at each place a section is about to be read, is what makes every
+    section safe to reach for: what is being decided is whether the footer can be
+    the writer's at all, not whether the one section a given caller wants is
+    plausible.
     """
     footer_offset = file_size - FOOTER_SIZE
     sections = (
@@ -885,6 +921,40 @@ def validate_footer_sections(footer: SSTableFooter, *, file_size: int) -> None:
                 f"{FILE_HEADER_SIZE} to {footer_offset} range this {file_size} byte file can "
                 "hold it in"
             )
+
+
+def read_bloom_filter(
+    stream: BinaryIO, footer: SSTableFooter, *, file_size: int | None = None
+) -> BloomFilter:
+    """Read and rebuild the bloom filter of the table open on ``stream``.
+
+    ``footer`` says where the section is, and is re-measured against the file
+    here rather than taken on trust, so that this function is safe to call with a
+    footer from anywhere: a caller that already validated it pays one comparison,
+    and a caller that did not cannot turn a damaged offset into a read sized by a
+    number nobody wrote. Only the bytes the section actually spans are read, and
+    everything inside them is :meth:`~ledgerlog.bloom.BloomFilter.deserialize`'s
+    to check.
+
+    This is deliberately not done at open time by :class:`SSTableReader`. A
+    filter exists to let the read path skip a table it would otherwise open
+    (ARCHITECTURE.md section 5), which is a decision made one level up, across
+    tables, and that level arrives in M7. Loading it here would mean every reader
+    paid for a filter whether or not anything consulted it.
+    """
+    if file_size is None:
+        file_size = stream.seek(0, os.SEEK_END)
+    validate_footer_sections(footer, file_size=file_size)
+
+    start = footer.bloom_filter_offset
+    length = footer.bloom_filter_end - start
+    stream.seek(start)
+    raw = stream.read(length)
+    if len(raw) < length:
+        raise SSTableFooterError(
+            f"read {len(raw)} of {length} bytes of the bloom filter section at offset {start}"
+        )
+    return BloomFilter.deserialize(raw)
 
 
 def read_footer(stream: BinaryIO, *, file_size: int | None = None) -> SSTableFooter:
@@ -1067,11 +1137,11 @@ class SSTableLayout:
     """Where each section of a finished SSTable lives, and what it holds.
 
     Returned by :meth:`SSTableWriter.finish`. It is what the footer is written
-    from, and it says the same thing the footer does plus the two things the
-    footer has no reason to carry: the path, and the sparse index as an object.
-    The index is here because the writer built it in memory on the way past, and
-    making the caller decode from disk what the writer already has would be work
-    done twice.
+    from, and it says the same thing the footer does plus the three things the
+    footer has no reason to carry: the path, the sparse index as an object, and
+    the bloom filter as an object. Those last two are here because the writer
+    built them in memory on the way past, and making the caller decode from disk
+    what the writer already has would be work done twice.
     """
 
     path: Path
@@ -1086,6 +1156,7 @@ class SSTableLayout:
     footer_end: int
     record_count: int
     index: SparseIndex
+    bloom_filter: BloomFilter
 
     @property
     def data_block_size(self) -> int:
@@ -1144,6 +1215,17 @@ class SSTableWriter:
     records are being written, so building the index afterwards would mean
     reading the table back to recover numbers the writer just had.
 
+    The bloom filter is built from every key, tombstones included. A tombstone is
+    the table's answer for that key and it has to stop the read path rather than
+    let an older table's value surface (ARCHITECTURE.md section 5), so a filter
+    that omitted deleted keys would send a lookup straight past the table that
+    holds the delete. Sizing a filter needs the key count up front, which a
+    streaming writer does not have, so ``expected_keys`` is how a caller that
+    knows it (a flush knows its memtable's length; a merge knows the sum of its
+    sources' record counts) keeps the writer streaming. Without it the keys are
+    held until :meth:`finish` and the filter is sized exactly, which costs memory
+    proportional to the key set and is why the hint exists.
+
     Writes go to a temporary file in the destination directory and are moved to
     the final path by :meth:`finish` with an atomic rename, so the destination
     either does not exist or is a complete table. ARCHITECTURE.md section 6 makes
@@ -1171,6 +1253,8 @@ class SSTableWriter:
         path: str | os.PathLike[str],
         *,
         index_interval: int = DEFAULT_INDEX_INTERVAL,
+        expected_keys: int | None = None,
+        bloom_false_positive_rate: float = DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
     ) -> None:
         """Open a temporary file for the SSTable that will be moved to ``path``.
 
@@ -1178,8 +1262,33 @@ class SSTableWriter:
         is a constructor argument rather than a module constant because the right
         value depends on record size and read pattern, which the engine knows and
         the format does not.
+
+        ``expected_keys``, when given, sizes the bloom filter immediately so keys
+        are hashed into it as they stream past and none are held. It is a hint
+        and not a promise: writing more keys than were expected saturates the
+        array and pushes the real false-positive rate above the target, which
+        costs lookups and never correctness, since a bloom filter's bits are only
+        ever set and no amount of saturation can produce a false negative.
+
+        ``bloom_false_positive_rate`` is checked here rather than where the
+        filter is built, because in the deferred case that is :meth:`finish`, and
+        a rate the sizing formula cannot accept should be reported when the
+        writer is opened rather than after a whole table has been streamed into
+        it. ``ledgerlog.bloom`` is what enforces the rule; this repeats its range
+        so the report arrives at the useful moment.
         """
         self._index_interval = _validate_index_interval(index_interval)
+        self._bloom_rate = _validate_false_positive_rate(bloom_false_positive_rate)
+        self._expected_keys = _validate_expected_keys(expected_keys)
+        # Either a filter that is already sized and takes keys as they arrive, or
+        # no filter and a list of the keys to size one from at finish. Never
+        # both: the buffer exists only because the size is not yet known.
+        self._bloom: BloomFilter | None = None
+        self._pending_keys: list[bytes] | None = None
+        if self._expected_keys is None:
+            self._pending_keys = []
+        else:
+            self._bloom = BloomFilter.for_target(max(1, self._expected_keys), self._bloom_rate)
         self._path = Path(path)
         self._temp_path = self._path.with_name(f".{self._path.name}.tmp")
         self._index_entries: list[IndexEntry] = []
@@ -1209,6 +1318,16 @@ class SSTableWriter:
     def index_interval(self) -> int:
         """Number of records between two sparse index entries."""
         return self._index_interval
+
+    @property
+    def bloom_false_positive_rate(self) -> float:
+        """Target false-positive rate the table's bloom filter is sized for."""
+        return self._bloom_rate
+
+    @property
+    def expected_keys(self) -> int | None:
+        """Key count the filter was sized from, or ``None`` if sized at finish."""
+        return self._expected_keys
 
     @property
     def record_count(self) -> int:
@@ -1244,6 +1363,14 @@ class SSTableWriter:
             )
 
         record = encode_record(key, value)
+        # Every key reaches the filter, one way or the other: hashed straight in
+        # when the size was known up front, held for finish to size from when it
+        # was not.
+        bloom = self._bloom
+        if bloom is not None:
+            bloom.add(key)
+        elif self._pending_keys is not None:
+            self._pending_keys.append(key)
         offset = self._file.tell()
         # The index entry is appended before the write rather than after, so that
         # its offset is the position the record is about to occupy. Taking it
@@ -1272,12 +1399,10 @@ class SSTableWriter:
     def finish(self) -> SSTableLayout:
         """Write the remaining sections, sync, and move the table to its final path.
 
-        The bloom filter section is written as a zero length placeholder. Its
-        position in the layout is fixed, between the index and the footer, so
-        that M5.3 can fill it in without moving anything else. A placeholder with
-        an explicit length rather than no section at all means a reader is never
-        guessing whether the bytes at that offset are a filter or the start of
-        something else.
+        The bloom filter section holds one serialized filter, built from every
+        key in the table. When the writer was not told how many keys to expect,
+        this is where the filter is sized and filled, from the keys held since
+        the first :meth:`add`.
 
         The footer goes last, after every section it describes, which is what
         makes it the commit point: it cannot be written until the offsets it
@@ -1299,7 +1424,8 @@ class SSTableWriter:
             index = SparseIndex(self._index_entries)
             self._file.write(index.encode())
             index_end = self._file.tell()
-            self._file.write(struct.pack(_BLOOM_PLACEHOLDER_FORMAT, 0))
+            bloom = self._build_bloom_filter()
+            self._file.write(bloom.serialize())
             bloom_filter_end = self._file.tell()
 
             footer = SSTableFooter(
@@ -1353,7 +1479,33 @@ class SSTableWriter:
             footer_end=footer_end,
             record_count=self._record_count,
             index=index,
+            bloom_filter=bloom,
         )
+
+    def _build_bloom_filter(self) -> BloomFilter:
+        """Return the filter to store, sizing and filling it now if that was deferred.
+
+        An empty table still gets a filter rather than an empty section. A one
+        bit filter with nothing added answers "definitely absent" for every key,
+        which is the true answer for a table with no keys, and it keeps the
+        section one shape: a reader never has to handle a table whose filter is
+        missing, and so never has a path where a missing filter is quietly read
+        as "might contain anything".
+
+        The held keys are dropped once they are hashed in. They were only ever
+        kept to count them, and a filter stores no keys, so holding them past
+        this point would be holding the one thing the structure exists not to
+        store.
+        """
+        if self._bloom is not None:
+            return self._bloom
+        pending = self._pending_keys or []
+        bloom = BloomFilter.for_target(max(1, len(pending)), self._bloom_rate)
+        for key in pending:
+            bloom.add(key)
+        self._bloom = bloom
+        self._pending_keys = None
+        return bloom
 
     def discard(self) -> None:
         """Close the writer and remove its temporary file. Safe to call more than once.
@@ -1402,11 +1554,43 @@ def _validate_index_interval(index_interval: int) -> int:
     return index_interval
 
 
+def _validate_expected_keys(expected_keys: int | None) -> int | None:
+    """Return ``expected_keys`` if it is a usable count, else raise.
+
+    Zero is accepted, since a table with no records is a table a flush can
+    legitimately produce, and it is not the same as ``None``: zero says the
+    caller counted and found nothing, ``None`` says the caller did not count.
+    """
+    if expected_keys is None:
+        return None
+    if not isinstance(expected_keys, int) or isinstance(expected_keys, bool):
+        raise TypeError(f"expected_keys must be an int or None, got {type(expected_keys).__name__}")
+    if expected_keys < 0:
+        raise ValueError(f"expected_keys must not be negative, got {expected_keys}")
+    return expected_keys
+
+
+def _validate_false_positive_rate(rate: float) -> float:
+    """Return ``rate`` if a filter can be sized for it, else raise.
+
+    The same range ``ledgerlog.bloom`` enforces, checked early: zero makes the
+    sizing formula diverge and one means every query is a false positive, which
+    is the same as carrying no filter at all.
+    """
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool):
+        raise TypeError(f"bloom_false_positive_rate must be a float, got {type(rate).__name__}")
+    if not 0.0 < rate < 1.0:
+        raise ValueError(f"bloom_false_positive_rate must be strictly between 0 and 1, got {rate}")
+    return float(rate)
+
+
 def write_sstable(
     path: str | os.PathLike[str],
     records: Iterable[tuple[bytes, bytes | None]],
     *,
     index_interval: int = DEFAULT_INDEX_INTERVAL,
+    expected_keys: int | None = None,
+    bloom_false_positive_rate: float = DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
 ) -> SSTableLayout:
     """Write ``records`` to a new SSTable at ``path`` and return its layout.
 
@@ -1415,8 +1599,18 @@ def write_sstable(
     type, so that CLAUDE.md's rule about independently testable components holds:
     the SSTable format does not need to import the memtable to be written, and a
     caller flushing one adapts its entries in a generator expression.
+
+    ``expected_keys`` and ``bloom_false_positive_rate`` are passed through to
+    :class:`SSTableWriter`. They are not defaulted from ``len(records)`` here,
+    because ``records`` is an iterable and measuring it would mean consuming it,
+    which would defeat the streaming this function exists to do.
     """
-    with SSTableWriter(path, index_interval=index_interval) as writer:
+    with SSTableWriter(
+        path,
+        index_interval=index_interval,
+        expected_keys=expected_keys,
+        bloom_false_positive_rate=bloom_false_positive_rate,
+    ) as writer:
         for key, value in records:
             writer.add(key, value)
         return writer.finish()

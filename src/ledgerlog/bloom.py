@@ -4,8 +4,8 @@ Scope of this module today (stories M5.1 and M5.2): sizing a filter from an
 expected key count and a target false-positive rate, adding keys to it,
 answering "possibly present" or "definitely absent" for a key, and turning a
 filter into bytes and back. This module still writes no files of its own. It
-produces and consumes one self-contained blob, which M5.3 stores as the bloom
-filter section of an SSTable.
+produces and consumes one self-contained blob, which ``ledgerlog.sstable`` (M5.3)
+stores verbatim as the bloom filter section of an SSTable.
 
 Serialized layout (little endian, no padding)::
 
