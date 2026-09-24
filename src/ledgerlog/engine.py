@@ -1,12 +1,13 @@
 """Engine: the write-ahead log and the memtable wired into one key-value store.
 
-Scope of this module today (stories M3.1 and M3.2): the write path and startup
-recovery. A put or a delete is appended to the WAL first and applied to the
-memtable second, a get answers from the memtable, and opening an engine over an
-existing log replays that log into a fresh memtable before the caller can issue
-anything. That is the whole engine for now, and it is already a complete durable
-store: every acknowledged write is in the log before any reader can see it, and
-a restart brings every one of them back.
+Scope of this module today (stories M3.1, M3.2 and M6.1): the write path,
+startup recovery, and the freeze-and-swap that retires a memtable once it has
+grown past a configured size. A put or a delete is appended to the WAL first and
+applied to the memtable second, a get answers from the memtable and then from any
+frozen memtables behind it, and opening an engine over an existing log replays
+that log into a fresh memtable before the caller can issue anything. Every
+acknowledged write is in the log before any reader can see it, and a restart
+brings every one of them back.
 
 Why the WAL comes first, since this ordering is the only reason the module
 exists: the memtable is memory and the log is disk, so the moment a write
@@ -66,6 +67,41 @@ with an exception and nothing is truncated. Recovery declines to guess at a file
 it cannot parse, for the reason ``wal.py`` gives: the one response worse than
 refusing to recover from such a file is destroying it.
 
+Freeze and swap
+---------------
+
+A memtable is not written to forever. Once the active one's payload size (see
+``memtable.py`` for exactly what that counts) reaches
+``memtable_threshold_bytes``, the writer that pushed it over freezes it, hands it
+to :attr:`LedgerLog.frozen_memtables`, and installs a fresh empty memtable for
+the writes that follow. ARCHITECTURE.md section 2 asks for precisely this: the
+flush runs against a table nothing can still be writing to, and the caller's next
+write does not wait for the flush, because it goes somewhere else.
+
+The check runs on the write path, inside the same lock as the write, rather than
+on a timer or a background thread. That is what makes the threshold mean
+something: a writer that has just applied a record is the one thread that knows
+the size is now over, and checking there means no write is ever applied to a
+table already over the line by more than the one record that crossed it.
+
+Publication order during the swap is the only subtle part, and it is written the
+way it is because :meth:`LedgerLog.get` takes no lock. The table is frozen, then
+appended to the frozen tuple, and only then replaced as the active one. A reader
+that loads the old active table finds the records there; a reader that loads the
+new one finds nothing and goes on to the frozen tuple, which was published
+before the table it is looking for stopped being active. There is no ordering of
+those loads that lets a reader see neither, which is what "no write is lost
+during the swap" comes to for a reader. Doing it the other way round, swapping
+first and publishing after, opens exactly that window.
+
+Frozen tables are kept newest-first and are never dropped by this module.
+Dropping one is :meth:`LedgerLog.drop_frozen`, which the flush calls once the
+SSTable's footer is on disk (story M6.2), because until that moment the records
+exist only in that table and in the log. So until M6.2 lands, a long-running
+engine accumulates frozen tables rather than releasing memory, which is the
+honest state of a half-built flush path and not an oversight: the alternative,
+dropping a frozen table with nowhere to have written it, is data loss.
+
 Concurrency
 -----------
 
@@ -89,16 +125,24 @@ One lock guards the whole write path, and reads take nothing.
   takes its own lock on the way through (see ``memtable.py``), so a read there
   can wait on the memtable step of a write, though never on the log step.
 
-Lock ordering is fixed and one way, the engine lock then the WAL writer's, so
-there is no cycle for two threads to deadlock around.
+* The freeze-and-swap and :meth:`LedgerLog.drop_frozen` take the same engine
+  lock, which is what gives story M6.1 the atomicity it asks for. A write cannot
+  be in flight while a table is being frozen, because a write holds the lock
+  across its whole self and the freeze happens inside that same critical
+  section, so the record that crossed the threshold is in the table being frozen
+  and the next record is in the table that replaced it, with nothing in between.
+
+Lock ordering is fixed and one way, the engine lock then the WAL writer's or the
+memtable's, so there is no cycle for two threads to deadlock around.
 
 What is deliberately not here yet:
 
-* Flushing the memtable to an SSTable and everything downstream of it
-  (milestones 4 and up), so the memtable grows without bound and every read is
-  answered from memory. The same bound applies to recovery: the log is replayed
-  in full because nothing yet trims it, so startup cost and memory both grow
-  with the log until a flush exists to cut it back (milestone 6).
+* Writing a frozen memtable out as an SSTable (story M6.2), and everything
+  downstream of it. Freezing retires a memtable from writes but nothing yet
+  moves its records to disk, so memory still grows with the data written, and
+  the log is still replayed in full at startup because nothing yet trims it.
+* Reading from SSTables (milestone 7). Every read is still answered from memory,
+  from the active memtable and then the frozen ones.
 """
 
 from __future__ import annotations
@@ -109,7 +153,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
-from ledgerlog.memtable import Memtable
+from ledgerlog.memtable import Memtable, MemtableEntry
 from ledgerlog.wal import (
     DEFAULT_FSYNC_INTERVAL_SECONDS,
     FILE_HEADER_SIZE,
@@ -128,6 +172,19 @@ engine owns, and from milestone 4 on it holds SSTables that have to be
 discovered by name alongside this file. Letting the log live anywhere would mean
 a data directory that is only complete if the caller remembers to point at the
 matching log.
+"""
+
+DEFAULT_MEMTABLE_THRESHOLD_BYTES = 4 * 1024 * 1024
+"""Payload bytes an active memtable may hold before it is frozen and replaced.
+
+Four mebibytes, chosen as a starting point rather than a measured optimum, and
+listed in ROADMAP.md milestone 10 as something the benchmarks are meant to tune.
+The trade it sits in the middle of: a smaller threshold means more SSTables,
+each cheap to flush but one more thing a read may have to check and one more
+thing compaction has to merge, while a larger one means fewer, bigger files and
+more memory held (several times this number once Python object overhead is
+counted, per ``memtable.py``) and a longer log to replay after a crash, since
+nothing trims the log until the data it describes is on disk.
 """
 
 
@@ -177,6 +234,7 @@ class LedgerLog:
         *,
         fsync_policy: FsyncPolicy | str = FsyncPolicy.ALWAYS,
         fsync_interval_seconds: float = DEFAULT_FSYNC_INTERVAL_SECONDS,
+        memtable_threshold_bytes: int = DEFAULT_MEMTABLE_THRESHOLD_BYTES,
     ) -> None:
         """Open, or create, the engine whose data lives in ``directory``.
 
@@ -197,13 +255,26 @@ class LedgerLog:
         lazily, on the first get, would have to define what a get racing it
         should see, and there is no answer to that which is both simple and
         correct.
+
+        ``memtable_threshold_bytes`` is the payload size at which the active
+        memtable is frozen and replaced. It has to be at least one byte: a
+        threshold of zero would be met by an empty memtable, so every write would
+        freeze the table it had just landed in and the engine would make one
+        table per record forever.
         """
+        if memtable_threshold_bytes < 1:
+            raise ValueError(
+                f"memtable_threshold_bytes must be at least 1, got {memtable_threshold_bytes}"
+            )
+
         self._directory = Path(directory)
         self._directory.mkdir(parents=True, exist_ok=True)
 
         self._write_lock = threading.Lock()
         self._closed = False
+        self._memtable_threshold_bytes = memtable_threshold_bytes
         self._memtable = Memtable()
+        self._frozen_memtables: tuple[Memtable, ...] = ()
         self._recovery = self._replay_existing_log()
         self._wal = WalWriter(
             self._directory / WAL_FILENAME,
@@ -225,6 +296,37 @@ class LedgerLog:
     def fsync_policy(self) -> FsyncPolicy:
         """Policy deciding when appended log bytes are forced onto the disk."""
         return self._wal.fsync_policy
+
+    @property
+    def memtable_threshold_bytes(self) -> int:
+        """Payload size at which the active memtable is frozen and replaced."""
+        return self._memtable_threshold_bytes
+
+    @property
+    def memtable_nbytes(self) -> int:
+        """Payload bytes the active memtable currently holds.
+
+        The frozen tables are not counted. This number is what the threshold is
+        compared against, so a caller watching it is watching the same thing the
+        write path is, and adding in tables that are no longer being written to
+        would make it stop meaning that.
+        """
+        return self._memtable.nbytes
+
+    @property
+    def frozen_memtables(self) -> tuple[Memtable, ...]:
+        """Memtables retired from writing but still holding records, newest first.
+
+        Newest first because that is the order a read has to consult them in: a
+        key written, frozen, written again and frozen again exists in two of
+        these, and the newer record is the one that is true (ARCHITECTURE.md
+        section 5).
+
+        A tuple rather than a list, so that a caller holding this cannot change
+        what the engine will read next, and so that the engine can publish a new
+        set with one store that a lock-free reader sees all of or none of.
+        """
+        return self._frozen_memtables
 
     @property
     def recovery(self) -> RecoveryReport:
@@ -250,11 +352,17 @@ class LedgerLog:
         record over the format's size limit, or a failing disk, the memtable is
         left exactly as it was and the exception reaches the caller unchanged:
         the write did not happen, at either layer.
+
+        Once the write is applied, this call also freezes the memtable and swaps
+        in a fresh one if the threshold has been reached. That happens before the
+        put returns, and under the same lock, so the caller's next write is
+        already aimed at the new table.
         """
         with self._write_lock:
             self._check_open()
             self._wal.append_put(key, value)
             self._memtable.put(key, value)
+            self._freeze_if_full()
 
     def delete(self, key: bytes) -> None:
         """Record that ``key`` was deleted, logging it before it becomes visible.
@@ -273,23 +381,85 @@ class LedgerLog:
             self._check_open()
             self._wal.append_delete(key)
             self._memtable.delete(key)
+            self._freeze_if_full()
 
     def get(self, key: bytes) -> bytes | None:
         """Return the value stored under ``key``, or ``None`` if there is none.
 
-        A deleted key reads as ``None``, the same as a key that was never
-        written. The memtable keeps the two apart internally, and the read path
-        will need that distinction once there are older layers to fall through
-        to (story M7.2), but with the memtable as the only layer both honestly
-        mean "this engine has no value for that key".
+        The active memtable is consulted first and the frozen ones after it,
+        newest first, which is ARCHITECTURE.md section 5's ordering minus the
+        SSTables that do not exist yet (story M7.2). The search stops at the
+        first layer holding any record for the key, including a tombstone: a
+        tombstone means the key was deleted after whatever an older layer still
+        remembers, so falling through it would resurrect that older value.
+
+        A deleted key therefore reads as ``None``, the same as a key that was
+        never written. The two are different facts internally and the difference
+        is what the paragraph above turns on, but to a caller asking for a value
+        they come to the same thing.
 
         A key put with an empty value reads back as ``b""``, which is not
         ``None``. The distinction between an empty value and a deletion is
         carried all the way down into the log's record format, and it survives
         here.
+
+        Takes no lock, and reads the active table before the frozen ones, which
+        is the order the swap publishes in reverse. See this module's docstring
+        for why that is what keeps a concurrent freeze from hiding a record from
+        this call.
         """
         self._check_open()
-        return self._memtable.get(key)
+
+        entry = self._lookup(key)
+        if entry is None or entry.is_tombstone:
+            return None
+        return entry.value
+
+    def _lookup(self, key: bytes) -> MemtableEntry | None:
+        """Return the newest record held for ``key``, or ``None`` if there is none.
+
+        Separate from :meth:`get` because the layers have to be walked with the
+        distinction between "deleted here" and "not here" intact, and
+        :meth:`Memtable.get` has already thrown it away. Collapsing the two into
+        one loop would mean a tombstone in the active table reading the same as
+        no record at all, and the search moving on to a frozen table that still
+        holds the deleted value.
+        """
+        entry = self._memtable.lookup(key)
+        if entry is not None:
+            return entry
+
+        for table in self._frozen_memtables:
+            entry = table.lookup(key)
+            if entry is not None:
+                return entry
+
+        return None
+
+    def drop_frozen(self, memtable: Memtable) -> None:
+        """Forget a frozen memtable, releasing its records from memory.
+
+        The caller is asserting that these records are safe somewhere else. That
+        will be an SSTable whose footer is fully written (story M6.2), since the
+        footer is what makes a table count as existing at all (ARCHITECTURE.md
+        section 6); dropping before that point loses every record in it that the
+        log no longer covers.
+
+        Identity, not equality, decides which table goes: two frozen tables can
+        hold identical records and still be different snapshots, and the caller
+        is dropping the one it flushed rather than one that looks like it.
+
+        Raises :class:`ValueError` if the table is not one this engine is
+        holding, rather than returning quietly. A caller dropping a table twice,
+        or dropping one belonging to another engine, has lost track of which
+        snapshot it flushed, and that is worth an exception on the spot rather
+        than at the point where the records turn out to be missing.
+        """
+        with self._write_lock:
+            remaining = tuple(table for table in self._frozen_memtables if table is not memtable)
+            if len(remaining) == len(self._frozen_memtables):
+                raise ValueError("memtable is not one of this engine's frozen memtables")
+            self._frozen_memtables = remaining
 
     def close(self) -> None:
         """Close the log and stop accepting operations. Safe to call more than once.
@@ -369,12 +539,49 @@ class LedgerLog:
                     "which startup replay has no rule for"
                 )
 
+        # A log big enough to recover a memtable past the threshold is a log
+        # whose records belong on disk, so the same rule is applied to the
+        # replayed table as to a written one, once, after the last record. Not
+        # per record: replay is not the write path, and freezing every threshold
+        # worth of a large log would build a stack of tables at startup that
+        # nothing can flush until the engine is open anyway.
+        self._freeze_if_full()
+
         return RecoveryReport(
             records_replayed=len(result.records),
             end_offset=result.end_offset,
             stopped_at=result.stopped_at,
             reason=result.reason,
         )
+
+    def _freeze_if_full(self) -> None:
+        """Freeze and replace the active memtable if it has reached the threshold.
+
+        Call holding the write lock, or from the constructor before any other
+        thread can reach this engine. The lock is what story M6.1's atomicity
+        criterion comes down to: the write that crossed the threshold and the
+        freeze that follows it are one critical section, so no other writer can
+        slip a record into the table between the two, and no writer is left
+        holding the old table after the swap, since a writer reads
+        ``self._memtable`` afresh under the lock every time.
+
+        The last three steps below are ordered for the benefit of :meth:`get`,
+        which takes no lock: freeze, then publish the frozen tuple, then swap the
+        active table. This module's docstring works through why the reverse
+        order would let a reader miss a record that was never lost.
+
+        A threshold met exactly counts as full, matching the story's "meets or
+        exceeds". Records are not split across tables, so the size lands on the
+        threshold only by coincidence, and treating that coincidence as "not yet"
+        would be a rule with no reason behind it.
+        """
+        if self._memtable.nbytes < self._memtable_threshold_bytes:
+            return
+
+        full = self._memtable
+        full.freeze()
+        self._frozen_memtables = (full, *self._frozen_memtables)
+        self._memtable = Memtable()
 
     def _check_open(self) -> None:
         """Raise if the engine has been closed.
