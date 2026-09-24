@@ -61,6 +61,7 @@ from ledgerlog import LedgerLog
 from ledgerlog import engine as engine_module
 from ledgerlog import wal as wal_module
 from ledgerlog.engine import WAL_FILENAME
+from ledgerlog.memtable import Memtable, MemtableFrozenError
 from ledgerlog.wal import (
     FILE_HEADER_SIZE,
     RECORD_HEADER_SIZE,
@@ -1361,3 +1362,505 @@ def test_a_killed_process_leaves_a_log_a_restarted_engine_can_keep_using(
         assert final.get(b"beta") == b"two"
         assert final.get(b"gamma") == b"three"
         assert final.get(b"epsilon") == b"five"
+
+
+# ---------------------------------------------------------------------------
+# Story M6.1: freeze the active memtable at the size threshold and swap in a
+# fresh one
+#
+# The story is about a boundary, so the tests are about which side of it each
+# record ends up on. Asserting only that ``get`` still answers would pass just as
+# happily with no freeze at all, and asserting only that a frozen table appeared
+# would pass with a swap that dropped the records it was supposed to keep. So
+# each test below pins down a table: which one the record is in, which one the
+# next write goes to, and what is left once a frozen one is dropped.
+#
+# The tests at the end are what the story's atomicity criterion needs, and they
+# come in two kinds because one cannot do the other's job. The threaded ones put
+# real writers and a real reader through dozens of real freezes. The ordering
+# one reaches into the swap instead, because the window a mis-ordered swap opens
+# is two stores wide and a thread scheduled into it by luck is not a test.
+#
+# Two of them read ``engine._memtable``, marked where it happens: the active
+# table has no public accessor, on purpose (handing it out would invite a write
+# that bypassed the log), and "which table is this record in" is the whole
+# question here.
+# ---------------------------------------------------------------------------
+
+SMALL_KEY = b"key"
+"""Key used where a test needs to know a record's exact byte cost."""
+
+
+def record_bytes(key: bytes, value: bytes | None) -> int:
+    """Payload cost of one record, as ``Memtable.nbytes`` counts it."""
+    return len(key) + (0 if value is None else len(value))
+
+
+def keys_in(memtable: Memtable) -> list[bytes]:
+    """Every key a memtable holds, tombstoned keys included."""
+    return list(memtable.keys())
+
+
+def fill_until_frozen(engine: LedgerLog, prefix: bytes = b"fill") -> list[bytes]:
+    """Write records until the engine freezes exactly once, and return their keys.
+
+    Returns as soon as one more frozen table appears than there was to start
+    with, so a caller can be sure the keys it got back are the ones in that
+    table and that nothing has been written to the new active one yet. Counted
+    rather than tested for emptiness, so that a second call on the same engine
+    waits for a second freeze instead of returning immediately.
+    """
+    before = len(engine.frozen_memtables)
+    written: list[bytes] = []
+    for index in range(10_000):
+        key = prefix + f"{index:04d}".encode()
+        engine.put(key, b"value")
+        written.append(key)
+        if len(engine.frozen_memtables) > before:
+            return written
+    raise AssertionError("the engine never froze its memtable")
+
+
+def test_a_fresh_engine_holds_no_frozen_memtables(engine: LedgerLog) -> None:
+    assert engine.frozen_memtables == ()
+    assert engine.memtable_nbytes == 0
+
+
+def test_the_threshold_defaults_to_four_mebibytes(engine: LedgerLog) -> None:
+    assert engine.memtable_threshold_bytes == 4 * 1024 * 1024
+    assert engine.memtable_threshold_bytes == engine_module.DEFAULT_MEMTABLE_THRESHOLD_BYTES
+
+
+def test_the_configured_threshold_is_reported(tmp_path: Path) -> None:
+    with LedgerLog(tmp_path / "data", memtable_threshold_bytes=64) as engine:
+        assert engine.memtable_threshold_bytes == 64
+
+
+@pytest.mark.parametrize("threshold", [0, -1])
+def test_a_threshold_below_one_byte_is_rejected(tmp_path: Path, threshold: int) -> None:
+    """Zero would be met by an empty table, so every single write would freeze one."""
+    with pytest.raises(ValueError, match="memtable_threshold_bytes"):
+        LedgerLog(tmp_path / "data", memtable_threshold_bytes=threshold)
+
+
+def test_the_active_memtable_tracks_the_bytes_written_to_it(tmp_path: Path) -> None:
+    with LedgerLog(tmp_path / "data", fsync_policy=FsyncPolicy.NEVER) as engine:
+        engine.put(SMALL_KEY, b"value")
+
+        assert engine.memtable_nbytes == record_bytes(SMALL_KEY, b"value")
+
+
+def test_staying_under_the_threshold_freezes_nothing(tmp_path: Path) -> None:
+    """The other half of the boundary: one byte short is not full."""
+    cost = record_bytes(SMALL_KEY, b"value")
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=cost + 1
+    ) as engine:
+        engine.put(SMALL_KEY, b"value")
+
+        assert engine.frozen_memtables == ()
+        assert engine.memtable_nbytes == cost
+
+
+def test_meeting_the_threshold_exactly_freezes_the_memtable(tmp_path: Path) -> None:
+    """Criterion 1, at the exact boundary the story words as "meets or exceeds"."""
+    cost = record_bytes(SMALL_KEY, b"value")
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=cost
+    ) as engine:
+        engine.put(SMALL_KEY, b"value")
+
+        assert len(engine.frozen_memtables) == 1
+        assert engine.frozen_memtables[0].is_frozen is True
+        assert keys_in(engine.frozen_memtables[0]) == [SMALL_KEY]
+        assert engine.memtable_nbytes == 0, "the active memtable is not a fresh empty one"
+
+
+def test_a_delete_can_be_the_write_that_fills_the_memtable(tmp_path: Path) -> None:
+    """A tombstone is a record and takes space, so it has to be able to trigger the freeze.
+
+    An engine that only checked the threshold after a put would let a stream of
+    deletes grow the memtable indefinitely.
+    """
+    with LedgerLog(
+        tmp_path / "data",
+        fsync_policy=FsyncPolicy.NEVER,
+        memtable_threshold_bytes=len(SMALL_KEY),
+    ) as engine:
+        engine.delete(SMALL_KEY)
+
+        assert len(engine.frozen_memtables) == 1
+        assert keys_in(engine.frozen_memtables[0]) == [SMALL_KEY]
+
+
+def test_the_write_after_the_swap_goes_to_the_new_active_memtable(tmp_path: Path) -> None:
+    """Criterion 2, checked from both sides: in the new table, not in the frozen one."""
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    ) as engine:
+        fill_until_frozen(engine)
+        frozen = engine.frozen_memtables[0]
+
+        engine.put(b"after", b"the-swap")
+
+        assert frozen.lookup(b"after") is None, "the write landed in the frozen memtable"
+        assert engine.memtable_nbytes == record_bytes(b"after", b"the-swap")
+        assert engine.get(b"after") == b"the-swap"
+
+
+def test_a_frozen_memtable_refuses_any_further_write(tmp_path: Path) -> None:
+    """The guarantee behind criterion 4, stated as what the frozen table itself does."""
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    ) as engine:
+        fill_until_frozen(engine)
+
+        with pytest.raises(MemtableFrozenError):
+            engine.frozen_memtables[0].put(b"smuggled", b"value")
+
+
+def test_every_value_written_before_the_freeze_is_still_readable(tmp_path: Path) -> None:
+    """Criterion 3: the records are still served, they have just moved table."""
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    ) as engine:
+        written = fill_until_frozen(engine)
+        engine.put(b"after", b"the-swap")
+
+        for key in written:
+            assert engine.get(key) == b"value", f"{key!r} stopped being readable at the freeze"
+        assert engine.get(b"after") == b"the-swap"
+
+
+def test_repeated_freezes_stack_up_newest_first(tmp_path: Path) -> None:
+    """The order a read has to consult them in, which the next test then relies on."""
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    ) as engine:
+        first = fill_until_frozen(engine, prefix=b"aaa")
+        second = fill_until_frozen(engine, prefix=b"bbb")
+
+        assert len(engine.frozen_memtables) == 2
+        assert keys_in(engine.frozen_memtables[0]) == sorted(second)
+        assert keys_in(engine.frozen_memtables[1]) == sorted(first)
+        assert all(table.is_frozen for table in engine.frozen_memtables)
+
+
+def test_a_value_rewritten_after_a_freeze_wins_over_the_frozen_one(tmp_path: Path) -> None:
+    """Newest first is not decoration: the older record is still sitting in the frozen table."""
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    ) as engine:
+        written = fill_until_frozen(engine)
+        key = written[0]
+
+        engine.put(key, b"newer")
+
+        assert engine.get(key) == b"newer"
+        assert engine.frozen_memtables[0].get(key) == b"value", (
+            "the frozen snapshot was edited, so it is not a snapshot"
+        )
+
+
+def test_a_tombstone_shadows_a_value_left_in_a_frozen_memtable(tmp_path: Path) -> None:
+    """A delete after a freeze has to stop the read, not let it fall through.
+
+    This is the case that catches a read path which treats "no live value here"
+    as "keep looking": the frozen table still holds the value, so a search that
+    walked past the tombstone would hand back the deleted data.
+    """
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    ) as engine:
+        written = fill_until_frozen(engine)
+        key = written[0]
+
+        engine.delete(key)
+
+        assert engine.get(key) is None
+        assert engine.frozen_memtables[0].get(key) == b"value", (
+            "the value was removed from the frozen table rather than shadowed"
+        )
+
+
+def test_an_empty_value_written_before_a_freeze_is_not_a_deletion(tmp_path: Path) -> None:
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    ) as engine:
+        engine.put(b"empty", b"")
+        fill_until_frozen(engine)
+
+        assert engine.get(b"empty") == b""
+
+
+def test_dropping_a_frozen_memtable_releases_its_records(tmp_path: Path) -> None:
+    """The other half of criterion 3: readable *until* it is dropped."""
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    ) as engine:
+        written = fill_until_frozen(engine)
+        engine.put(b"after", b"the-swap")
+
+        engine.drop_frozen(engine.frozen_memtables[0])
+
+        assert engine.frozen_memtables == ()
+        assert engine.get(written[0]) is None
+        assert engine.get(b"after") == b"the-swap", "the drop took the active memtable with it"
+
+
+def test_dropping_one_frozen_memtable_leaves_the_others(tmp_path: Path) -> None:
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    ) as engine:
+        first = fill_until_frozen(engine, prefix=b"aaa")
+        second = fill_until_frozen(engine, prefix=b"bbb")
+        older = engine.frozen_memtables[1]
+
+        engine.drop_frozen(older)
+
+        assert len(engine.frozen_memtables) == 1
+        assert engine.get(first[0]) is None
+        assert engine.get(second[0]) == b"value"
+
+
+def test_dropping_the_same_frozen_memtable_twice_is_refused(tmp_path: Path) -> None:
+    """A caller that has lost track of which snapshot it flushed should hear about it."""
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    ) as engine:
+        fill_until_frozen(engine)
+        frozen = engine.frozen_memtables[0]
+        engine.drop_frozen(frozen)
+
+        with pytest.raises(ValueError, match="frozen memtables"):
+            engine.drop_frozen(frozen)
+
+
+def test_dropping_a_memtable_the_engine_does_not_hold_is_refused(tmp_path: Path) -> None:
+    with LedgerLog(tmp_path / "data", fsync_policy=FsyncPolicy.NEVER) as engine:
+        with pytest.raises(ValueError, match="frozen memtables"):
+            engine.drop_frozen(Memtable())
+
+
+def test_a_freeze_does_not_change_what_the_log_holds(tmp_path: Path) -> None:
+    """Freezing is a memory-side event. The log is untouched until a flush exists to trim it."""
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    ) as engine:
+        written = fill_until_frozen(engine)
+
+        assert [record.key for record in wal_records(engine)] == written
+
+
+def test_a_restart_replays_every_record_written_across_a_freeze(tmp_path: Path) -> None:
+    """Frozen records are still only in the log, so a restart has to bring them all back."""
+    directory = tmp_path / "data"
+    with LedgerLog(directory, fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40) as first:
+        written = fill_until_frozen(first)
+        first.put(b"after", b"the-swap")
+
+    with LedgerLog(directory, fsync_policy=FsyncPolicy.NEVER) as second:
+        for key in written:
+            assert second.get(key) == b"value"
+        assert second.get(b"after") == b"the-swap"
+
+
+def test_a_replayed_memtable_over_the_threshold_is_frozen_at_startup(tmp_path: Path) -> None:
+    """A recovered table that is already full is full, and should not wait for a write.
+
+    Written with a threshold that never fires and reopened with one that is
+    already exceeded, which is the shape of an operator lowering the setting
+    between runs.
+    """
+    directory = tmp_path / "data"
+    with LedgerLog(directory, fsync_policy=FsyncPolicy.NEVER) as first:
+        for index in range(20):
+            first.put(f"key{index:03d}".encode(), b"value")
+        assert first.frozen_memtables == ()
+
+    with LedgerLog(
+        directory, fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    ) as second:
+        assert len(second.frozen_memtables) == 1, "a full recovered memtable was left active"
+        assert second.memtable_nbytes == 0
+        assert len(keys_in(second.frozen_memtables[0])) == 20
+        assert second.get(b"key000") == b"value"
+
+
+def test_a_replayed_memtable_under_the_threshold_stays_active(tmp_path: Path) -> None:
+    directory = tmp_path / "data"
+    with LedgerLog(directory, fsync_policy=FsyncPolicy.NEVER) as first:
+        first.put(SMALL_KEY, b"value")
+
+    with LedgerLog(directory, fsync_policy=FsyncPolicy.NEVER) as second:
+        assert second.frozen_memtables == ()
+        assert second.memtable_nbytes == record_bytes(SMALL_KEY, b"value")
+
+
+def test_no_write_is_lost_or_duplicated_across_freezes_under_contending_writers(
+    tmp_path: Path,
+) -> None:
+    """Criterion 4 with real threads: many writers, many freezes, every record in one table.
+
+    Each thread writes its own keys, so any key appearing in two tables is a
+    record the swap copied rather than moved, and any key appearing in none is
+    one it dropped. Both are what "none is lost during the swap" rules out, and
+    neither is visible through ``get`` alone, which would keep answering from
+    whichever table still had the key.
+
+    The threshold is small enough that the engine freezes dozens of times during
+    the run, so the swap happens under contention over and over rather than once
+    at a quiet moment.
+    """
+    writers = 8
+    per_writer = 250
+    errors: list[BaseException] = []
+
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=500
+    ) as engine:
+
+        def write(thread_id: int) -> None:
+            try:
+                for step in range(per_writer):
+                    engine.put(f"t{thread_id}-k{step:04d}".encode(), f"v{step}".encode())
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=write, args=(thread_id,), daemon=True)
+            for thread_id in range(writers)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        assert not errors, f"a writer thread raised: {errors[0]!r}"
+        assert all(not thread.is_alive() for thread in threads), "a writer thread did not finish"
+        assert len(engine.frozen_memtables) > 1, "the run never exercised a repeated freeze"
+
+        expected = {
+            f"t{thread_id}-k{step:04d}".encode(): f"v{step}".encode()
+            for thread_id in range(writers)
+            for step in range(per_writer)
+        }
+
+        placed: dict[bytes, int] = {}
+        for table_index, table in enumerate((*engine.frozen_memtables, engine._memtable)):
+            assert table is engine._memtable or table.is_frozen, "a retired table is still writable"
+            for key in keys_in(table):
+                assert key not in placed, (
+                    f"{key!r} is in two memtables, so the swap copied a record"
+                )
+                placed[key] = table_index
+
+        assert set(placed) == set(expected), "the swap lost or invented a record"
+        for key, value in expected.items():
+            assert engine.get(key) == value, f"{key!r} is unreadable after the freezes"
+
+
+def test_the_frozen_table_is_published_before_its_replacement_is_installed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The swap's publication order, pinned where a thread cannot reliably observe it.
+
+    ``get`` takes no lock, so a swap that installed the new active memtable
+    before publishing the frozen one would leave a window in which a record is
+    in neither and a reader sees nothing. The window is two adjacent stores
+    wide, which means a racing reader almost never lands in it: the test below
+    runs one through dozens of real freezes and does not catch a deliberately
+    reversed order. That makes a thread the wrong instrument here, not the order
+    unimportant, since the window is real and a machine will eventually hit it.
+
+    So the order is observed directly instead. The replacement memtable is built
+    by calling the class, which is a moment inside the swap that a test can hook,
+    and by that moment the retired table must already be published. Reversing the
+    two stores fails this immediately and deterministically.
+    """
+    seen: list[tuple[int, bool]] = []
+    engine_holder: list[LedgerLog] = []
+    real_memtable = engine_module.Memtable
+
+    class WatchedMemtable(real_memtable):  # type: ignore[valid-type, misc]
+        def __init__(self, **kwargs: object) -> None:
+            super().__init__(**kwargs)  # type: ignore[arg-type]
+            if engine_holder:
+                frozen = engine_holder[0].frozen_memtables
+                seen.append((len(frozen), engine_holder[0]._memtable in frozen))
+
+    monkeypatch.setattr(engine_module, "Memtable", WatchedMemtable)
+
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    ) as engine:
+        engine_holder.append(engine)
+        fill_until_frozen(engine, prefix=b"aaa")
+        fill_until_frozen(engine, prefix=b"bbb")
+
+    assert len(seen) == 2, "the replacement memtable was not built during each swap"
+    for index, (frozen_count, retired_is_published) in enumerate(seen):
+        assert retired_is_published, (
+            f"swap {index} built the replacement before publishing the table it retired, "
+            f"so a lock-free reader could see the records in neither"
+        )
+        assert frozen_count == index + 1
+
+
+def test_a_reader_never_misses_a_key_while_the_engine_freezes(tmp_path: Path) -> None:
+    """A live reader sees no gap across dozens of real freezes.
+
+    Deliberately not billed as the test that pins the publication order, which
+    is the test above: this one cannot fail reliably for a reversed swap, since
+    the window is too narrow to schedule into. What it does check is the whole
+    read path under real contention, that a key stays continuously readable as
+    its table is retired underneath it, that a reader is never blocked out by a
+    writer holding the write lock, and that nothing in the swap raises.
+
+    The switch interval is shortened so the reader and the writer genuinely
+    interleave rather than taking long uninterrupted turns.
+    """
+    previous_interval = sys.getswitchinterval()
+    sys.setswitchinterval(1e-6)
+    errors: list[BaseException] = []
+    misses = [0]
+
+    try:
+        with LedgerLog(
+            tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=300
+        ) as engine:
+            engine.put(b"anchor", b"anchored")
+            stop = threading.Event()
+
+            def read() -> None:
+                try:
+                    while not stop.is_set():
+                        if engine.get(b"anchor") != b"anchored":
+                            misses[0] += 1
+                except BaseException as error:
+                    errors.append(error)
+
+            def write() -> None:
+                try:
+                    for step in range(4000):
+                        engine.put(f"k{step:05d}".encode(), b"value")
+                except BaseException as error:
+                    errors.append(error)
+                finally:
+                    stop.set()
+
+            threads = [
+                threading.Thread(target=read, daemon=True),
+                threading.Thread(target=write, daemon=True),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=60)
+
+            assert not errors, f"a thread raised: {errors[0]!r}"
+            assert all(not thread.is_alive() for thread in threads), "a thread did not finish"
+            assert len(engine.frozen_memtables) > 5, "the reader did not span many freezes"
+            assert misses[0] == 0, "a reader saw the anchor key vanish during a swap"
+    finally:
+        sys.setswitchinterval(previous_interval)

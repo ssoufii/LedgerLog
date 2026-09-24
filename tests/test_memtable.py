@@ -1889,3 +1889,371 @@ def test_the_module_docstring_documents_the_concurrency_approach() -> None:
         "What the lock-free read side rests on",
     ]:
         assert phrase in documented, f"the strategy section no longer explains {phrase!r}"
+
+
+# ---------------------------------------------------------------------------
+# Story M6.1: size accounting and the one-way freeze
+#
+# The engine decides when to flush by reading Memtable.nbytes, so a wrong count
+# is a flush at the wrong time rather than a visibly wrong answer, and nothing
+# else in the suite would notice. The tests below therefore recount the records
+# independently wherever they can, instead of comparing the total against
+# another expression built the same way the implementation builds it.
+#
+# The freeze tests are about what stops happening. A freeze whose flag was
+# checked outside the lock, or not checked at all, would pass every read-side
+# assertion here, so the ones that matter run a real writer thread against a
+# freeze and pin down exactly which of its writes landed.
+# ---------------------------------------------------------------------------
+
+
+def recount_nbytes(memtable: Memtable) -> int:
+    """Add up the payload bytes a memtable holds, by walking its records.
+
+    Deliberately not the running total the memtable keeps: this walks every
+    record and adds up what is actually there, so comparing the two catches an
+    accounting bug that a drift in the running total would otherwise hide
+    forever.
+    """
+    total = 0
+    for entry in memtable.entries():
+        total += len(entry.key)
+        if entry.value is not None:
+            total += len(entry.value)
+    return total
+
+
+def test_a_fresh_memtable_holds_no_bytes() -> None:
+    assert Memtable().nbytes == 0
+
+
+def test_a_put_counts_its_key_and_its_value() -> None:
+    memtable = Memtable()
+    memtable.put(b"key", b"value")
+
+    assert memtable.nbytes == len(b"key") + len(b"value")
+
+
+def test_a_tombstone_counts_its_key_and_nothing_else() -> None:
+    """A tombstone has no value, so counting one would be counting a byte nobody stored."""
+    memtable = Memtable()
+    memtable.delete(b"key")
+
+    assert memtable.nbytes == len(b"key")
+
+
+def test_the_tag_byte_is_not_counted() -> None:
+    """The in-memory tag is not part of the payload the flush will write.
+
+    Pinned by a put of an empty value, where the tag is the only byte stored
+    under the key: a count that included it would report one byte more than the
+    record holds, and would do so on every record in the table.
+    """
+    memtable = Memtable()
+    memtable.put(b"k", b"")
+
+    assert memtable.nbytes == 1
+
+
+def test_overwriting_a_key_replaces_its_cost_rather_than_adding_to_it() -> None:
+    """The case a growing-only counter gets wrong, and the reason insert reports the old value.
+
+    A key written over and over is one record. A memtable that added each write
+    to the total would freeze on a workload whose contents never grew, making
+    an SSTable out of almost nothing.
+    """
+    memtable = Memtable()
+    memtable.put(b"key", b"first-value")
+    memtable.put(b"key", b"second")
+
+    assert memtable.nbytes == len(b"key") + len(b"second")
+    assert memtable.nbytes == recount_nbytes(memtable)
+
+
+def test_deleting_a_key_that_held_a_value_gives_back_the_value_bytes() -> None:
+    memtable = Memtable()
+    memtable.put(b"key", b"a-fairly-long-value")
+    memtable.delete(b"key")
+
+    assert memtable.nbytes == len(b"key")
+    assert memtable.nbytes == recount_nbytes(memtable)
+
+
+def test_a_put_over_a_tombstone_counts_the_value_again() -> None:
+    memtable = Memtable()
+    memtable.delete(b"key")
+    memtable.put(b"key", b"back-again")
+
+    assert memtable.nbytes == len(b"key") + len(b"back-again")
+    assert memtable.nbytes == recount_nbytes(memtable)
+
+
+def test_a_repeated_delete_does_not_change_the_total() -> None:
+    memtable = Memtable()
+    memtable.delete(b"key")
+    before = memtable.nbytes
+    memtable.delete(b"key")
+
+    assert memtable.nbytes == before
+
+
+@given(
+    operations=st.lists(
+        st.tuples(
+            st.sampled_from(["put", "delete"]),
+            st.binary(min_size=0, max_size=6),
+            st.binary(min_size=0, max_size=12),
+        ),
+        max_size=120,
+    )
+)
+@settings(max_examples=200, suppress_health_check=[HealthCheck.too_slow])
+def test_the_running_total_always_matches_a_recount(
+    operations: list[tuple[str, bytes, bytes]],
+) -> None:
+    """Any sequence of puts and deletes leaves the total equal to what is there.
+
+    Generated rather than enumerated because the accounting only goes wrong on
+    the transitions between record kinds: put over put, put over tombstone,
+    tombstone over put. Random sequences over a small key space hit all of them
+    together, in orders nobody would think to write down.
+    """
+    memtable = Memtable()
+    for kind, key, value in operations:
+        if kind == "put":
+            memtable.put(key, value)
+        else:
+            memtable.delete(key)
+
+    assert memtable.nbytes == recount_nbytes(memtable)
+
+
+def test_insert_reports_no_previous_value_for_a_new_key() -> None:
+    skiplist = SkipList()
+
+    assert skiplist.insert(b"key", b"value") is None
+
+
+def test_insert_reports_the_value_it_replaced() -> None:
+    skiplist = SkipList()
+    skiplist.insert(b"key", b"first")
+
+    assert skiplist.insert(b"key", b"second") == b"first"
+    assert skiplist.search(b"key") == b"second"
+
+
+def test_a_fresh_memtable_is_not_frozen() -> None:
+    assert Memtable().is_frozen is False
+
+
+def test_freezing_marks_the_memtable_frozen() -> None:
+    memtable = Memtable()
+    memtable.freeze()
+
+    assert memtable.is_frozen is True
+
+
+def test_freezing_twice_is_not_an_error() -> None:
+    """Idempotent, so a caller that cannot cheaply tell whether it already froze is fine."""
+    memtable = Memtable()
+    memtable.freeze()
+    memtable.freeze()
+
+    assert memtable.is_frozen is True
+
+
+def test_a_frozen_memtable_refuses_a_put() -> None:
+    memtable = Memtable()
+    memtable.put(b"before", b"value")
+    memtable.freeze()
+
+    with pytest.raises(memtable_module.MemtableFrozenError):
+        memtable.put(b"after", b"value")
+
+
+def test_a_frozen_memtable_refuses_a_delete() -> None:
+    memtable = Memtable()
+    memtable.freeze()
+
+    with pytest.raises(memtable_module.MemtableFrozenError):
+        memtable.delete(b"key")
+
+
+def test_a_refused_write_changes_nothing_at_all() -> None:
+    """The refusal has to be before the insert, not a check after the damage.
+
+    A tombstone written and then complained about would still shadow the value,
+    and the total would still have moved, so the record count, the value and
+    the byte total are all checked rather than only the exception.
+    """
+    memtable = Memtable()
+    memtable.put(b"key", b"value")
+    memtable.freeze()
+    before = (len(memtable), memtable.nbytes, memtable.get(b"key"))
+
+    with pytest.raises(memtable_module.MemtableFrozenError):
+        memtable.delete(b"key")
+    with pytest.raises(memtable_module.MemtableFrozenError):
+        memtable.put(b"key", b"overwritten")
+    with pytest.raises(memtable_module.MemtableFrozenError):
+        memtable.put(b"new", b"value")
+
+    assert (len(memtable), memtable.nbytes, memtable.get(b"key")) == before
+    assert list(memtable.keys()) == [b"key"]
+
+
+def test_a_frozen_memtable_stays_fully_readable() -> None:
+    """Criterion 3 at this layer: freezing stops writes and nothing else.
+
+    A flush reads the table after it is frozen, and the engine keeps serving
+    reads from it until it is dropped, so every read-side method has to go on
+    working exactly as it did.
+    """
+    memtable = Memtable()
+    memtable.put(b"alpha", b"1")
+    memtable.put(b"beta", b"2")
+    memtable.delete(b"gamma")
+    before_entries = list(memtable.entries())
+    before_nbytes = memtable.nbytes
+
+    memtable.freeze()
+
+    assert memtable.get(b"alpha") == b"1"
+    assert memtable.get(b"gamma") is None
+    assert memtable.lookup(b"gamma") == MemtableEntry(key=b"gamma", value=None)
+    assert memtable.lookup(b"missing") is None
+    assert list(memtable.keys()) == [b"alpha", b"beta", b"gamma"]
+    assert list(memtable.entries()) == before_entries
+    assert len(memtable) == 3
+    assert memtable.nbytes == before_nbytes
+
+
+def test_freezing_one_memtable_leaves_another_writable() -> None:
+    """The flag is per instance, which is what makes the engine's swap possible."""
+    frozen = Memtable()
+    active = Memtable()
+    frozen.freeze()
+
+    active.put(b"key", b"value")
+
+    assert active.get(b"key") == b"value"
+    assert active.is_frozen is False
+
+
+def test_no_write_lands_in_a_memtable_after_it_is_frozen() -> None:
+    """Criterion 4 at this layer, with a real writer thread and a real freeze.
+
+    The freeze happens while a writer is mid-run, so it lands somewhere inside
+    the writer's loop rather than between two tidy calls. What is then checked
+    is the boundary itself: every key the writer was told it had written is in
+    the table, the key it was refused is not, and nothing after that point got
+    in either. A freeze that set its flag outside the lock could let the write
+    that was already past the check land afterwards, which would show up here as
+    a refused key that is nonetheless present.
+
+    The byte total is recounted for the same reason: a write applied to the skip
+    list while the freeze was running, with its accounting skipped or doubled,
+    would leave the two disagreeing.
+    """
+    memtable = Memtable()
+    written: list[bytes] = []
+    refused: list[bytes] = []
+    writer_started = threading.Event()
+
+    def write() -> None:
+        for index in range(20_000):
+            key = f"key{index:06d}".encode()
+            try:
+                memtable.put(key, b"value")
+            except memtable_module.MemtableFrozenError:
+                refused.append(key)
+                break
+            written.append(key)
+            writer_started.set()
+
+    def freeze_midway() -> None:
+        assert writer_started.wait(EVENT_WAIT_TIMEOUT), "the writer never started"
+        memtable.freeze()
+
+    with forced_thread_interleaving():
+        run_in_threads([write, freeze_midway])
+
+    assert refused, "the writer finished its whole run before the freeze landed"
+    assert written, "the freeze landed before the writer wrote anything"
+
+    for key in written:
+        assert memtable.get(key) == b"value", f"acknowledged write {key!r} is missing"
+    for key in refused:
+        assert memtable.lookup(key) is None, f"refused write {key!r} landed anyway"
+
+    assert len(memtable) == len(written), "the table holds records the writer never wrote"
+    assert memtable.nbytes == recount_nbytes(memtable)
+
+    # Every attempt after the first refusal is refused too: freezing is one way.
+    with pytest.raises(memtable_module.MemtableFrozenError):
+        memtable.put(b"later", b"value")
+
+
+def test_the_byte_total_survives_concurrent_writers() -> None:
+    """Two writers, one total: the running count agrees with the contents afterwards.
+
+    ``self._nbytes += ...`` is a load, an add and a store, so two writers doing
+    it unguarded can lose updates to each other, which is why it is inside the
+    mutation lock. What this test can honestly claim is narrower than that
+    reasoning: on a GIL build the unguarded version was run against this test
+    and passed, because the interpreter almost never switches threads between
+    those three steps. The lock is therefore argued from the free-threaded build
+    (see ``memtable.py``), where nothing makes them indivisible, and this test is
+    the invariant check that holds on any build: after real concurrent writers,
+    the total equals a recount of what is actually stored.
+
+    The keys are interleaved rather than split into ranges so the two threads are
+    genuinely in each other's way, which is also what makes this a real check on
+    the skip list underneath rather than two threads working in separate halves.
+    """
+    memtable = Memtable()
+    keys = [f"key{index:05d}".encode() for index in range(2000)]
+    shuffled = random.Random(24601).sample(keys, len(keys))
+
+    def writer_for(share: list[bytes]) -> Callable[[], None]:
+        def run() -> None:
+            for key in share:
+                memtable.put(key, b"value-" + key)
+
+        return run
+
+    with forced_thread_interleaving():
+        run_in_threads([writer_for(shuffled[0::2]), writer_for(shuffled[1::2])])
+
+    assert len(memtable) == len(keys)
+    assert memtable.nbytes == recount_nbytes(memtable), "concurrent writers lost a size update"
+
+
+def test_readers_keep_working_across_a_freeze() -> None:
+    """A reader running while the table is frozen sees no gap and no error.
+
+    The freeze takes the mutation lock, which readers do not, so a reader must
+    not stall or fail while it happens. This one reads a key written before the
+    freeze, continuously, from before it until after it.
+    """
+    memtable = Memtable()
+    memtable.put(b"anchor", b"anchored")
+    stop = threading.Event()
+    reads: list[bytes | None] = []
+
+    def read() -> None:
+        while not stop.is_set():
+            reads.append(memtable.get(b"anchor"))
+
+    def freeze_then_stop() -> None:
+        memtable.freeze()
+        # Keep reading past the freeze, so the reads span both sides of it.
+        for _ in range(1000):
+            memtable.get(b"anchor")
+        stop.set()
+
+    with forced_thread_interleaving():
+        run_in_threads([read, freeze_then_stop])
+
+    assert reads, "the reader never ran"
+    assert all(value == b"anchored" for value in reads), "a read across the freeze saw a gap"

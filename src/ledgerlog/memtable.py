@@ -1,12 +1,13 @@
 """Memtable: the in-memory sorted structure that holds recent writes.
 
-Scope of this module today (stories M2.1, M2.2 and M2.4): the skip list itself,
-as a plain sorted container with insert, search, delete and in-order iteration,
-the key-value layer above it that turns a delete into a tombstone, and the
-locking that lets many readers run against one writer. Keys are compared as
-bytes, so iteration order is the byte-lexicographic order that SSTables are
-written in later, and a flush can walk this structure front to back without
-re-sorting anything.
+Scope of this module today (stories M2.1, M2.2, M2.4 and M6.1): the skip list
+itself, as a plain sorted container with insert, search, delete and in-order
+iteration, the key-value layer above it that turns a delete into a tombstone,
+the locking that lets many readers run against one writer, and the size
+accounting and one-way freeze that let the engine decide a table is full and
+stop writing to it. Keys are compared as bytes, so iteration order is the
+byte-lexicographic order that SSTables are written in later, and a flush can
+walk this structure front to back without re-sorting anything.
 
 Two classes, in two layers. :class:`SkipList` is a sorted container and nothing
 more: its :meth:`SkipList.delete` unlinks the node, which is the ordinary
@@ -50,9 +51,46 @@ What is deliberately not here yet:
   reason given under "Concurrency strategy" below. The engine never asks it to
   be: a key-value delete is a tombstone insert, so :class:`Memtable` never
   unlinks anything.
-* The size accounting that decides when a memtable is full enough to freeze and
-  flush (story M6.1). :func:`len` counts records here, which is not the byte
-  measure the flush threshold is expressed in.
+* Writing a frozen table out as an SSTable (story M6.2). :meth:`Memtable.freeze`
+  here only stops the writes and leaves the records readable; who reads them,
+  and when the table may be dropped, is the engine's business.
+
+Size accounting and freezing (story M6.1)
+-----------------------------------------
+
+:attr:`Memtable.nbytes` is the measure the engine's flush threshold is expressed
+in, and what it counts is the record payload: the key bytes plus the value bytes
+of every live record, with a tombstone counted as its key alone, since a
+tombstone has no value. :func:`len` still counts records, which is a different
+question and not the one a threshold asks.
+
+Why payload bytes rather than the memtable's actual memory footprint, which is
+what a flush threshold is morally about: the footprint is Python object
+overhead, a node and a pointer list and two ``bytes`` objects per record, and it
+is neither stable across interpreters nor measurable without walking every node.
+The payload total is exact, is O(1) to maintain, and is also very nearly the size
+of the data block the flush will write, so a threshold set in it says something
+true about the file that comes out the other end. The cost of the choice, stated
+so a later reader can price it: real memory use is some multiple of this number,
+several times it for tiny records, so a threshold here bounds the data held and
+not the heap. Tightening that means measuring per-node overhead, which belongs
+with the M10 benchmarks rather than in an accounting routine on the write path.
+
+An overwrite adjusts the count rather than adding to it, which is why
+:meth:`SkipList.insert` reports the value it replaced: a key written a thousand
+times is one record and has to be counted once, and a memtable whose count only
+ever grew would freeze on a workload that was not growing at all.
+
+Freezing is one way and there is no thaw. A frozen table refuses
+:meth:`Memtable.put` and :meth:`Memtable.delete` with
+:class:`MemtableFrozenError` and stays readable exactly as it was. The reason it
+cannot be undone is the flush it exists for: once the engine has started writing
+a table's records into an SSTable, a write that landed in the table afterwards
+would either miss the file (the record is lost, since the WAL position it was
+logged at is one the flush is about to let go) or land in it halfway through
+(two readers of the same table disagree about what it held). Refusing the write
+is what keeps the frozen table the stable snapshot ARCHITECTURE.md section 2
+asks a flush to run against.
 
 Why a skip list rather than a balanced tree: per ARCHITECTURE.md section 2, a
 skip list reaches O(log n) expected search and insert without rebalancing. An
@@ -186,13 +224,15 @@ too rather than things M2.4 quietly dropped:
   that demands it), never disable it, so a cached "no GIL" can only leave this
   module locking reads it no longer needs to, and a cached "GIL" cannot go
   stale.
-* :func:`len` and :attr:`SkipList.level` are approximate while a writer is
-  running: they are read without the lock on every build, so they can be one
-  insert behind. Both are a single load of an ``int`` attribute, which no build
-  can tear into a value nobody stored, so what a caller can see is an older
-  count and never a wrong one. Nothing in the engine branches on them mid-write
-  (the M6.1 flush threshold is checked by the writer, under the lock), so this
-  is a documented limit rather than a problem to fix.
+* :func:`len`, :attr:`Memtable.nbytes` and :attr:`SkipList.level` are
+  approximate while a writer is running: they are read without the lock on every
+  build, so they can be one insert behind. Each is a single load of an ``int``
+  attribute, which no build can tear into a value nobody stored, so what a
+  caller can see is an older count and never a wrong one. Nothing in the engine
+  branches on them mid-write: the flush threshold is checked by the writer
+  itself, holding the engine's write lock, so the value it reads is its own
+  last write and is exact. This is a documented limit rather than a problem to
+  fix.
 """
 
 from __future__ import annotations
@@ -364,8 +404,15 @@ class SkipList:
         with self._read_guard:
             return self._find_node(key) is not None
 
-    def insert(self, key: bytes, value: bytes) -> None:
-        """Store ``value`` under ``key``, replacing any value already there.
+    def insert(self, key: bytes, value: bytes) -> bytes | None:
+        """Store ``value`` under ``key``, and return the value it replaced, if any.
+
+        The return value is ``None`` when the key was absent, and the previous
+        value when it was present, which is the one fact about the insert that a
+        caller cannot cheaply recover afterwards. :class:`Memtable` needs it to
+        keep a running byte total (see this module's docstring): without it, an
+        overwrite would have to be preceded by a search, doubling the cost of
+        every put to answer a question the insert already had in hand.
 
         An existing key is updated in place rather than given a second node.
         A memtable's job is to answer with the newest write for a key, so two
@@ -388,8 +435,9 @@ class SkipList:
 
             existing = predecessors[0].forward[0]
             if existing is not None and existing.key == key:
+                previous = existing.value
                 existing.value = value
-                return
+                return previous
 
             level = self._random_level()
             node = _Node(key, value, level)
@@ -411,6 +459,7 @@ class SkipList:
                 self._level = level
 
             self._size += 1
+            return None
 
     def search(self, key: bytes) -> bytes | None:
         """Return the value stored under ``key``, or ``None`` if it is absent.
@@ -620,6 +669,34 @@ shared enum would make each module's tests depend on the other's format.
 """
 
 
+def _record_nbytes(key: bytes, stored: bytes) -> int:
+    """Payload size of one record: its key plus its value, the tag excluded.
+
+    The tag is one byte on every record, put and tombstone alike, so subtracting
+    it leaves the key plus the value for a put and the key alone for a tombstone,
+    which is the measure this module's docstring defines :attr:`Memtable.nbytes`
+    as. The tag itself is not counted because it does not exist outside this
+    process: the SSTable a flush writes encodes the same distinction its own way,
+    so counting an in-memory implementation detail would make the number say less
+    about the file that comes out.
+    """
+    return len(key) + len(stored) - len(_TAG_PUT)
+
+
+class MemtableFrozenError(RuntimeError):
+    """Raised when a write is attempted on a memtable that has been frozen.
+
+    A distinct type rather than :class:`ValueError` or :class:`TypeError`,
+    because it reports something categorically different from the other
+    rejections on this path. A bad key or an oversized value is the caller's
+    write being wrong; this is the caller's write being aimed at the wrong table,
+    which means a layer above kept a reference across a swap it should have
+    followed. Giving it its own type is what lets that be caught, or asserted on
+    in a test, without also catching the rejections that really are about the
+    write.
+    """
+
+
 @dataclass(frozen=True)
 class MemtableEntry:
     """One record in the memtable: a key with either a value or a tombstone.
@@ -697,12 +774,15 @@ class Memtable:
 
     Carries the same concurrency guarantee as the :class:`SkipList` underneath:
     one writer thread calling :meth:`put` or :meth:`delete` against any number
-    of reader threads, with no synchronization asked of the caller. It adds no
-    lock of its own, and does not need one, because every mutating call it makes
-    is a single :meth:`SkipList.insert` (a key-value delete writes a tombstone
-    rather than unlinking, so the container's writer-only :meth:`SkipList.delete`
-    is never reached from here). Tagging and decoding happen outside the lock on
-    ``bytes`` objects, which nothing mutates once made.
+    of reader threads, with no synchronization asked of the caller. It holds one
+    lock of its own, taken by :meth:`put`, :meth:`delete` and :meth:`freeze` and
+    by nothing else, which exists for the two pieces of state that live at this
+    layer rather than in the container: the running byte total, which is a
+    read-modify-write and so is not something concurrent writers could be left
+    to do unguarded, and the frozen flag, which has to be set with no write
+    half-applied around it or a record could land in a table a flush had already
+    begun reading. Readers take it never. Tagging and decoding happen outside it
+    on ``bytes`` objects, which nothing mutates once made.
     """
 
     def __init__(
@@ -725,6 +805,13 @@ class Memtable:
             rng=rng,
         )
 
+        # Ordered outside the skip list's own lock and never the other way
+        # round: a mutating call here takes this one, then the container's,
+        # which is a single ordering and so has no cycle to deadlock on.
+        self._mutation_lock = threading.Lock()
+        self._nbytes = 0
+        self._frozen = False
+
     def __len__(self) -> int:
         """Number of records held, counting tombstones.
 
@@ -734,6 +821,59 @@ class Memtable:
         would understate how much work a flush has to do.
         """
         return len(self._skiplist)
+
+    @property
+    def nbytes(self) -> int:
+        """Payload bytes currently held: every live record's key plus its value.
+
+        A tombstone contributes its key and nothing more, since it has no value,
+        and an overwritten key contributes once rather than once per write. This
+        is the measure the engine's flush threshold is expressed in, and this
+        module's docstring says what it deliberately does not count.
+        """
+        return self._nbytes
+
+    @property
+    def is_frozen(self) -> bool:
+        """True once :meth:`freeze` has run, after which writes are refused."""
+        return self._frozen
+
+    def freeze(self) -> None:
+        """Mark this memtable read-only, so it can be flushed as a stable snapshot.
+
+        Idempotent, and one way: there is no thaw, for the reason this module's
+        docstring gives. After this returns, :meth:`put` and :meth:`delete` raise
+        :class:`MemtableFrozenError` and every read keeps working unchanged, so a
+        frozen table stays a full participant in the read path until whoever owns
+        it decides it has been written out and drops it.
+
+        Takes the mutation lock, which is what makes the boundary sharp rather
+        than approximate: a concurrent writer is either entirely before the
+        freeze, in which case its record is in the snapshot and its bytes are in
+        the count, or entirely after it, in which case it is refused and nothing
+        was applied. There is no third case where the freeze lands between a
+        write's insert and its accounting.
+        """
+        with self._mutation_lock:
+            self._frozen = True
+
+    def _check_writable(self) -> None:
+        """Raise if this memtable has been frozen. Call while holding the mutation lock."""
+        if self._frozen:
+            raise MemtableFrozenError(
+                "cannot write to a frozen memtable: it is a snapshot being flushed, "
+                "so the write belongs in the active memtable that replaced it"
+            )
+
+    def _record_written(self, key: bytes, record: bytes, previous: bytes | None) -> None:
+        """Fold one applied write into the byte total. Call while holding the mutation lock.
+
+        Takes the replaced record rather than looking it up, so that an overwrite
+        costs the same as a fresh insert. See :meth:`SkipList.insert`.
+        """
+        self._nbytes += _record_nbytes(key, record)
+        if previous is not None:
+            self._nbytes -= _record_nbytes(key, previous)
 
     def __contains__(self, key: object) -> NoReturn:
         """Refuse the membership test, naming the two questions it could mean.
@@ -758,10 +898,17 @@ class Memtable:
         and nothing remembers that it was briefly deleted. It does not need to,
         because the tombstone existed only to shadow older layers, and this
         newer value now shadows them itself.
+
+        Raises :class:`MemtableFrozenError` if this memtable has been frozen,
+        without applying anything.
         """
         _check_key(key)
         _check_value(value)
-        self._skiplist.insert(key, _TAG_PUT + value)
+        record = _TAG_PUT + value
+        with self._mutation_lock:
+            self._check_writable()
+            previous = self._skiplist.insert(key, record)
+            self._record_written(key, record, previous)
 
     def delete(self, key: bytes) -> None:
         """Record that ``key`` was deleted, whether or not it held a value here.
@@ -778,9 +925,15 @@ class Memtable:
         nothing to delete" would be a claim about one layer dressed up as a
         claim about the engine, and answering it honestly needs the whole read
         path (story M7.2).
+
+        Raises :class:`MemtableFrozenError` if this memtable has been frozen,
+        without applying anything.
         """
         _check_key(key)
-        self._skiplist.insert(key, _TAG_DELETE)
+        with self._mutation_lock:
+            self._check_writable()
+            previous = self._skiplist.insert(key, _TAG_DELETE)
+            self._record_written(key, _TAG_DELETE, previous)
 
     def get(self, key: bytes) -> bytes | None:
         """Return the value stored under ``key``, or ``None`` if there is none here.
