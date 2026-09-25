@@ -53,6 +53,7 @@ import threading
 import time
 from collections.abc import Callable, Iterator
 from pathlib import Path
+from typing import NoReturn
 
 import pytest
 
@@ -60,8 +61,18 @@ import ledgerlog
 from ledgerlog import LedgerLog
 from ledgerlog import engine as engine_module
 from ledgerlog import wal as wal_module
-from ledgerlog.engine import WAL_FILENAME
+from ledgerlog.engine import WAL_FILENAME, parse_sstable_sequence, sstable_filename
 from ledgerlog.memtable import Memtable, MemtableFrozenError
+from ledgerlog.sstable import (
+    SSTableLayout,
+    SSTableReader,
+    SSTableStatus,
+    SSTableWriter,
+    inspect_sstable,
+    is_complete_sstable,
+    iter_records,
+    read_footer,
+)
 from ledgerlog.wal import (
     FILE_HEADER_SIZE,
     RECORD_HEADER_SIZE,
@@ -1401,6 +1412,23 @@ def keys_in(memtable: Memtable) -> list[bytes]:
     return list(memtable.keys())
 
 
+def freezing_engine(directory: Path, threshold: int) -> LedgerLog:
+    """Open an engine that freezes at ``threshold`` bytes and flushes nothing on its own.
+
+    Background flushing is off because every test in this section is about the
+    freeze-and-swap and inspects the frozen memtable it produces. A flush would
+    write that table out and drop it from memory on its own thread, at a moment
+    none of these tests control, which would make them race a flush instead of
+    checking a swap. The flush has its own section below, where it is turned on.
+    """
+    return LedgerLog(
+        directory,
+        fsync_policy=FsyncPolicy.NEVER,
+        memtable_threshold_bytes=threshold,
+        flush_in_background=False,
+    )
+
+
 def fill_until_frozen(engine: LedgerLog, prefix: bytes = b"fill") -> list[bytes]:
     """Write records until the engine freezes exactly once, and return their keys.
 
@@ -1465,9 +1493,7 @@ def test_staying_under_the_threshold_freezes_nothing(tmp_path: Path) -> None:
 def test_meeting_the_threshold_exactly_freezes_the_memtable(tmp_path: Path) -> None:
     """Criterion 1, at the exact boundary the story words as "meets or exceeds"."""
     cost = record_bytes(SMALL_KEY, b"value")
-    with LedgerLog(
-        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=cost
-    ) as engine:
+    with freezing_engine(tmp_path / "data", cost) as engine:
         engine.put(SMALL_KEY, b"value")
 
         assert len(engine.frozen_memtables) == 1
@@ -1482,11 +1508,7 @@ def test_a_delete_can_be_the_write_that_fills_the_memtable(tmp_path: Path) -> No
     An engine that only checked the threshold after a put would let a stream of
     deletes grow the memtable indefinitely.
     """
-    with LedgerLog(
-        tmp_path / "data",
-        fsync_policy=FsyncPolicy.NEVER,
-        memtable_threshold_bytes=len(SMALL_KEY),
-    ) as engine:
+    with freezing_engine(tmp_path / "data", len(SMALL_KEY)) as engine:
         engine.delete(SMALL_KEY)
 
         assert len(engine.frozen_memtables) == 1
@@ -1495,9 +1517,7 @@ def test_a_delete_can_be_the_write_that_fills_the_memtable(tmp_path: Path) -> No
 
 def test_the_write_after_the_swap_goes_to_the_new_active_memtable(tmp_path: Path) -> None:
     """Criterion 2, checked from both sides: in the new table, not in the frozen one."""
-    with LedgerLog(
-        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
-    ) as engine:
+    with freezing_engine(tmp_path / "data", 40) as engine:
         fill_until_frozen(engine)
         frozen = engine.frozen_memtables[0]
 
@@ -1510,9 +1530,7 @@ def test_the_write_after_the_swap_goes_to_the_new_active_memtable(tmp_path: Path
 
 def test_a_frozen_memtable_refuses_any_further_write(tmp_path: Path) -> None:
     """The guarantee behind criterion 4, stated as what the frozen table itself does."""
-    with LedgerLog(
-        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
-    ) as engine:
+    with freezing_engine(tmp_path / "data", 40) as engine:
         fill_until_frozen(engine)
 
         with pytest.raises(MemtableFrozenError):
@@ -1521,9 +1539,7 @@ def test_a_frozen_memtable_refuses_any_further_write(tmp_path: Path) -> None:
 
 def test_every_value_written_before_the_freeze_is_still_readable(tmp_path: Path) -> None:
     """Criterion 3: the records are still served, they have just moved table."""
-    with LedgerLog(
-        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
-    ) as engine:
+    with freezing_engine(tmp_path / "data", 40) as engine:
         written = fill_until_frozen(engine)
         engine.put(b"after", b"the-swap")
 
@@ -1534,9 +1550,7 @@ def test_every_value_written_before_the_freeze_is_still_readable(tmp_path: Path)
 
 def test_repeated_freezes_stack_up_newest_first(tmp_path: Path) -> None:
     """The order a read has to consult them in, which the next test then relies on."""
-    with LedgerLog(
-        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
-    ) as engine:
+    with freezing_engine(tmp_path / "data", 40) as engine:
         first = fill_until_frozen(engine, prefix=b"aaa")
         second = fill_until_frozen(engine, prefix=b"bbb")
 
@@ -1548,9 +1562,7 @@ def test_repeated_freezes_stack_up_newest_first(tmp_path: Path) -> None:
 
 def test_a_value_rewritten_after_a_freeze_wins_over_the_frozen_one(tmp_path: Path) -> None:
     """Newest first is not decoration: the older record is still sitting in the frozen table."""
-    with LedgerLog(
-        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
-    ) as engine:
+    with freezing_engine(tmp_path / "data", 40) as engine:
         written = fill_until_frozen(engine)
         key = written[0]
 
@@ -1569,9 +1581,7 @@ def test_a_tombstone_shadows_a_value_left_in_a_frozen_memtable(tmp_path: Path) -
     as "keep looking": the frozen table still holds the value, so a search that
     walked past the tombstone would hand back the deleted data.
     """
-    with LedgerLog(
-        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
-    ) as engine:
+    with freezing_engine(tmp_path / "data", 40) as engine:
         written = fill_until_frozen(engine)
         key = written[0]
 
@@ -1584,9 +1594,7 @@ def test_a_tombstone_shadows_a_value_left_in_a_frozen_memtable(tmp_path: Path) -
 
 
 def test_an_empty_value_written_before_a_freeze_is_not_a_deletion(tmp_path: Path) -> None:
-    with LedgerLog(
-        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
-    ) as engine:
+    with freezing_engine(tmp_path / "data", 40) as engine:
         engine.put(b"empty", b"")
         fill_until_frozen(engine)
 
@@ -1595,9 +1603,7 @@ def test_an_empty_value_written_before_a_freeze_is_not_a_deletion(tmp_path: Path
 
 def test_dropping_a_frozen_memtable_releases_its_records(tmp_path: Path) -> None:
     """The other half of criterion 3: readable *until* it is dropped."""
-    with LedgerLog(
-        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
-    ) as engine:
+    with freezing_engine(tmp_path / "data", 40) as engine:
         written = fill_until_frozen(engine)
         engine.put(b"after", b"the-swap")
 
@@ -1609,9 +1615,7 @@ def test_dropping_a_frozen_memtable_releases_its_records(tmp_path: Path) -> None
 
 
 def test_dropping_one_frozen_memtable_leaves_the_others(tmp_path: Path) -> None:
-    with LedgerLog(
-        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
-    ) as engine:
+    with freezing_engine(tmp_path / "data", 40) as engine:
         first = fill_until_frozen(engine, prefix=b"aaa")
         second = fill_until_frozen(engine, prefix=b"bbb")
         older = engine.frozen_memtables[1]
@@ -1625,9 +1629,7 @@ def test_dropping_one_frozen_memtable_leaves_the_others(tmp_path: Path) -> None:
 
 def test_dropping_the_same_frozen_memtable_twice_is_refused(tmp_path: Path) -> None:
     """A caller that has lost track of which snapshot it flushed should hear about it."""
-    with LedgerLog(
-        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
-    ) as engine:
+    with freezing_engine(tmp_path / "data", 40) as engine:
         fill_until_frozen(engine)
         frozen = engine.frozen_memtables[0]
         engine.drop_frozen(frozen)
@@ -1644,9 +1646,7 @@ def test_dropping_a_memtable_the_engine_does_not_hold_is_refused(tmp_path: Path)
 
 def test_a_freeze_does_not_change_what_the_log_holds(tmp_path: Path) -> None:
     """Freezing is a memory-side event. The log is untouched until a flush exists to trim it."""
-    with LedgerLog(
-        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
-    ) as engine:
+    with freezing_engine(tmp_path / "data", 40) as engine:
         written = fill_until_frozen(engine)
 
         assert [record.key for record in wal_records(engine)] == written
@@ -1655,7 +1655,7 @@ def test_a_freeze_does_not_change_what_the_log_holds(tmp_path: Path) -> None:
 def test_a_restart_replays_every_record_written_across_a_freeze(tmp_path: Path) -> None:
     """Frozen records are still only in the log, so a restart has to bring them all back."""
     directory = tmp_path / "data"
-    with LedgerLog(directory, fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40) as first:
+    with freezing_engine(directory, 40) as first:
         written = fill_until_frozen(first)
         first.put(b"after", b"the-swap")
 
@@ -1678,9 +1678,7 @@ def test_a_replayed_memtable_over_the_threshold_is_frozen_at_startup(tmp_path: P
             first.put(f"key{index:03d}".encode(), b"value")
         assert first.frozen_memtables == ()
 
-    with LedgerLog(
-        directory, fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
-    ) as second:
+    with freezing_engine(directory, 40) as second:
         assert len(second.frozen_memtables) == 1, "a full recovered memtable was left active"
         assert second.memtable_nbytes == 0
         assert len(keys_in(second.frozen_memtables[0])) == 20
@@ -1716,9 +1714,7 @@ def test_no_write_is_lost_or_duplicated_across_freezes_under_contending_writers(
     per_writer = 250
     errors: list[BaseException] = []
 
-    with LedgerLog(
-        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=500
-    ) as engine:
+    with freezing_engine(tmp_path / "data", 500) as engine:
 
         def write(thread_id: int) -> None:
             try:
@@ -1791,9 +1787,7 @@ def test_the_frozen_table_is_published_before_its_replacement_is_installed(
 
     monkeypatch.setattr(engine_module, "Memtable", WatchedMemtable)
 
-    with LedgerLog(
-        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
-    ) as engine:
+    with freezing_engine(tmp_path / "data", 40) as engine:
         engine_holder.append(engine)
         fill_until_frozen(engine, prefix=b"aaa")
         fill_until_frozen(engine, prefix=b"bbb")
@@ -1826,9 +1820,7 @@ def test_a_reader_never_misses_a_key_while_the_engine_freezes(tmp_path: Path) ->
     misses = [0]
 
     try:
-        with LedgerLog(
-            tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=300
-        ) as engine:
+        with freezing_engine(tmp_path / "data", 300) as engine:
             engine.put(b"anchor", b"anchored")
             stop = threading.Event()
 
@@ -1864,3 +1856,524 @@ def test_a_reader_never_misses_a_key_while_the_engine_freezes(tmp_path: Path) ->
             assert misses[0] == 0, "a reader saw the anchor key vanish during a swap"
     finally:
         sys.setswitchinterval(previous_interval)
+
+
+# ---------------------------------------------------------------------------
+# Story M6.2: flush a frozen memtable to an SSTable without blocking writes.
+#
+# The story has two claims that pull in different directions, so the tests come
+# in two kinds. The first kind is about the table: a flush has to produce a
+# complete SSTable holding exactly the frozen memtable's records, tombstones
+# included, and it must not release the memtable until that table's footer is on
+# disk. Those run with the background thread turned off, because what they check
+# is the content and the ordering of one flush, and a thread that picks its own
+# moment would only make them harder to read.
+#
+# The second kind is about the thread, and per CLAUDE.md these are the tests the
+# concurrency claims need rather than a docstring. One pins "a write does not wait
+# for a flush" by holding a real flush open inside the SSTable write and issuing a
+# put while it is stuck there: if the write path waited on the flush, that put
+# could not return. The other runs sustained writes from several threads through
+# dozens of real freezes and flushes, then accounts for every key exactly once
+# across the tables on disk and the memtables in memory, which is what "no writes
+# lost and no writes duplicated" means and is not something ``get`` can answer,
+# since ``get`` would keep answering from whichever copy it found first.
+#
+# Two tests reach for ``engine._memtable`` and one for ``engine._flusher``, marked
+# where it happens, for the same reason the section above does: the active table
+# has no public accessor and "which layer is this record in" is the whole question.
+# ---------------------------------------------------------------------------
+
+
+def sstable_paths(engine: LedgerLog) -> list[Path]:
+    """Every SSTable in an engine's directory, oldest first.
+
+    Sorted by name, which is sorted by age: the sequence number is zero padded to
+    a fixed width precisely so that the two orders agree.
+    """
+    return sorted(
+        path for path in engine.directory.iterdir() if parse_sstable_sequence(path.name) is not None
+    )
+
+
+def sstable_records(path: Path) -> list[tuple[bytes, bytes | None]]:
+    """Every record in a finished SSTable, in data block order.
+
+    Reads the footer first, as any reader must, so a table this returns records
+    for is one whose footer landed whole and whose sections fit inside it. A value
+    of ``None`` is a tombstone.
+    """
+    with open(path, "rb") as handle:
+        footer = read_footer(handle)
+        return [
+            (record.key, record.value)
+            for record in iter_records(
+                handle,
+                start_offset=footer.data_block_offset,
+                end_offset=footer.data_block_end,
+            )
+        ]
+
+
+def memtable_records(memtable: Memtable) -> list[tuple[bytes, bytes | None]]:
+    """Every record a memtable holds, in the ascending key order a flush reads it in."""
+    return [(entry.key, entry.value) for entry in memtable.entries()]
+
+
+def wait_until(predicate: Callable[[], bool], timeout: float = 30.0) -> bool:
+    """Poll ``predicate`` until it is true, and report whether it became true.
+
+    For the two things a background flush does that no condition variable here
+    reports: an error being recorded, and a flush having started. The generous
+    timeout is a ceiling on a hang, not an expected wait; every use of it passes
+    in well under a second on a working engine.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
+
+
+class _TornFlushEngine(LedgerLog):
+    """Engine whose flush writes every record and then dies before the footer.
+
+    The shape of a flush interrupted by a full disk, and the case criterion 4
+    turns on: the records are all written, and because the footer never lands the
+    table was never committed, so the frozen memtable must survive.
+    """
+
+    def _write_sstable(self, memtable: Memtable, path: Path) -> NoReturn:
+        writer = SSTableWriter(path, expected_keys=len(memtable))
+        try:
+            for entry in memtable.entries():
+                writer.add(entry.key, entry.value)
+            raise OSError("the disk filled up before the footer")
+        finally:
+            writer.discard()
+
+
+class _BlockingFlushEngine(LedgerLog):
+    """Engine whose flush stops inside the SSTable write until it is released.
+
+    The events are built before the engine is, because opening one can start the
+    flush thread immediately: replay may already have left a table frozen, and a
+    thread that reached ``_write_sstable`` before these existed would fail on an
+    attribute rather than block on an event.
+    """
+
+    def __init__(self, *args: object, **kwargs: object) -> None:
+        self.flush_started = threading.Event()
+        self.release_flush = threading.Event()
+        self.flush_finished = threading.Event()
+        super().__init__(*args, **kwargs)  # type: ignore[arg-type]
+
+    def _write_sstable(self, memtable: Memtable, path: Path) -> SSTableLayout:
+        self.flush_started.set()
+        if not self.release_flush.wait(timeout=60):
+            raise AssertionError("the test never released the flush")
+        layout = super()._write_sstable(memtable, path)
+        self.flush_finished.set()
+        return layout
+
+
+def test_an_sstable_name_carries_a_fixed_width_sequence_number() -> None:
+    assert sstable_filename(0) == "sstable-0000000000.sst"
+    assert sstable_filename(42) == "sstable-0000000042.sst"
+    assert parse_sstable_sequence(sstable_filename(42)) == 42
+    assert sstable_filename(9) < sstable_filename(10), "the padding does not sort by age"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        WAL_FILENAME,
+        ".sstable-0000000000.sst.tmp",
+        "sstable-0.sst",
+        "sstable-0000000000.dat",
+        "sstable-00000000000.sst",
+        "sstable-000000000٣.sst",
+    ],
+)
+def test_a_name_that_is_not_an_sstable_has_no_sequence_number(name: str) -> None:
+    """Including the two a data directory really holds: the log, and a flush in progress.
+
+    The last case is a non-ASCII numeral, which ``str.isdigit`` and ``int`` both
+    accept and which would be given a number its own name does not sort by.
+    """
+    assert parse_sstable_sequence(name) is None
+
+
+@pytest.mark.parametrize("sequence", [-1, 10**10])
+def test_a_sequence_number_that_does_not_fit_the_name_is_refused(sequence: int) -> None:
+    with pytest.raises(ValueError, match="sequence number"):
+        sstable_filename(sequence)
+
+
+def test_a_flush_writes_the_frozen_memtable_out_as_a_complete_sstable(tmp_path: Path) -> None:
+    """Criterion 1: exactly the frozen table's contents, in a table a reader accepts."""
+    with freezing_engine(tmp_path / "data", 40) as engine:
+        written = fill_until_frozen(engine)
+        expected = memtable_records(engine.frozen_memtables[0])
+
+        layouts = engine.flush_pending()
+
+        assert len(layouts) == 1
+        table = layouts[0].path
+        assert inspect_sstable(table).status is SSTableStatus.VALID
+        assert sstable_records(table) == expected
+        assert [key for key, _ in expected] == sorted(written)
+        assert layouts[0].record_count == len(written)
+
+
+def test_a_flushed_table_carries_a_tombstone_for_a_key_deleted_before_the_freeze(
+    tmp_path: Path,
+) -> None:
+    """Criterion 1's "including tombstones", which a flush that only wrote values would drop.
+
+    A dropped tombstone is not a missing record, it is a resurrected value: the
+    delete would stop shadowing whatever an older table still holds for the key.
+    """
+    with freezing_engine(tmp_path / "data", 200) as engine:
+        engine.put(b"kept", b"value")
+        engine.put(b"doomed", b"value")
+        engine.delete(b"doomed")
+        fill_until_frozen(engine, prefix=b"pad")
+
+        layout = engine.flush_frozen()
+
+        assert layout is not None
+        records = dict(sstable_records(layout.path))
+        assert records[b"doomed"] is None, "the tombstone was dropped or written as a value"
+        assert records[b"kept"] == b"value"
+
+
+def test_every_key_in_a_flushed_table_can_be_read_back_out_of_it(tmp_path: Path) -> None:
+    """The table is not merely well framed, it answers lookups for what went into it."""
+    with freezing_engine(tmp_path / "data", 40) as engine:
+        written = fill_until_frozen(engine)
+
+        layout = engine.flush_frozen()
+
+        assert layout is not None
+        with SSTableReader.open(layout.path) as reader:
+            for key in written:
+                record = reader.lookup(key)
+                assert record is not None, f"{key!r} did not survive the flush"
+                assert record.value == b"value"
+            assert reader.lookup(b"never-written") is None
+
+
+def test_flushing_an_engine_with_nothing_frozen_writes_no_table(tmp_path: Path) -> None:
+    with freezing_engine(tmp_path / "data", 10_000) as engine:
+        engine.put(b"under", b"the-threshold")
+
+        assert engine.flush_pending() == ()
+        assert engine.flush_frozen() is None
+        assert sstable_paths(engine) == []
+        assert engine.flush_count == 0
+
+
+def test_the_frozen_memtable_is_dropped_once_the_footer_is_written(tmp_path: Path) -> None:
+    """Criterion 4, from the successful side: the table is committed, the memory is released."""
+    with freezing_engine(tmp_path / "data", 40) as engine:
+        fill_until_frozen(engine)
+        frozen = engine.frozen_memtables[0]
+
+        layout = engine.flush_frozen()
+
+        assert layout is not None
+        assert is_complete_sstable(layout.path), "the table was not committed"
+        assert engine.frozen_memtables == ()
+        assert frozen not in engine.frozen_memtables
+        assert engine.flush_count == 1
+        assert engine.flush_error is None
+
+
+def test_a_flush_that_dies_before_the_footer_keeps_the_frozen_memtable(tmp_path: Path) -> None:
+    """Criterion 4 from behind: no footer, no drop.
+
+    An engine that dropped the table when the flush call returned, rather than
+    when the table was committed, loses every record in it: the file at the
+    destination does not exist, since the writer builds tables under a temporary
+    name and renames them, so the records would be nowhere but the log.
+    """
+    with _TornFlushEngine(
+        tmp_path / "data",
+        fsync_policy=FsyncPolicy.NEVER,
+        memtable_threshold_bytes=40,
+        flush_in_background=False,
+    ) as engine:
+        written = fill_until_frozen(engine)
+        frozen = engine.frozen_memtables[0]
+
+        with pytest.raises(OSError, match="before the footer"):
+            engine.flush_frozen()
+
+        assert len(engine.frozen_memtables) == 1, "the table was dropped without being committed"
+        assert engine.frozen_memtables[0] is frozen
+        assert sstable_paths(engine) == [], "an uncommitted table was left at its final name"
+        assert engine.flush_count == 0
+        for key in written:
+            assert engine.get(key) == b"value", f"{key!r} was lost by the failed flush"
+
+
+def test_a_failing_background_flush_records_the_error_and_leaves_the_engine_writable(
+    tmp_path: Path,
+) -> None:
+    """A flush has nowhere to raise, so a failure has to be reported rather than thrown.
+
+    The engine keeps taking writes throughout, which is the point: a write does
+    not depend on a flush having worked, because its record is already in the log.
+    """
+    with _TornFlushEngine(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    ) as engine:
+        for index in range(40):
+            engine.put(f"k{index:03d}".encode(), b"value")
+
+        assert wait_until(lambda: engine.flush_error is not None), "the failure was not reported"
+        assert isinstance(engine.flush_error, OSError)
+        assert engine.frozen_memtables, "a table that was never committed was dropped anyway"
+        assert engine.flush_count == 0
+
+        engine.put(b"after", b"the-failure")
+        assert engine.get(b"after") == b"the-failure"
+
+
+def test_tables_are_flushed_oldest_first_and_named_in_that_order(tmp_path: Path) -> None:
+    """The order the read path needs, decided here: a lower sequence number is older data."""
+    with freezing_engine(tmp_path / "data", 40) as engine:
+        older = fill_until_frozen(engine, prefix=b"aaa")
+        newer = fill_until_frozen(engine, prefix=b"bbb")
+
+        layouts = engine.flush_pending()
+
+        assert [layout.path.name for layout in layouts] == [
+            sstable_filename(0),
+            sstable_filename(1),
+        ]
+        assert [key for key, _ in sstable_records(layouts[0].path)] == sorted(older)
+        assert [key for key, _ in sstable_records(layouts[1].path)] == sorted(newer)
+        assert engine.flush_count == 2
+
+
+def test_a_reopened_engine_does_not_write_over_a_table_an_earlier_run_flushed(
+    tmp_path: Path,
+) -> None:
+    """Sequence numbers are allocated from the directory, not from zero every run."""
+    directory = tmp_path / "data"
+    with freezing_engine(directory, 40) as first:
+        fill_until_frozen(first, prefix=b"aaa")
+        first_layout = first.flush_frozen()
+        assert first_layout is not None
+        first_records = sstable_records(first_layout.path)
+
+    with freezing_engine(directory, 40) as second:
+        second_layout = second.flush_pending()[0]
+
+    assert second_layout.path != first_layout.path
+    first_sequence = parse_sstable_sequence(first_layout.path.name)
+    second_sequence = parse_sstable_sequence(second_layout.path.name)
+    assert first_sequence is not None and second_sequence is not None
+    assert second_sequence > first_sequence
+    assert sstable_records(first_layout.path) == first_records, "the earlier table was overwritten"
+
+
+def test_the_flush_is_left_to_the_caller_when_the_background_thread_is_off(
+    tmp_path: Path,
+) -> None:
+    with freezing_engine(tmp_path / "data", 40) as engine:
+        assert engine.flush_in_background is False
+        fill_until_frozen(engine)
+
+        assert engine.wait_for_flush(timeout=0.2) is False, "something flushed on its own"
+        assert engine.frozen_memtables
+
+        assert len(engine.flush_pending()) == 1
+        assert engine.frozen_memtables == ()
+        assert engine.wait_for_flush(timeout=0.2) is True
+
+
+def test_a_freeze_flushes_in_the_background_without_the_caller_asking(tmp_path: Path) -> None:
+    """The default: memory comes back down on its own, and every table is a valid one."""
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=100
+    ) as engine:
+        assert engine.flush_in_background is True
+        for index in range(200):
+            engine.put(f"k{index:04d}".encode(), b"value")
+
+        assert engine.wait_for_flush(timeout=60), "the background flush never drained"
+
+        assert engine.frozen_memtables == ()
+        assert engine.flush_error is None
+        assert engine.flush_count >= 1
+        tables = sstable_paths(engine)
+        assert len(tables) == engine.flush_count
+        for table in tables:
+            assert inspect_sstable(table).status is SSTableStatus.VALID
+
+
+def test_a_write_does_not_wait_for_a_flush_in_progress(tmp_path: Path) -> None:
+    """Criterion 2, with a real flush held open inside the SSTable write.
+
+    The flush is stopped in the one place it does its I/O and is only released
+    after the put has returned, so the put returning at all is the result: a write
+    path that took a lock the flush holds, or waited on the flush in any other
+    way, does not reach the assertions below, it stops on the put and the test
+    ends on a timeout instead. The frozen table is checked to still be there
+    first, which is what says the flush really is in progress rather than already
+    finished, and the finished flag is checked afterwards to say the put returned
+    while it still was.
+
+    Deliberately not timed. A put is microseconds of work, so any threshold that
+    told a blocked write apart from a fast one would have to be seconds, and by
+    then the interesting cases have already hung rather than been slow.
+    """
+    engine = _BlockingFlushEngine(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=40
+    )
+    try:
+        for index in range(20):
+            engine.put(f"k{index:03d}".encode(), b"value")
+
+        assert engine.flush_started.wait(timeout=60), "the background flush never started"
+        assert engine.frozen_memtables, "the flush dropped its table before writing it"
+
+        engine.put(b"during", b"the-flush")
+
+        assert not engine.flush_finished.is_set(), (
+            "the flush finished before the write returned, so the write did not overlap it"
+        )
+        assert engine.get(b"during") == b"the-flush"
+
+        engine.release_flush.set()
+        assert engine.wait_for_flush(timeout=60)
+        assert engine.flush_error is None
+    finally:
+        engine.release_flush.set()
+        engine.close()
+
+
+def test_no_write_is_lost_or_duplicated_between_the_flushed_tables_and_memory(
+    tmp_path: Path,
+) -> None:
+    """Criterion 3: sustained writes from several threads across dozens of real flushes.
+
+    Every key is written once, so accounting for the keys across the tables on
+    disk and the memtables still in memory is the whole check: a key in two places
+    is a record the flush copied rather than moved, and a key in none is one it
+    dropped. Neither is visible through ``get``, which would go on answering from
+    whichever copy it reached first, and the second one would only surface as a
+    stale value long after compaction merged the two.
+
+    The threshold is small enough that the engine freezes and flushes many times
+    while the writers are running, so the flush happens under contention over and
+    over rather than once at a quiet moment.
+    """
+    writers = 6
+    per_writer = 300
+    errors: list[BaseException] = []
+
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=500
+    ) as engine:
+
+        def write(thread_id: int) -> None:
+            try:
+                for step in range(per_writer):
+                    engine.put(f"t{thread_id}-k{step:04d}".encode(), f"v{step}".encode())
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=write, args=(thread_id,), daemon=True)
+            for thread_id in range(writers)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+
+        assert not errors, f"a writer thread raised: {errors[0]!r}"
+        assert all(not thread.is_alive() for thread in threads), "a writer thread did not finish"
+        assert engine.wait_for_flush(timeout=120), "the background flush never drained"
+        assert engine.flush_error is None
+        assert engine.flush_count > 1, "the run never exercised a repeated flush"
+
+        expected = {
+            f"t{thread_id}-k{step:04d}".encode(): f"v{step}".encode()
+            for thread_id in range(writers)
+            for step in range(per_writer)
+        }
+
+        placed: dict[bytes, bytes | None] = {}
+        for table in sstable_paths(engine):
+            for key, value in sstable_records(table):
+                assert key not in placed, f"{key!r} is in two layers, so the flush copied a record"
+                placed[key] = value
+        # ``engine._memtable`` on purpose: the active table has no public
+        # accessor, and where a record is held is exactly what is being counted.
+        for memtable in (*engine.frozen_memtables, engine._memtable):
+            for key, value in memtable_records(memtable):
+                assert key not in placed, f"{key!r} is in two layers, so the flush copied a record"
+                placed[key] = value
+
+        assert placed == expected, "the flush lost, changed or invented a record"
+
+
+def test_a_flushed_key_is_not_readable_until_the_read_path_reaches_sstables(
+    tmp_path: Path,
+) -> None:
+    """The gap this milestone leaves, pinned so it is a decision rather than a surprise.
+
+    A key whose table has been flushed and dropped reads as ``None`` from this
+    engine, because ``get`` still only looks in memory (milestone 7 is what adds
+    the SSTable read path). What the second half of this test shows is that this is
+    a gap in the read path and not lost data: the log is never trimmed by a flush,
+    so a restart replays every one of those records and the key is readable again.
+
+    Story M7.2 is what makes the first assertion here false, and it should be
+    changed to match rather than deleted.
+    """
+    directory = tmp_path / "data"
+    with LedgerLog(directory, memtable_threshold_bytes=100) as engine:
+        for index in range(50):
+            engine.put(f"k{index:03d}".encode(), b"value")
+        assert engine.wait_for_flush(timeout=60)
+
+        flushed = [key for table in sstable_paths(engine) for key, _ in sstable_records(table)]
+        assert flushed, "nothing was flushed, so this test proves nothing"
+        assert len(wal_records(engine)) == 50, "the flush trimmed the log it still depends on"
+        assert engine.get(flushed[0]) is None
+
+    with LedgerLog(directory, memtable_threshold_bytes=10**9) as reopened:
+        for key in flushed:
+            assert reopened.get(key) == b"value", f"{key!r} did not come back from the log"
+
+
+def test_closing_stops_the_background_flush_thread(tmp_path: Path) -> None:
+    engine = LedgerLog(tmp_path / "data", fsync_policy=FsyncPolicy.NEVER)
+    # ``engine._flusher`` on purpose: whether the thread is gone is not something
+    # the public surface can answer, and a close that left it running would leak
+    # one per engine.
+    flusher = engine._flusher
+    assert flusher is not None
+
+    engine.close()
+
+    assert not flusher.is_alive(), "the flush thread outlived the engine"
+    assert engine._flusher is None
+
+
+def test_flushing_after_close_is_refused(tmp_path: Path) -> None:
+    engine = freezing_engine(tmp_path / "data", 40)
+    fill_until_frozen(engine)
+    engine.close()
+
+    with pytest.raises(ValueError, match="closed"):
+        engine.flush_frozen()
+    with pytest.raises(ValueError, match="closed"):
+        engine.flush_pending()

@@ -1,13 +1,14 @@
 """Engine: the write-ahead log and the memtable wired into one key-value store.
 
-Scope of this module today (stories M3.1, M3.2 and M6.1): the write path,
-startup recovery, and the freeze-and-swap that retires a memtable once it has
-grown past a configured size. A put or a delete is appended to the WAL first and
-applied to the memtable second, a get answers from the memtable and then from any
-frozen memtables behind it, and opening an engine over an existing log replays
-that log into a fresh memtable before the caller can issue anything. Every
-acknowledged write is in the log before any reader can see it, and a restart
-brings every one of them back.
+Scope of this module today (stories M3.1, M3.2, M6.1 and M6.2): the write path,
+startup recovery, the freeze-and-swap that retires a memtable once it has grown
+past a configured size, and the background flush that writes a retired memtable
+out as an SSTable and releases it from memory. A put or a delete is appended to
+the WAL first and applied to the memtable second, a get answers from the memtable
+and then from any frozen memtables behind it, and opening an engine over an
+existing log replays that log into a fresh memtable before the caller can issue
+anything. Every acknowledged write is in the log before any reader can see it,
+and a restart brings every one of them back.
 
 Why the WAL comes first, since this ordering is the only reason the module
 exists: the memtable is memory and the log is disk, so the moment a write
@@ -94,13 +95,60 @@ those loads that lets a reader see neither, which is what "no write is lost
 during the swap" comes to for a reader. Doing it the other way round, swapping
 first and publishing after, opens exactly that window.
 
-Frozen tables are kept newest-first and are never dropped by this module.
-Dropping one is :meth:`LedgerLog.drop_frozen`, which the flush calls once the
-SSTable's footer is on disk (story M6.2), because until that moment the records
-exist only in that table and in the log. So until M6.2 lands, a long-running
-engine accumulates frozen tables rather than releasing memory, which is the
-honest state of a half-built flush path and not an oversight: the alternative,
-dropping a frozen table with nowhere to have written it, is data loss.
+Frozen tables are kept newest-first, and they are released by the flush below and
+by nothing else.
+
+Flushing to disk
+----------------
+
+A frozen memtable is written out as one SSTable, oldest frozen table first, and
+is dropped from memory once that table's footer is on disk. Oldest first because
+the tables on disk have to end up in age order for the read path that reads them
+(ARCHITECTURE.md section 5, story M7.2): a flush that took the newest frozen
+table first would give a younger snapshot a lower sequence number than an older
+one, and every layer above would then have to carry an ordering the filenames
+contradict.
+
+The drop happens after :meth:`~ledgerlog.sstable.SSTableWriter.finish` returns
+and not a moment earlier, because the footer is the commit point
+(ARCHITECTURE.md section 6): before it lands, the file at the destination does
+not exist yet (the writer builds the table under a temporary name and renames it),
+so the only copies of those records are the frozen table and the log. A flush
+that dropped first and wrote second would turn any failure in between into lost
+reads, and a flush that fails partway leaves the frozen table exactly where it
+was, still readable, for the next flush to try again.
+
+By default the flush runs on one background thread, which is what the story asks
+for and what keeps a write off it: a writer freezing a table only sets an event,
+so the cost a caller pays for a flush is one ``Event.set``, whatever the flush
+is doing at the time. The thread takes the flush lock and the write lock but
+never holds either while writing the file, so a put issued during a flush waits
+for neither the bytes nor the fsync. One thread rather than several, because the
+tables have to be produced in the order they were frozen, and two flushers would
+race to name them.
+
+``flush_in_background=False`` turns the thread off and leaves the flush to
+:meth:`LedgerLog.flush_frozen` and :meth:`LedgerLog.flush_pending`, which do the
+same work on the calling thread. That is for a caller that wants to decide when
+the I/O happens (a test asserting on a table that is still frozen, a batch load
+that would rather flush at the end), and the two paths share one implementation
+so the synchronous one is not a second flush with its own rules.
+
+A failing flush does not stop the engine. The frozen table stays, the exception
+is recorded in :attr:`LedgerLog.flush_error`, and the background thread goes back
+to waiting rather than spinning on a table that just failed; the next freeze
+wakes it and it tries again. Writes keep working throughout, because a write does
+not depend on a flush having succeeded: its record is already in the log.
+
+What a flush does not do yet is trim the log or make the table it wrote readable.
+Both belong to later milestones (the read path across SSTables is M7, startup
+discovery is M9.1), and until the first of them lands a key that has been flushed
+and dropped reads as ``None`` from this engine while its record sits in the
+SSTable and in the log. That is a gap in the read path and not lost data: the log
+is never trimmed here, so a restart replays every one of those records and the
+key is readable again. It is called out rather than papered over because the
+alternative, holding every frozen table in memory until M7 arrives, is the
+unbounded growth the flush exists to stop.
 
 Concurrency
 -----------
@@ -131,18 +179,35 @@ One lock guards the whole write path, and reads take nothing.
   across its whole self and the freeze happens inside that same critical
   section, so the record that crossed the threshold is in the table being frozen
   and the next record is in the table that replaced it, with nothing in between.
+* A flush takes a second lock, the flush lock, for as long as it takes to pick a
+  frozen table, write it and drop it. That lock is what makes "one flusher at a
+  time" true rather than hoped for: the background thread and a caller invoking
+  :meth:`LedgerLog.flush_frozen` by hand would otherwise both pick the oldest
+  frozen table, write it to two files under two sequence numbers, and race to
+  drop it, with one of them finding it already gone. No writer and no reader ever
+  takes it, so a flush holding it across a whole file write blocks neither.
+* :meth:`LedgerLog.close` takes a third lock of its own, so that a second thread
+  closing the same engine waits for the first to finish rather than returning as
+  soon as it sees the closed flag.
 
-Lock ordering is fixed and one way, the engine lock then the WAL writer's or the
-memtable's, so there is no cycle for two threads to deadlock around.
+Lock ordering is fixed and one way, the close lock then the flush lock then the
+engine lock then the WAL writer's or the memtable's, so there is no cycle for two
+threads to deadlock around. The one place that has to be deliberate about it is
+:meth:`LedgerLog.close`, which marks the engine closed under the engine lock and
+then releases it before joining the flush thread: joining while holding it would
+wait for a thread whose last act is to take it.
 
 What is deliberately not here yet:
 
-* Writing a frozen memtable out as an SSTable (story M6.2), and everything
-  downstream of it. Freezing retires a memtable from writes but nothing yet
-  moves its records to disk, so memory still grows with the data written, and
-  the log is still replayed in full at startup because nothing yet trims it.
 * Reading from SSTables (milestone 7). Every read is still answered from memory,
-  from the active memtable and then the frozen ones.
+  from the active memtable and then the frozen ones, so a flushed and dropped
+  key is not readable until a restart replays it (see "Flushing to disk" above).
+* Discovering the tables a previous run flushed (story M9.1). A reopened engine
+  reads the existing filenames only to avoid reusing one, and nothing yet opens
+  those files or judges whether they are complete.
+* Trimming the log once the records it holds are on disk. Replay still reads it
+  in full at startup, which is why a flush cannot lose data but does leave the
+  same records in two places.
 """
 
 from __future__ import annotations
@@ -154,6 +219,7 @@ from pathlib import Path
 from types import TracebackType
 
 from ledgerlog.memtable import Memtable, MemtableEntry
+from ledgerlog.sstable import SSTableLayout, write_sstable
 from ledgerlog.wal import (
     DEFAULT_FSYNC_INTERVAL_SECONDS,
     FILE_HEADER_SIZE,
@@ -186,6 +252,65 @@ more memory held (several times this number once Python object overhead is
 counted, per ``memtable.py``) and a longer log to replay after a crash, since
 nothing trims the log until the data it describes is on disk.
 """
+
+SSTABLE_FILENAME_PREFIX = "sstable-"
+"""Fixed start of the name of every SSTable an engine flushes."""
+
+SSTABLE_FILENAME_SUFFIX = ".sst"
+"""Fixed end of the name of every SSTable an engine flushes."""
+
+SSTABLE_SEQUENCE_DIGITS = 10
+"""Width of the zero-padded sequence number inside an SSTable's filename.
+
+Padded to a fixed width, rather than written as the shortest form of the number,
+so that sorting the names as text sorts the tables by age. Startup discovery
+(story M9.1) and any operator listing the directory both see files in whatever
+order the name comparison gives them, and an unpadded ``sstable-10`` sorting
+before ``sstable-9`` would put that order at odds with the order the tables were
+written in, which is the order the read path has to consult them in.
+
+Ten digits, which a flush cannot exhaust: at the default threshold that is more
+tables than four exabytes of flushed data would produce. The name is refused
+rather than widened past it, since an eleven digit name sorts before every ten
+digit one and would break the property the padding exists for.
+"""
+
+
+def sstable_filename(sequence: int) -> str:
+    """Return the name of the SSTable carrying this sequence number."""
+    if sequence < 0:
+        raise ValueError(f"SSTable sequence number must not be negative, got {sequence}")
+    if sequence >= 10**SSTABLE_SEQUENCE_DIGITS:
+        raise ValueError(
+            f"SSTable sequence number {sequence} does not fit in {SSTABLE_SEQUENCE_DIGITS} digits"
+        )
+    return (
+        f"{SSTABLE_FILENAME_PREFIX}{sequence:0{SSTABLE_SEQUENCE_DIGITS}d}{SSTABLE_FILENAME_SUFFIX}"
+    )
+
+
+def parse_sstable_sequence(name: str) -> int | None:
+    """Return the sequence number in an SSTable filename, or ``None`` if it is not one.
+
+    ``None`` rather than an exception, because the caller is sifting a directory
+    that legitimately holds files this function does not name: the log, the
+    temporary file a flush in progress is writing under a leading dot, and
+    whatever an operator has left there. Only a name this module could have
+    produced is given a number.
+
+    The digits are checked for being ASCII as well as for being digits, since
+    :meth:`str.isdigit` is true of numerals from other scripts that ``int`` also
+    accepts, and a file named with those would come back with a sequence number
+    its own name does not sort by.
+    """
+    if not name.startswith(SSTABLE_FILENAME_PREFIX) or not name.endswith(SSTABLE_FILENAME_SUFFIX):
+        return None
+    digits = name[len(SSTABLE_FILENAME_PREFIX) : len(name) - len(SSTABLE_FILENAME_SUFFIX)]
+    if len(digits) != SSTABLE_SEQUENCE_DIGITS:
+        return None
+    if not (digits.isascii() and digits.isdigit()):
+        return None
+    return int(digits)
 
 
 @dataclass(frozen=True)
@@ -235,6 +360,7 @@ class LedgerLog:
         fsync_policy: FsyncPolicy | str = FsyncPolicy.ALWAYS,
         fsync_interval_seconds: float = DEFAULT_FSYNC_INTERVAL_SECONDS,
         memtable_threshold_bytes: int = DEFAULT_MEMTABLE_THRESHOLD_BYTES,
+        flush_in_background: bool = True,
     ) -> None:
         """Open, or create, the engine whose data lives in ``directory``.
 
@@ -261,6 +387,18 @@ class LedgerLog:
         threshold of zero would be met by an empty memtable, so every write would
         freeze the table it had just landed in and the engine would make one
         table per record forever.
+
+        ``flush_in_background`` starts the thread that writes frozen memtables out
+        as SSTables, which is the default because a caller should not have to run
+        a flush loop of their own to keep memory bounded. Turning it off leaves
+        every flush to :meth:`flush_frozen` and :meth:`flush_pending` on the
+        caller's thread, and an engine that neither runs the thread nor calls
+        those accumulates frozen memtables for as long as it stays open.
+
+        The thread is started last, after the log is open, so it cannot find a
+        half-built engine: replay may already have frozen a table, and a flusher
+        running before :attr:`_wal` exists would be a flush racing the
+        constructor that created its work.
         """
         if memtable_threshold_bytes < 1:
             raise ValueError(
@@ -271,16 +409,47 @@ class LedgerLog:
         self._directory.mkdir(parents=True, exist_ok=True)
 
         self._write_lock = threading.Lock()
+        # Shares the write lock rather than carrying one of its own, because what
+        # it reports is a change to the frozen tuple and that tuple is only ever
+        # stored under the write lock. A second lock would mean a window between
+        # the store and the notification for a waiter to miss.
+        self._frozen_changed = threading.Condition(self._write_lock)
         self._closed = False
         self._memtable_threshold_bytes = memtable_threshold_bytes
         self._memtable = Memtable()
         self._frozen_memtables: tuple[Memtable, ...] = ()
+
+        # Ordered above the write lock and taken by nothing else, so a close can
+        # hold it across the whole shutdown, including the join of a thread whose
+        # last act is to take the write lock.
+        self._close_lock = threading.Lock()
+        self._flush_lock = threading.Lock()
+        self._flush_wakeup = threading.Event()
+        self._flush_stopping = False
+        self._flush_count = 0
+        self._flush_error: BaseException | None = None
+        self._next_sstable_sequence = self._next_free_sstable_sequence()
+        self._flush_in_background = flush_in_background
+        self._flusher: threading.Thread | None = None
+
         self._recovery = self._replay_existing_log()
         self._wal = WalWriter(
             self._directory / WAL_FILENAME,
             fsync_policy=fsync_policy,
             fsync_interval_seconds=fsync_interval_seconds,
         )
+        if flush_in_background:
+            # A daemon thread so that a caller who forgets to close an engine
+            # does not leave a process that will not exit. Nothing is lost by it:
+            # a flush killed at interpreter exit leaves its temporary file
+            # behind and its records in the log, which is the same state a crash
+            # mid-flush leaves, and the one recovery already has to handle.
+            self._flusher = threading.Thread(
+                target=self._flush_loop,
+                name=f"ledgerlog-flush-{self._directory.name}",
+                daemon=True,
+            )
+            self._flusher.start()
 
     @property
     def directory(self) -> Path:
@@ -327,6 +496,36 @@ class LedgerLog:
         set with one store that a lock-free reader sees all of or none of.
         """
         return self._frozen_memtables
+
+    @property
+    def flush_in_background(self) -> bool:
+        """True if this engine runs its own thread to flush frozen memtables."""
+        return self._flush_in_background
+
+    @property
+    def flush_count(self) -> int:
+        """Number of SSTables this engine has flushed since it was opened.
+
+        Counted per completed flush rather than per file found in the directory,
+        so it says what this engine has done and not what previous runs left
+        behind. A flush that failed is not counted, since no table was committed.
+        """
+        return self._flush_count
+
+    @property
+    def flush_error(self) -> BaseException | None:
+        """The exception from the most recent failed flush, or ``None``.
+
+        Kept because a background flush has nowhere to raise: the thread that
+        would have received the exception is the engine's own. Reporting it here
+        means a caller watching an engine whose memory is not coming down can find
+        out why, rather than seeing only that frozen tables are accumulating.
+
+        Not cleared by a later success, and not an engine-level failure: a flush
+        that fails has committed nothing and lost nothing, because the records are
+        still in the frozen table and in the log.
+        """
+        return self._flush_error
 
     @property
     def recovery(self) -> RecoveryReport:
@@ -460,12 +659,94 @@ class LedgerLog:
             if len(remaining) == len(self._frozen_memtables):
                 raise ValueError("memtable is not one of this engine's frozen memtables")
             self._frozen_memtables = remaining
+            self._frozen_changed.notify_all()
+
+    def flush_frozen(self) -> SSTableLayout | None:
+        """Write the oldest frozen memtable out as an SSTable, and drop it.
+
+        Returns the layout of the table that was written, or ``None`` if there was
+        no frozen memtable to flush. Oldest first, and the drop only after the
+        footer is on disk: this module's docstring works through why both of those
+        are the order rather than a preference.
+
+        Runs on the calling thread and takes the flush lock for the whole of it,
+        so calling this on an engine whose background thread is running is safe
+        but will wait for a flush already in progress. Writes are not waited on
+        and do not wait: the write lock is taken only to pick the table and to
+        drop it, never while the file is being written.
+
+        Raises whatever the SSTable write raises, and leaves the frozen memtable
+        in place when it does. A caller flushing by hand gets the exception where
+        it can act on it, rather than in :attr:`flush_error` where the background
+        thread has to leave it.
+        """
+        self._check_open()
+        with self._flush_lock:
+            return self._flush_oldest_frozen()
+
+    def flush_pending(self) -> tuple[SSTableLayout, ...]:
+        """Flush every frozen memtable, oldest first, and return the tables written.
+
+        Returns an empty tuple when there was nothing frozen. What counts as
+        "every" is decided as it goes: a table frozen by another thread while this
+        is working is flushed too, and the loop ends the first time it finds
+        nothing frozen, so this returns rather than following a workload that is
+        still writing.
+        """
+        self._check_open()
+        written: list[SSTableLayout] = []
+        while True:
+            with self._flush_lock:
+                layout = self._flush_oldest_frozen()
+            if layout is None:
+                return tuple(written)
+            written.append(layout)
+
+    def wait_for_flush(self, timeout: float | None = None) -> bool:
+        """Block until no frozen memtable is left, and report whether that happened.
+
+        For a caller that wants the background flush to have caught up: after a
+        batch of writes, before measuring memory, or in a test that has to know
+        the table is on disk. ``True`` means nothing is frozen, ``False`` means the
+        timeout expired first.
+
+        Waiting on the condition releases the write lock, so a waiter blocks no
+        writer and no flusher. A flush that keeps failing therefore reads as a
+        timeout rather than as an error raised here, since the frozen table never
+        goes away: :attr:`flush_error` is where the reason is, and raising a
+        previous flush's exception out of a wait would report it to whoever
+        happened to be waiting rather than to whoever asked for the flush.
+        """
+        with self._frozen_changed:
+            return self._frozen_changed.wait_for(lambda: not self._frozen_memtables, timeout)
 
     def close(self) -> None:
         """Close the log and stop accepting operations. Safe to call more than once.
 
-        Takes the write lock, so a close cannot land between a write's log
-        append and its memtable update and leave the two disagreeing.
+        Marking the engine closed takes the write lock, so a close cannot land
+        between a write's log append and its memtable update and leave the two
+        disagreeing. A write already in flight finishes first, because it holds
+        that lock, and a write that arrives afterwards finds the engine closed and
+        is refused before it touches the log.
+
+        The flush thread is then stopped, and the log is closed after it, both
+        outside the write lock. Outside because the flush thread's last act can be to
+        take the write lock (a flush ends by dropping the table it wrote), so
+        joining it while holding that lock would deadlock. Closing the log outside
+        it is safe for the reason above: by that point no write can start. A flush
+        already in progress is allowed to finish rather than abandoned, since it
+        is about to produce a table whose records would otherwise have to be
+        replayed from the log again.
+
+        Frozen memtables that were never flushed are simply released with the
+        engine. Nothing is lost by that: the log is not trimmed, so the next open
+        replays every record they held.
+
+        A second lock serializes closes so that the whole of this runs once, rather
+        than the closed flag alone. Without it, a second thread calling close would
+        see the flag and return while the first was still joining the flusher and
+        fsyncing the log, which would tell it the engine was closed before the log
+        was, and would hide a failing final fsync from it.
 
         The engine is marked closed even if closing the log raises, since the
         handle is gone either way, and the exception is then re-raised rather
@@ -473,13 +754,13 @@ class LedgerLog:
         log may be missing its last records, and a caller told the close
         succeeded would assume a durability the disk never confirmed.
         """
-        with self._write_lock:
-            if self._closed:
-                return
-            try:
-                self._wal.close()
-            finally:
+        with self._close_lock:
+            with self._write_lock:
+                if self._closed:
+                    return
                 self._closed = True
+            self._stop_flusher()
+            self._wal.close()
 
     def __enter__(self) -> LedgerLog:
         return self
@@ -545,7 +826,14 @@ class LedgerLog:
         # per record: replay is not the write path, and freezing every threshold
         # worth of a large log would build a stack of tables at startup that
         # nothing can flush until the engine is open anyway.
-        self._freeze_if_full()
+        #
+        # Under the write lock, although no other thread can reach this engine
+        # yet, because the freeze notifies the condition that lock guards and a
+        # notification without it held is an error rather than a no-op. Taking it
+        # here keeps one rule ("a freeze happens under the write lock") instead of
+        # an exception for the one caller that happens to be alone.
+        with self._write_lock:
+            self._freeze_if_full()
 
         return RecoveryReport(
             records_replayed=len(result.records),
@@ -557,9 +845,9 @@ class LedgerLog:
     def _freeze_if_full(self) -> None:
         """Freeze and replace the active memtable if it has reached the threshold.
 
-        Call holding the write lock, or from the constructor before any other
-        thread can reach this engine. The lock is what story M6.1's atomicity
-        criterion comes down to: the write that crossed the threshold and the
+        Call holding the write lock, which every caller does, the constructor's
+        replay included. The lock is what story M6.1's atomicity criterion comes
+        down to: the write that crossed the threshold and the
         freeze that follows it are one critical section, so no other writer can
         slip a record into the table between the two, and no writer is left
         holding the old table after the swap, since a writer reads
@@ -582,6 +870,141 @@ class LedgerLog:
         full.freeze()
         self._frozen_memtables = (full, *self._frozen_memtables)
         self._memtable = Memtable()
+        self._frozen_changed.notify_all()
+        # One store, and the whole of what a write pays for a flush. The flush
+        # thread does the file, the fsync and the drop; the writer that filled the
+        # table only says that there is now something to do, which is what
+        # "writes are never blocked on flush" comes down to in one line.
+        self._flush_wakeup.set()
+
+    def _next_free_sstable_sequence(self) -> int:
+        """Return the sequence number the next table flushed here should carry.
+
+        One past the highest already in the directory, so a reopened engine cannot
+        write over a table an earlier run flushed. The files are judged by name
+        only: whether each one is a complete table is startup discovery's question
+        (story M9.1), and a damaged or half-written table still owns its name until
+        something deletes it, so counting it here is exactly what keeps the next
+        flush from landing on top of it.
+        """
+        highest = -1
+        for entry in self._directory.iterdir():
+            sequence = parse_sstable_sequence(entry.name)
+            if sequence is not None and sequence > highest:
+                highest = sequence
+        return highest + 1
+
+    def _flush_loop(self) -> None:
+        """Flush frozen memtables as they appear, until the engine is closed.
+
+        Waits on an event rather than polling on a timer, so an idle engine costs
+        nothing and a freeze is acted on immediately. The event is cleared before
+        the tables are drained, not after, so a freeze that happens while this is
+        working sets it again and the next wait returns at once instead of the
+        wakeup being swallowed.
+
+        A failed flush is recorded and then waited out rather than retried on the
+        spot. Retrying immediately would spin on a table that just failed, most
+        likely for a reason that has not changed (a full disk, a directory that is
+        no longer writable), and burn a core for as long as it lasts. The next
+        freeze is the retry.
+        """
+        while True:
+            self._flush_wakeup.wait()
+            self._flush_wakeup.clear()
+            if self._flush_stopping:
+                return
+            try:
+                while not self._flush_stopping:
+                    with self._flush_lock:
+                        if self._flush_oldest_frozen() is None:
+                            break
+            except BaseException as error:
+                # Broad on purpose, and not silent: this is a thread boundary, so
+                # an exception that escaped here would be printed to stderr by the
+                # interpreter and take the flusher down with it, leaving an engine
+                # that quietly stops flushing forever. It is recorded where a
+                # caller can find it instead.
+                self._record_flush_error(error)
+
+    def _flush_oldest_frozen(self) -> SSTableLayout | None:
+        """Flush the oldest frozen memtable and drop it, or return ``None`` if there is none.
+
+        Call holding the flush lock, which is what makes the pick, the write and
+        the drop one unit: two flushers without it would pick the same table and
+        write it twice under two names.
+
+        The sequence number is allocated before the write and is not returned to
+        the pool if the write fails. A retry therefore writes the next number
+        rather than the failed one, which costs nothing (the numbers only have to
+        ascend, not to be contiguous) and avoids reusing a name whose failed
+        attempt may have left a file behind.
+        """
+        frozen = self._frozen_memtables
+        if not frozen:
+            return None
+        # The tuple is newest first, so the oldest frozen table is the last one.
+        memtable = frozen[-1]
+
+        sequence = self._next_sstable_sequence
+        self._next_sstable_sequence = sequence + 1
+        layout = self._write_sstable(memtable, self._directory / sstable_filename(sequence))
+
+        # After the write returns, which is after the footer landed and the file
+        # was renamed into place. Until then this table is the only copy of its
+        # records that is not in the log.
+        self.drop_frozen(memtable)
+        self._flush_count += 1
+        return layout
+
+    def _write_sstable(self, memtable: Memtable, path: Path) -> SSTableLayout:
+        """Write one frozen memtable to ``path`` as a complete SSTable.
+
+        Every record goes in, tombstones included, because a tombstone is this
+        table's answer for its key and dropping it would let an older table's value
+        for that key resurface (ARCHITECTURE.md section 3). Compaction is where
+        tombstones stop being written, and only once no older table can still
+        answer (story M8.3).
+
+        The entries stream straight from the memtable into the writer rather than
+        being collected first: they are already in ascending key order, which is
+        the order the data block needs, and materializing them would double the
+        memory the flush exists to release.
+
+        ``expected_keys`` is the memtable's record count, which lets the writer
+        size the bloom filter up front and hash each key as it passes instead of
+        holding every key until the end. A frozen memtable is one of the few
+        callers that knows this number exactly.
+
+        This is the one place a table is written, and it is a method rather than a
+        call inline above so that the whole flush path can be exercised against a
+        write that blocks or fails.
+        """
+        return write_sstable(
+            path,
+            ((entry.key, entry.value) for entry in memtable.entries()),
+            expected_keys=len(memtable),
+        )
+
+    def _record_flush_error(self, error: BaseException) -> None:
+        """Store a failed flush's exception where a caller can find it."""
+        with self._write_lock:
+            self._flush_error = error
+
+    def _stop_flusher(self) -> None:
+        """Ask the flush thread to stop and wait for it. Call without the write lock.
+
+        Sets the stop flag before the wakeup so the thread cannot wait again after
+        seeing it, and joins without a timeout: the only unbounded thing a flush
+        does is write a table, and a close that returned while a flush was still
+        writing would hand back an engine whose directory is still changing.
+        """
+        self._flush_stopping = True
+        self._flush_wakeup.set()
+        flusher = self._flusher
+        if flusher is not None:
+            flusher.join()
+            self._flusher = None
 
     def _check_open(self) -> None:
         """Raise if the engine has been closed.
