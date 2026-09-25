@@ -60,8 +60,14 @@ import pytest
 import ledgerlog
 from ledgerlog import LedgerLog
 from ledgerlog import engine as engine_module
+from ledgerlog import sstable as sstable_module
 from ledgerlog import wal as wal_module
-from ledgerlog.engine import WAL_FILENAME, parse_sstable_sequence, sstable_filename
+from ledgerlog.engine import (
+    WAL_FILENAME,
+    SSTableHandle,
+    parse_sstable_sequence,
+    sstable_filename,
+)
 from ledgerlog.memtable import Memtable, MemtableFrozenError
 from ledgerlog.sstable import (
     SSTableLayout,
@@ -72,6 +78,7 @@ from ledgerlog.sstable import (
     is_complete_sstable,
     iter_records,
     read_footer,
+    write_sstable,
 )
 from ledgerlog.wal import (
     FILE_HEADER_SIZE,
@@ -2377,3 +2384,413 @@ def test_flushing_after_close_is_refused(tmp_path: Path) -> None:
         engine.flush_frozen()
     with pytest.raises(ValueError, match="closed"):
         engine.flush_pending()
+
+
+# ---------------------------------------------------------------------------
+# Story M7.1: track the tables on disk, newest first.
+#
+# The story is about metadata rather than about bytes, so most of these tests are
+# about order and about identity: which table is at the front of the list, whether
+# the list agrees with the directory, and whether the thing at position 0 really
+# is the table the last flush wrote. The read path that will walk the list is
+# M7.2, so nothing here asks ``get`` about an SSTable.
+#
+# Criterion 3, "without re-parsing the footer on every access", is the one that
+# could pass on inspection while being false, since a handle that reopened the
+# file every time would answer every question correctly and only be slow. It is
+# pinned by counting the footer parses that actually happen: the bloom filter must
+# cost none at all, and any number of reader borrows must cost exactly one.
+#
+# The last two tests use real threads, per CLAUDE.md, for the two concurrency
+# claims the code makes. One is that the list is published as one tuple store, so
+# a lock-free reader never sees it half updated while flushes are prepending to
+# it. The other is that a handle lends its reader exclusively, which matters
+# because a reader is a file cursor: two lookups sharing one unguarded would move
+# each other's position and could answer from the wrong offset.
+#
+# Two tests reach for ``engine._register_sstable`` and one for a handle's
+# ``_reader``, marked where it happens: the ordering invariant and "was a second
+# reader opened" are not questions the public surface can be asked.
+# ---------------------------------------------------------------------------
+
+
+class _FooterParseCounter:
+    """Stand-in for :func:`ledgerlog.sstable.read_footer` that counts its calls.
+
+    Every way of opening a table goes through that function, so counting it counts
+    parses regardless of which object did the opening.
+    """
+
+    def __init__(self, real: Callable[..., object]) -> None:
+        self._real = real
+        self.calls = 0
+
+    def __call__(self, *args: object, **kwargs: object) -> object:
+        self.calls += 1
+        return self._real(*args, **kwargs)
+
+
+def flushed_handles(engine: LedgerLog) -> list[SSTableHandle]:
+    """The engine's tracked tables as a list, newest first."""
+    return list(engine.sstables)
+
+
+def test_a_fresh_engine_tracks_no_sstables(engine: LedgerLog) -> None:
+    assert engine.sstables == ()
+
+
+def test_a_flushed_table_is_added_to_the_front_of_the_list(tmp_path: Path) -> None:
+    """Criterion 1, with one flush: the table the flush wrote is the table at position 0."""
+    with freezing_engine(tmp_path / "data", 40) as engine:
+        written = fill_until_frozen(engine)
+
+        layout = engine.flush_frozen()
+
+        assert layout is not None
+        assert len(engine.sstables) == 1
+        handle = engine.sstables[0]
+        assert handle.path == layout.path
+        assert handle.sequence == parse_sstable_sequence(layout.path.name)
+        assert handle.record_count == len(written)
+        assert handle.footer == layout.footer
+        assert handle.closed is False
+
+
+def test_repeated_flushes_stack_up_newest_first(tmp_path: Path) -> None:
+    """Criteria 1 and 2: three flushes, and the list is the directory read backwards.
+
+    The keys are checked as well as the order, because a list in the right order
+    whose entries pointed at the wrong files would satisfy every assertion about
+    sequence numbers and none of the read path's needs.
+    """
+    with freezing_engine(tmp_path / "data", 40) as engine:
+        oldest = fill_until_frozen(engine, prefix=b"aaa")
+        middle = fill_until_frozen(engine, prefix=b"bbb")
+        newest = fill_until_frozen(engine, prefix=b"ccc")
+
+        engine.flush_pending()
+
+        handles = flushed_handles(engine)
+        assert [handle.sequence for handle in handles] == [2, 1, 0]
+        assert [handle.path for handle in handles] == list(reversed(sstable_paths(engine)))
+        assert [[key for key, _ in sstable_records(handle.path)] for handle in handles] == [
+            sorted(newest),
+            sorted(middle),
+            sorted(oldest),
+        ]
+
+
+def test_a_flush_that_never_committed_a_table_tracks_nothing(tmp_path: Path) -> None:
+    """A table is tracked because its footer landed, not because a flush was attempted.
+
+    Tracking an uncommitted table would put a path in the list that no reader can
+    open, since a writer builds under a temporary name and the destination does
+    not exist until the rename.
+    """
+    with _TornFlushEngine(
+        tmp_path / "data",
+        fsync_policy=FsyncPolicy.NEVER,
+        memtable_threshold_bytes=40,
+        flush_in_background=False,
+    ) as engine:
+        fill_until_frozen(engine)
+
+        with pytest.raises(OSError, match="before the footer"):
+            engine.flush_frozen()
+
+        assert engine.sstables == ()
+
+
+def test_a_background_flush_tracks_every_table_it_writes(tmp_path: Path) -> None:
+    """Criterion 2 with the flush thread doing the work: the list matches the disk."""
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=100
+    ) as engine:
+        for index in range(200):
+            engine.put(f"k{index:04d}".encode(), b"value")
+
+        assert engine.wait_for_flush(timeout=60), "the background flush never drained"
+
+        assert engine.flush_error is None
+        assert engine.flush_count > 1, "the run never exercised a repeated flush"
+        handles = flushed_handles(engine)
+        assert len(handles) == engine.flush_count
+        assert [handle.path for handle in handles] == list(reversed(sstable_paths(engine)))
+        sequences = [handle.sequence for handle in handles]
+        assert sequences == sorted(sequences, reverse=True), "the list is not newest first"
+
+
+def test_a_reopened_engine_tracks_only_the_tables_it_flushed_itself(tmp_path: Path) -> None:
+    """The gap story M9.1 closes, pinned so it is a decision rather than a surprise.
+
+    An earlier run's tables are on disk and are not in this list, because nothing
+    discovers them yet. What the reopened engine does read from the directory is
+    the names, so its own tables do not land on top of one of theirs.
+
+    The reopened engine flushes more than the writes made through it, because
+    replay rebuilds a memtable from the log and freezes it if it is over the
+    threshold. That is the existing recovery behavior; what this test pins is that
+    every table in the list is one this run committed and none of them is the
+    earlier run's.
+    """
+    directory = tmp_path / "data"
+    with freezing_engine(directory, 40) as first:
+        fill_until_frozen(first, prefix=b"aaa")
+        first.flush_pending()
+        earlier = [handle.path for handle in first.sstables]
+        assert earlier
+
+    with freezing_engine(directory, 40) as second:
+        fill_until_frozen(second, prefix=b"bbb")
+        second.flush_pending()
+
+        tracked = [handle.path for handle in second.sstables]
+        assert len(tracked) == second.flush_count
+        assert not set(tracked) & set(earlier), "the run wrote over an earlier table"
+        assert set(earlier) <= set(sstable_paths(second)), "an earlier table left the directory"
+
+
+def test_a_handle_serves_its_bloom_filter_and_reader_without_reparsing_the_footer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Criterion 3, counted rather than asserted in prose.
+
+    A handle that reopened its table per access would answer everything correctly
+    and only be slow, which is why this counts the footer parses instead of the
+    answers. The bloom filter has to cost none: it is the first thing a read
+    consults and the one that decides whether the table is opened at all, so a
+    parse there would be I/O for a table the filter is about to rule out. The
+    reader has to cost one, however many times it is borrowed.
+    """
+    with freezing_engine(tmp_path / "data", 40) as engine:
+        written = fill_until_frozen(engine)
+        engine.flush_pending()
+        handle = engine.sstables[0]
+
+        counter = _FooterParseCounter(sstable_module.read_footer)
+        monkeypatch.setattr(sstable_module, "read_footer", counter)
+
+        for _ in range(5):
+            assert handle.bloom_filter is handle.bloom_filter
+            assert handle.footer is handle.footer
+            assert handle.record_count == len(written)
+        assert counter.calls == 0, "reaching for the cached metadata went back to the file"
+        for key in written:
+            assert handle.bloom_filter.might_contain(key), "the filter lost a key of its own table"
+
+        readers = []
+        for key in written:
+            with handle.borrow_reader() as reader:
+                readers.append(reader)
+                assert reader.lookup(key) is not None
+        assert counter.calls == 1, "the footer was parsed more than once for one handle"
+        assert len({id(reader) for reader in readers}) == 1, "a borrow opened a second reader"
+
+
+def test_a_handle_reads_back_every_record_of_the_table_it_tracks(tmp_path: Path) -> None:
+    """The entry points at the right table, which is what makes the ordering useful."""
+    with freezing_engine(tmp_path / "data", 200) as engine:
+        engine.put(b"kept", b"value")
+        engine.put(b"doomed", b"value")
+        engine.delete(b"doomed")
+        padding = fill_until_frozen(engine, prefix=b"pad")
+
+        engine.flush_pending()
+
+        handle = engine.sstables[0]
+        with handle.borrow_reader() as reader:
+            for key in padding:
+                record = reader.lookup(key)
+                assert record is not None, f"{key!r} is missing from the tracked table"
+                assert record.value == b"value"
+            doomed = reader.lookup(b"doomed")
+            assert doomed is not None and doomed.is_tombstone, "the tombstone is not readable"
+            assert reader.lookup(b"never-written") is None
+
+
+def test_closing_the_engine_closes_the_readers_it_opened(tmp_path: Path) -> None:
+    """A descriptor per flushed table is exactly what a long-lived engine must not leak."""
+    with freezing_engine(tmp_path / "data", 40) as engine:
+        fill_until_frozen(engine, prefix=b"aaa")
+        fill_until_frozen(engine, prefix=b"bbb")
+        engine.flush_pending()
+        handles = flushed_handles(engine)
+        assert len(handles) == 2
+        borrowed = []
+        for handle in handles:
+            with handle.borrow_reader() as reader:
+                borrowed.append(reader)
+
+    assert all(handle.closed for handle in handles)
+    assert all(reader.closed for reader in borrowed)
+    assert engine.sstables == tuple(handles), "closing forgot which tables the engine wrote"
+    for handle in handles:
+        with pytest.raises(ValueError, match="closed"):
+            with handle.borrow_reader():
+                pass
+
+
+def test_closing_an_engine_twice_leaves_its_handles_closed(tmp_path: Path) -> None:
+    engine = freezing_engine(tmp_path / "data", 40)
+    fill_until_frozen(engine)
+    engine.flush_pending()
+    handle = engine.sstables[0]
+
+    engine.close()
+    engine.close()
+
+    assert handle.closed is True
+
+
+def test_a_handle_that_was_never_read_closes_without_opening_the_file(tmp_path: Path) -> None:
+    """The reader is lazy, so a table nothing asked about costs no descriptor."""
+    with freezing_engine(tmp_path / "data", 40) as engine:
+        fill_until_frozen(engine)
+        engine.flush_pending()
+        handle = engine.sstables[0]
+        # ``handle._reader`` on purpose: whether a reader was ever opened is the
+        # whole claim, and a handle that opened one eagerly would look identical
+        # from outside.
+        assert handle._reader is None
+
+    assert handle.closed is True
+
+
+def test_a_table_out_of_sequence_order_is_refused(tmp_path: Path) -> None:
+    """The invariant everything above the list rests on, checked where it is cheap to fix.
+
+    A table prepended out of order would not read as an ordering bug later, it
+    would read as correct data from the wrong table, so the list refuses it.
+
+    ``engine._register_sstable`` on purpose: the ordering rule is internal, and
+    there is no public way to hand the engine a table it did not flush.
+    """
+    with freezing_engine(tmp_path / "data", 40) as engine:
+        fill_until_frozen(engine)
+        engine.flush_pending()
+        newest = engine.sstables[0]
+        layout = write_sstable(engine.directory / sstable_filename(newest.sequence + 5), [])
+
+        with pytest.raises(ValueError, match="newest tracked table"):
+            engine._register_sstable(newest.sequence, layout)
+
+        assert engine.sstables == (newest,)
+        assert engine._register_sstable(newest.sequence + 5, layout).sequence > newest.sequence
+        assert [handle.sequence for handle in engine.sstables] == [
+            newest.sequence + 5,
+            newest.sequence,
+        ]
+
+
+def test_a_handle_refuses_a_negative_sequence_number(tmp_path: Path) -> None:
+    layout = write_sstable(tmp_path / sstable_filename(0), [(b"key", b"value")])
+
+    with pytest.raises(ValueError, match="sequence number"):
+        SSTableHandle(-1, layout)
+
+
+def test_the_table_list_is_never_seen_half_updated_while_flushes_prepend_to_it(
+    tmp_path: Path,
+) -> None:
+    """The publication claim, with a real reader thread against real background flushes.
+
+    The reader takes no lock, so what it must never see is a list that is out of
+    order, holds a table twice, or holds a handle whose file is not there yet. It
+    snapshots the tuple thousands of times while writers drive dozens of freezes
+    and the flush thread prepends to it.
+    """
+    writers = 4
+    per_writer = 400
+    errors: list[BaseException] = []
+    snapshots = [0]
+    stop = threading.Event()
+
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=400
+    ) as engine:
+
+        def write(thread_id: int) -> None:
+            try:
+                for step in range(per_writer):
+                    engine.put(f"t{thread_id}-k{step:04d}".encode(), b"value")
+            except BaseException as error:
+                errors.append(error)
+
+        def watch() -> None:
+            try:
+                while not stop.is_set():
+                    handles = engine.sstables
+                    snapshots[0] += 1
+                    sequences = [handle.sequence for handle in handles]
+                    assert sequences == sorted(sequences, reverse=True), (
+                        f"a reader saw the list out of order: {sequences}"
+                    )
+                    assert len(set(sequences)) == len(sequences), (
+                        f"a reader saw a table tracked twice: {sequences}"
+                    )
+                    for handle in handles:
+                        assert handle.path.exists(), f"{handle.path} is tracked but not on disk"
+            except BaseException as error:
+                errors.append(error)
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        threads = [
+            threading.Thread(target=write, args=(thread_id,), daemon=True)
+            for thread_id in range(writers)
+        ]
+        watcher.start()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+        stop.set()
+        watcher.join(timeout=60)
+
+        assert not errors, f"a thread raised: {errors[0]!r}"
+        assert all(not thread.is_alive() for thread in threads), "a writer thread did not finish"
+        assert not watcher.is_alive(), "the watcher thread did not finish"
+        assert engine.wait_for_flush(timeout=120), "the background flush never drained"
+        assert engine.flush_error is None
+        assert engine.flush_count > 1, "the run never exercised a repeated flush"
+        assert snapshots[0] > 100, "the watcher barely looked at the list"
+        assert len(engine.sstables) == engine.flush_count
+        assert [handle.path for handle in engine.sstables] == list(reversed(sstable_paths(engine)))
+
+
+def test_concurrent_lookups_through_one_handle_each_get_their_own_record(tmp_path: Path) -> None:
+    """The exclusivity claim, which a shared unguarded reader would fail on position alone.
+
+    Every thread looks up keys it knows are in the table and checks the record it
+    gets back is the one it asked for. Two lookups sharing a cursor without the
+    borrow's lock would seek out from under each other, and the symptom is a miss
+    or a record for the wrong key rather than an exception.
+    """
+    readers = 6
+    errors: list[BaseException] = []
+
+    with freezing_engine(tmp_path / "data", 2000) as engine:
+        written = fill_until_frozen(engine)
+        engine.flush_pending()
+        handle = engine.sstables[0]
+        assert handle.record_count == len(written) > 50, "the table is too small to contend on"
+
+        def read() -> None:
+            try:
+                for _ in range(20):
+                    for key in written:
+                        with handle.borrow_reader() as reader:
+                            record = reader.lookup(key)
+                        assert record is not None, f"{key!r} read as absent under contention"
+                        assert record.key == key, f"asked for {key!r} and got {record.key!r}"
+                        assert record.value == b"value"
+            except BaseException as error:
+                errors.append(error)
+
+        threads = [threading.Thread(target=read, daemon=True) for _ in range(readers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+
+        assert not errors, f"a reader thread raised: {errors[0]!r}"
+        assert all(not thread.is_alive() for thread in threads), "a reader thread did not finish"
