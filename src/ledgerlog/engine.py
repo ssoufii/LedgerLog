@@ -141,7 +141,7 @@ wakes it and it tries again. Writes keep working throughout, because a write doe
 not depend on a flush having succeeded: its record is already in the log.
 
 What a flush does not do yet is trim the log or make the table it wrote readable.
-Both belong to later milestones (the read path across SSTables is M7, startup
+Both belong to later milestones (the read path across SSTables is M7.2, startup
 discovery is M9.1), and until the first of them lands a key that has been flushed
 and dropped reads as ``None`` from this engine while its record sits in the
 SSTable and in the log. That is a gap in the read path and not lost data: the log
@@ -149,6 +149,40 @@ is never trimmed here, so a restart replays every one of those records and the
 key is readable again. It is called out rather than papered over because the
 alternative, holding every frozen table in memory until M7 arrives, is the
 unbounded growth the flush exists to stop.
+
+Tracking the tables on disk
+---------------------------
+
+Every table a flush commits is recorded in :attr:`LedgerLog.sstables`, newest
+first, as an :class:`SSTableHandle`. Newest first for the same reason the frozen
+memtables are: that is the order the read path has to consult them in, since one
+key can have an old value in one table and a newer value or a tombstone in
+another and the newest record is the one that is true (ARCHITECTURE.md section
+5). Keeping the order in the list rather than deriving it at read time means the
+ordering is decided once, by the flush that knows which table it just wrote, and
+not recomputed from filenames by every caller that walks the list.
+
+A table is added to the list before its frozen memtable is dropped, which is the
+same publish-before-retire rule the freeze-and-swap follows and for the same
+reason: the frozen table and the SSTable hold the same snapshot, so a reader that
+sees both sees one answer twice, while a reader that caught the drop before the
+table appeared would see a key in neither. The list is stored under the write
+lock and read without one, as one tuple store that a lock-free reader sees whole
+or not at all.
+
+What a handle exists to avoid is re-parsing. A flush has the table's footer and
+its bloom filter in hand already, so the handle keeps both, and the one
+:class:`~ledgerlog.sstable.SSTableReader` it opens for the data block is opened
+once and kept, which is what decodes the sparse index once rather than per
+lookup. A read path that took a path and opened it per get would pay a footer
+parse and an index decode for every one of them, which is exactly the cost the
+sparse index exists to amortize.
+
+What the list does not yet hold is tables from a previous run: nothing discovers
+those until story M9.1, so a reopened engine starts with an empty list and reads
+the old filenames only to avoid reusing one. Nor is the number of readers held
+open bounded, which is a question for the point where compaction (M8) starts
+producing and retiring tables in bulk.
 
 Concurrency
 -----------
@@ -179,6 +213,10 @@ One lock guards the whole write path, and reads take nothing.
   across its whole self and the freeze happens inside that same critical
   section, so the record that crossed the threshold is in the table being frozen
   and the next record is in the table that replaced it, with nothing in between.
+* Each :class:`SSTableHandle` carries a lock of its own, guarding the one reader
+  it lends out, because a reader owns its file position and two lookups on one
+  reader would pull each other's cursor (see ``sstable.py``). It is a leaf lock,
+  taken by nothing else and taking nothing, so it cannot be part of a cycle.
 * A flush takes a second lock, the flush lock, for as long as it takes to pick a
   frozen table, write it and drop it. That lock is what makes "one flusher at a
   time" true rather than hoped for: the background thread and a caller invoking
@@ -199,9 +237,11 @@ wait for a thread whose last act is to take it.
 
 What is deliberately not here yet:
 
-* Reading from SSTables (milestone 7). Every read is still answered from memory,
-  from the active memtable and then the frozen ones, so a flushed and dropped
-  key is not readable until a restart replays it (see "Flushing to disk" above).
+* Answering a :meth:`LedgerLog.get` from an SSTable (story M7.2). The tables are
+  tracked in the order that read will need them and each one's bloom filter and
+  reader are a property access away, but :meth:`LedgerLog.get` still stops at the
+  memtables, so a flushed and dropped key is not readable until a restart replays
+  it (see "Flushing to disk" above).
 * Discovering the tables a previous run flushed (story M9.1). A reopened engine
   reads the existing filenames only to avoid reusing one, and nothing yet opens
   those files or judges whether they are complete.
@@ -214,12 +254,20 @@ from __future__ import annotations
 
 import os
 import threading
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
 
+from ledgerlog.bloom import BloomFilter
 from ledgerlog.memtable import Memtable, MemtableEntry
-from ledgerlog.sstable import SSTableLayout, write_sstable
+from ledgerlog.sstable import (
+    SSTableFooter,
+    SSTableLayout,
+    SSTableReader,
+    write_sstable,
+)
 from ledgerlog.wal import (
     DEFAULT_FSYNC_INTERVAL_SECONDS,
     FILE_HEADER_SIZE,
@@ -311,6 +359,151 @@ def parse_sstable_sequence(name: str) -> int | None:
     if not (digits.isascii() and digits.isdigit()):
         return None
     return int(digits)
+
+
+class SSTableHandle:
+    """One committed SSTable, with what the read path needs about it kept resident.
+
+    An entry in :attr:`LedgerLog.sstables`. It exists so that consulting a table
+    costs what reading it costs and nothing more: the footer and the bloom filter
+    are held from the moment the table was written, and the reader behind them is
+    opened once and reused, which decodes the sparse index once. A read path built
+    on paths instead would parse a footer and decode an index on every lookup,
+    which for a get that the bloom filter ends up rejecting is all of the work and
+    none of the answer.
+
+    The footer and the filter come from the flush that produced the table rather
+    than from the file, because the writer had already built both on the way past
+    (see :class:`~ledgerlog.sstable.SSTableLayout`). Reading them back off the disk
+    to populate a handle would be decoding bytes this process encoded moments
+    earlier. Discovering a table a previous run left behind is story M9.1, and that
+    is the path where a handle will have to be built by parsing, which is why the
+    footer is kept as a footer rather than as the layout it came from: a discovered
+    table can supply a footer and has no layout.
+
+    The reader, unlike the other two, is opened lazily on the first borrow.
+    Nothing reads a table's data block until story M7.2, and a flush that opened
+    one eagerly would hold a descriptor per table for tables nothing has asked
+    about. The index is left to the reader rather than kept here as well, so that
+    a table being read does not hold two copies of it.
+
+    Lending the reader through :meth:`borrow_reader` rather than exposing it is
+    what keeps that sharing safe. A reader owns its stream's position, so two
+    lookups running at once on one reader would each move the other's cursor and
+    both could return a record from the wrong offset (see ``sstable.py``). The
+    borrow serializes them on this handle's lock, which is per table: a lookup in
+    one table never waits for a lookup in another, which is what keeps the
+    newest-first walk of many tables from turning into one queue.
+    """
+
+    def __init__(self, sequence: int, layout: SSTableLayout) -> None:
+        """Build the handle for the table ``layout`` describes.
+
+        ``sequence`` is the number in the table's filename, kept separately
+        because it is what orders tables by age and a layout carries the path but
+        not the number inside it. It is taken as given rather than parsed back out
+        of the name: the flush allocated it, and re-deriving it here would mean
+        two places deciding what a table's age is.
+        """
+        if sequence < 0:
+            raise ValueError(f"SSTable sequence number must not be negative, got {sequence}")
+        self._sequence = sequence
+        self._path = layout.path
+        self._footer = layout.footer
+        self._bloom_filter = layout.bloom_filter
+        self._lock = threading.Lock()
+        self._reader: SSTableReader | None = None
+        self._closed = False
+
+    @property
+    def sequence(self) -> int:
+        """Sequence number from this table's filename, which is its age."""
+        return self._sequence
+
+    @property
+    def path(self) -> Path:
+        """Path of the table on disk."""
+        return self._path
+
+    @property
+    def footer(self) -> SSTableFooter:
+        """The footer the table was committed with, held rather than re-read."""
+        return self._footer
+
+    @property
+    def bloom_filter(self) -> BloomFilter:
+        """The table's bloom filter, as the writer built it.
+
+        This is the first thing a read consults and the one that decides whether
+        the table is opened at all (ARCHITECTURE.md section 5), so it is the piece
+        that most has to be free of a parse: a get for a key no table holds should
+        cost a few hash probes per table and no I/O.
+        """
+        return self._bloom_filter
+
+    @property
+    def record_count(self) -> int:
+        """Number of records in the table, as its footer reports it."""
+        return self._footer.record_count
+
+    @property
+    def closed(self) -> bool:
+        """True once :meth:`close` has released this handle's reader."""
+        return self._closed
+
+    @contextmanager
+    def borrow_reader(self) -> Iterator[SSTableReader]:
+        """Yield this table's reader, exclusively, for the duration of the block.
+
+        The reader is opened on the first borrow and kept for every borrow after
+        it, so the footer is parsed and the index decoded once per handle rather
+        than once per lookup, which is the point of the class.
+
+        Exclusive because a reader is a cursor: two callers using one at the same
+        time would interleave seeks. The lock is released on every exit, including
+        an exception thrown by the caller's block, which is what the context
+        manager form is for.
+
+        A reader that fails to open leaves the handle without one rather than
+        holding a broken object, so a later borrow tries again. A file that has
+        been deleted or damaged under a running engine is the case that reaches
+        here, and it is the caller's to report, not this class's to paper over.
+
+        The lock is not reentrant, so a block must not close this handle, or the
+        engine holding it, from inside the borrow. Nothing in the read path does:
+        a borrow is one lookup long.
+        """
+        with self._lock:
+            if self._closed:
+                raise ValueError(f"cannot read from a closed SSTableHandle for {self._path}")
+            if self._reader is None:
+                self._reader = SSTableReader.open(self._path)
+            yield self._reader
+
+    def close(self) -> None:
+        """Release the reader this handle holds. Safe to call more than once.
+
+        Called when the engine closes, so that an engine that flushed many tables
+        does not leave a descriptor per table behind it. The handle stays in the
+        engine's list, closed, because the list says which tables this engine
+        wrote and that stays true after the engine is shut.
+        """
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            reader = self._reader
+            self._reader = None
+        if reader is not None:
+            # Outside the lock, because closing a file can block and nothing else
+            # can reach this reader once it has been unhooked above.
+            reader.close()
+
+    def __repr__(self) -> str:
+        return (
+            f"{type(self).__name__}(sequence={self._sequence}, path={str(self._path)!r}, "
+            f"record_count={self.record_count})"
+        )
 
 
 @dataclass(frozen=True)
@@ -418,6 +611,9 @@ class LedgerLog:
         self._memtable_threshold_bytes = memtable_threshold_bytes
         self._memtable = Memtable()
         self._frozen_memtables: tuple[Memtable, ...] = ()
+        # Newest first, and empty for a reopened engine until story M9.1 teaches
+        # startup to discover the tables previous runs committed.
+        self._sstables: tuple[SSTableHandle, ...] = ()
 
         # Ordered above the write lock and taken by nothing else, so a close can
         # hold it across the whole shutdown, including the join of a thread whose
@@ -496,6 +692,25 @@ class LedgerLog:
         set with one store that a lock-free reader sees all of or none of.
         """
         return self._frozen_memtables
+
+    @property
+    def sstables(self) -> tuple[SSTableHandle, ...]:
+        """Tables this engine has flushed, newest first.
+
+        The order a read has to consult them in (ARCHITECTURE.md section 5): a key
+        can appear in several tables, as an old value, a newer value or a
+        tombstone, and the first table in this list that holds it holds the record
+        that is true. Sequence numbers therefore descend along it.
+
+        Only tables this engine flushed are here. Ones an earlier run committed
+        are on disk and not in this list until startup discovery (story M9.1).
+
+        A tuple rather than a list, for the reason :attr:`frozen_memtables` is
+        one: a caller cannot change what the engine will read next, and the engine
+        publishes a new set with one store that a lock-free reader sees whole or
+        not at all.
+        """
+        return self._sstables
 
     @property
     def flush_in_background(self) -> bool:
@@ -742,6 +957,11 @@ class LedgerLog:
         engine. Nothing is lost by that: the log is not trimmed, so the next open
         replays every record they held.
 
+        The tracked tables' readers are closed last, after the log, so an engine
+        that flushed many tables leaves no descriptor behind. The handles stay in
+        :attr:`sstables`, closed: the list records which tables this engine wrote,
+        and the files are still on disk for the next open to find.
+
         A second lock serializes closes so that the whole of this runs once, rather
         than the closed flag alone. Without it, a second thread calling close would
         see the flag and return while the first was still joining the flusher and
@@ -760,7 +980,16 @@ class LedgerLog:
                     return
                 self._closed = True
             self._stop_flusher()
-            self._wal.close()
+            try:
+                self._wal.close()
+            finally:
+                # In a finally so that a failing final fsync still releases the
+                # table readers: the exception is the caller's to hear about, and
+                # leaking a descriptor per flushed table on the way to raising it
+                # would help nobody. A reader that then also refuses to close
+                # raises in its place, with the log's failure chained to it as the
+                # context, so neither of the two is lost.
+                self._close_sstables()
 
     def __enter__(self) -> LedgerLog:
         return self
@@ -950,12 +1179,65 @@ class LedgerLog:
         self._next_sstable_sequence = sequence + 1
         layout = self._write_sstable(memtable, self._directory / sstable_filename(sequence))
 
+        # Published before the memtable it came from is dropped, never after. The
+        # two hold the same records, so a reader that sees both sees one answer
+        # twice, while the other order leaves a window where the records are in
+        # neither the frozen tables nor the table list.
+        self._register_sstable(sequence, layout)
+
         # After the write returns, which is after the footer landed and the file
         # was renamed into place. Until then this table is the only copy of its
         # records that is not in the log.
         self.drop_frozen(memtable)
         self._flush_count += 1
         return layout
+
+    def _register_sstable(self, sequence: int, layout: SSTableLayout) -> SSTableHandle:
+        """Record a table this engine just committed at the front of the list.
+
+        Under the write lock, so that the store the lock-free :attr:`sstables`
+        reader sees is the one publication of a finished tuple, and so that the
+        ordering check below is made against the list the flush is actually
+        prepending to rather than against a snapshot of it.
+
+        The sequence number is required to be higher than the newest table's, and
+        the check earns its place: everything above this list treats position as
+        age, so a table prepended out of order would not read as an ordering bug,
+        it would read as correct data. There is one flusher and it takes tables in
+        freeze order, which is what makes the invariant hold; asserting it here is
+        what would catch a second flusher or a reused sequence number, at the
+        point where the mistake is still one table rather than a wrong answer.
+        """
+        handle = SSTableHandle(sequence, layout)
+        with self._write_lock:
+            newest = self._sstables[0] if self._sstables else None
+            if newest is not None and sequence <= newest.sequence:
+                raise ValueError(
+                    f"SSTable {layout.path.name} carries sequence number {sequence}, which does "
+                    f"not follow the newest tracked table's {newest.sequence}, so the list would "
+                    "no longer be ordered newest first"
+                )
+            self._sstables = (handle, *self._sstables)
+        return handle
+
+    def _close_sstables(self) -> None:
+        """Release every tracked table's reader. Call without the write lock.
+
+        Every handle is closed even if one of them raises, and the first exception
+        is re-raised afterwards, because the point of this is to leave no
+        descriptor behind and stopping at the first failure would leak the rest.
+        The handles stay in the list: it is a record of what this engine flushed,
+        which does not stop being true when the engine closes.
+        """
+        first_error: BaseException | None = None
+        for handle in self._sstables:
+            try:
+                handle.close()
+            except BaseException as error:
+                if first_error is None:
+                    first_error = error
+        if first_error is not None:
+            raise first_error
 
     def _write_sstable(self, memtable: Memtable, path: Path) -> SSTableLayout:
         """Write one frozen memtable to ``path`` as a complete SSTable.
