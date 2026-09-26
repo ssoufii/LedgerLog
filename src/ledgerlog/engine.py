@@ -1,10 +1,11 @@
 """Engine: the write-ahead log and the memtable wired into one key-value store.
 
-Scope of this module today (stories M3.1, M3.2, M6.1, M6.2, M7.1 and M7.2): the
-write path, startup recovery, the freeze-and-swap that retires a memtable once it
-has grown past a configured size, the background flush that writes a retired
-memtable out as an SSTable and releases it from memory, and the read path that
-walks all of those layers. A put or a delete is appended to the WAL first and
+Scope of this module today (stories M3.1, M3.2, M6.1, M6.2, M7.1, M7.2 and M8.1):
+the write path, startup recovery, the freeze-and-swap that retires a memtable once
+it has grown past a configured size, the background flush that writes a retired
+memtable out as an SSTable and releases it from memory, the read path that walks
+all of those layers, and the size-tier plan the engine keeps over the tables it
+has flushed. A put or a delete is appended to the WAL first and
 applied to the memtable second, a get answers from the active memtable, then from
 any frozen memtables behind it, then from the SSTables on disk newest first, and
 opening an engine over an existing log replays that log into a fresh memtable
@@ -273,6 +274,12 @@ What is deliberately not here yet:
 * Trimming the log once the records it holds are on disk. Replay still reads it
   in full at startup, which is why a flush cannot lose data but does leave the
   same records in two places.
+* Running a compaction. Story M8.1 gives the engine a
+  :class:`~ledgerlog.compaction.CompactionPlan`, republished whenever a table is
+  added, which says which tables are grouped together and which group has enough
+  tables to be worth merging. Nothing acts on it: the merge is story M8.2 and the
+  swap that retires the merged tables is M8.5, so until then the plan is a report
+  about the directory and not a thing the engine does.
 """
 
 from __future__ import annotations
@@ -286,6 +293,7 @@ from pathlib import Path
 from types import TracebackType
 
 from ledgerlog.bloom import BloomFilter
+from ledgerlog.compaction import CompactionPlan, CompactionPolicy, plan_compaction
 from ledgerlog.memtable import Memtable, MemtableEntry
 from ledgerlog.sstable import (
     SSTableFooter,
@@ -437,6 +445,7 @@ class SSTableHandle:
         self._path = layout.path
         self._footer = layout.footer
         self._bloom_filter = layout.bloom_filter
+        self._size_bytes = layout.footer_end
         self._lock = threading.Lock()
         self._reader: SSTableReader | None = None
         self._closed = False
@@ -471,6 +480,23 @@ class SSTableHandle:
     def record_count(self) -> int:
         """Number of records in the table, as its footer reports it."""
         return self._footer.record_count
+
+    @property
+    def size_bytes(self) -> int:
+        """Size of the table's file in bytes, which is what compaction groups by.
+
+        Taken from the layout's footer end rather than from the filesystem, because
+        the footer is the last thing written and the end of it is the end of the
+        file, so this is the size the table was committed at without a call out to
+        ask. It is also the size that stays true: a ``stat`` would report whatever
+        the file is now, and a file that has grown or shrunk since it was committed
+        is damaged, not resized.
+
+        Bytes on disk rather than record count, because the tiering in
+        ``compaction.py`` is about the I/O a merge would cost, and two tables with
+        the same number of records can differ by orders of magnitude in size.
+        """
+        return self._size_bytes
 
     @property
     def closed(self) -> bool:
@@ -580,6 +606,7 @@ class LedgerLog:
         fsync_interval_seconds: float = DEFAULT_FSYNC_INTERVAL_SECONDS,
         memtable_threshold_bytes: int = DEFAULT_MEMTABLE_THRESHOLD_BYTES,
         flush_in_background: bool = True,
+        compaction_policy: CompactionPolicy | None = None,
     ) -> None:
         """Open, or create, the engine whose data lives in ``directory``.
 
@@ -614,6 +641,12 @@ class LedgerLog:
         caller's thread, and an engine that neither runs the thread nor calls
         those accumulates frozen memtables for as long as it stays open.
 
+        ``compaction_policy`` sets how tables are grouped into size tiers and how
+        many tables a tier needs before it is worth merging, and defaults to
+        :class:`~ledgerlog.compaction.CompactionPolicy`'s own defaults. It changes
+        nothing the engine does today, since no compaction runs yet (story M8.2):
+        it decides what :attr:`compaction_plan` reports.
+
         The thread is started last, after the log is open, so it cannot find a
         half-built engine: replay may already have frozen a table, and a flusher
         running before :attr:`_wal` exists would be a flush racing the
@@ -640,6 +673,15 @@ class LedgerLog:
         # Newest first, and empty for a reopened engine until story M9.1 teaches
         # startup to discover the tables previous runs committed.
         self._sstables: tuple[SSTableHandle, ...] = ()
+        self._compaction_policy = (
+            compaction_policy if compaction_policy is not None else CompactionPolicy()
+        )
+        # Recomputed from the table list whenever that list changes, rather than
+        # updated in place, so there is one way a plan comes to exist and no
+        # incremental path that could disagree with it. See _register_sstable.
+        self._compaction_plan: CompactionPlan[SSTableHandle] = plan_compaction(
+            self._sstables, self._compaction_policy
+        )
 
         # Ordered above the write lock and taken by nothing else, so a close can
         # hold it across the whole shutdown, including the join of a thread whose
@@ -737,6 +779,32 @@ class LedgerLog:
         not at all.
         """
         return self._sstables
+
+    @property
+    def compaction_policy(self) -> CompactionPolicy:
+        """How this engine groups tables into size tiers and when it calls one full."""
+        return self._compaction_policy
+
+    @property
+    def compaction_plan(self) -> CompactionPlan[SSTableHandle]:
+        """The tracked tables grouped into size tiers, with the ready ones flagged.
+
+        Recomputed and republished every time a table joins :attr:`sstables`, so it
+        describes the tables the engine holds now and not the ones it held at some
+        earlier point. Nothing consumes it yet: the merge that a ready tier calls
+        for is story M8.2.
+
+        Read without a lock, like :attr:`sstables`, and safe for the same reason:
+        the plan is built complete and published with one store, so a reader sees
+        one whole plan. It is a snapshot either way, so a caller that means to act
+        on a ready tier has to expect the set of tables to have moved on by the
+        time it does, exactly as it would with :attr:`sstables`.
+
+        Only tables this engine flushed are in it, since that is all
+        :attr:`sstables` holds until startup discovery (story M9.1). A reopened
+        engine therefore reports no tiers even where the directory holds tables.
+        """
+        return self._compaction_plan
 
     @property
     def flush_in_background(self) -> bool:
@@ -1279,7 +1347,17 @@ class LedgerLog:
                     f"not follow the newest tracked table's {newest.sequence}, so the list would "
                     "no longer be ordered newest first"
                 )
-            self._sstables = (handle, *self._sstables)
+            tracked = (handle, *self._sstables)
+            # Re-tiered under the same lock, from the list about to be published,
+            # since it is the only thing keeping the plan honest once a table
+            # arrives (story M8.1's third criterion). Built before either store so
+            # that a planner that refused the new set would leave both the list
+            # and the plan as they were, rather than publishing a table the plan
+            # does not cover. Recomputing costs a sort of the table list, which a
+            # flush that has just written a whole file can afford.
+            plan = plan_compaction(tracked, self._compaction_policy)
+            self._sstables = tracked
+            self._compaction_plan = plan
         return handle
 
     def _close_sstables(self) -> None:
