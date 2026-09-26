@@ -64,6 +64,7 @@ from ledgerlog import bloom as bloom_module
 from ledgerlog import engine as engine_module
 from ledgerlog import sstable as sstable_module
 from ledgerlog import wal as wal_module
+from ledgerlog.compaction import CompactionPolicy
 from ledgerlog.engine import (
     WAL_FILENAME,
     SSTableHandle,
@@ -3227,3 +3228,218 @@ def test_a_reader_never_misses_a_key_while_the_engine_flushes(tmp_path: Path) ->
         assert engine.flush_count > 1, "the run never exercised a repeated flush"
         for key in keys:
             assert engine.get(key) == b"value", f"{key!r} was lost across the flushes"
+
+
+# ---------------------------------------------------------------------------
+# Story M8.1: the size-tier plan the engine keeps over the tables it has flushed.
+#
+# The grouping rules and the trigger threshold are ``compaction.py``'s, and they
+# are tested there against hand-computed sizes. What is left for here is the half
+# the planner cannot be asked about: that the size a handle reports is really the
+# size of the file, and that a table arriving from a flush, or from a compaction
+# that registered one directly, re-tiers the plan the engine publishes.
+#
+# The size is worth a test of its own because it is taken from the layout rather
+# than from the filesystem. A wrong-but-consistent number (the data block's size,
+# say, or the offset the footer starts at) would group tables perfectly well in
+# every test that only compares tables written the same way, and would quietly
+# misgroup a merged table against a flushed one.
+#
+# One test reaches for ``engine._register_sstable``, marked where it happens: a
+# table produced by a compaction is what criterion 3's "or a prior compaction"
+# means, and until story M8.2 exists there is no public way to make one.
+#
+# The last test uses real threads, for the same reason the table list has one: the
+# plan is published without a lock, so a reader must never see one that is missing
+# a table it can already see in ``sstables`` for good, or one built half way.
+# ---------------------------------------------------------------------------
+
+
+def planned_sequences(engine: LedgerLog) -> list[tuple[int, ...]]:
+    """The engine's plan as sequence numbers, one tuple per tier, in the plan's order."""
+    return [tier.sequences for tier in engine.compaction_plan.tiers]
+
+
+def test_a_fresh_engine_plans_no_tiers(engine: LedgerLog) -> None:
+    plan = engine.compaction_plan
+
+    assert plan.tiers == ()
+    assert plan.table_count == 0
+    assert plan.needs_compaction is False
+    assert plan.next_tier is None
+
+
+def test_the_compaction_policy_defaults_to_the_modules_default(engine: LedgerLog) -> None:
+    assert engine.compaction_policy == CompactionPolicy()
+
+
+def test_the_compaction_policy_can_be_chosen_when_the_engine_is_opened(tmp_path: Path) -> None:
+    policy = CompactionPolicy(size_ratio=3.0, min_tier_tables=6)
+
+    with LedgerLog(tmp_path / "data", compaction_policy=policy) as engine:
+        assert engine.compaction_policy == policy
+        assert engine.compaction_plan.policy == policy
+
+
+def test_a_tracked_table_reports_the_size_of_its_file(tmp_path: Path) -> None:
+    """Criterion 1 needs a real size, so the number the handle reports is the file's."""
+    with freezing_engine(tmp_path / "data", 400) as engine:
+        fill_until_frozen(engine)
+
+        layout = engine.flush_frozen()
+
+        assert layout is not None
+        handle = engine.sstables[0]
+        assert handle.size_bytes == handle.path.stat().st_size
+        assert handle.size_bytes > 0
+
+
+def test_each_flush_re_tiers_the_plan(tmp_path: Path) -> None:
+    """Criterion 3 with flushes, and criterion 2 on the way past.
+
+    The flushes here produce tables of the same size, so they belong to one tier,
+    and the tier is not ready until the fourth one lands. Each flush is planned
+    again from scratch, so what is checked after every one is the whole plan, not
+    just the table that was added.
+    """
+    with freezing_engine(tmp_path / "data", 40) as engine:
+        for flush_number in range(1, 5):
+            fill_until_frozen(engine, prefix=f"p{flush_number}".encode())
+            engine.flush_pending()
+
+            plan = engine.compaction_plan
+            assert plan.table_count == flush_number
+            assert planned_sequences(engine) == [tuple(reversed(range(flush_number)))]
+            assert plan.needs_compaction is (flush_number >= 4)
+
+        next_tier = engine.compaction_plan.next_tier
+        assert next_tier is not None
+        assert next_tier.sequences == (3, 2, 1, 0)
+        assert next_tier.tables == engine.sstables
+
+
+def test_a_flush_that_committed_nothing_leaves_the_plan_alone(tmp_path: Path) -> None:
+    with freezing_engine(tmp_path / "data", 40) as engine:
+        assert engine.flush_frozen() is None
+
+        assert engine.compaction_plan.tiers == ()
+
+
+def test_a_background_flush_re_tiers_the_plan_too(tmp_path: Path) -> None:
+    """The plan is republished by whichever thread registered the table."""
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=400
+    ) as engine:
+        for index in range(600):
+            engine.put(f"key{index:04d}".encode(), b"value")
+        assert engine.wait_for_flush(timeout=120), "the background flush never drained"
+
+        plan = engine.compaction_plan
+        assert plan.table_count == engine.flush_count > 0
+        assert [table for tier in plan.tiers for table in tier.tables] != []
+        assert sorted(
+            (table.sequence for tier in plan.tiers for table in tier.tables), reverse=True
+        ) == [handle.sequence for handle in engine.sstables]
+
+
+def test_a_table_from_a_compaction_is_tiered_apart_from_the_flushes_it_merged(
+    tmp_path: Path,
+) -> None:
+    """Criterion 3's other half: a table that did not come from a flush.
+
+    Registering one by hand is the only way to make it before story M8.2 exists.
+    The table written here holds every record of the four flushed tables, so it is
+    the size a merge of them would produce, and the point of the test is that it
+    does not land back in their tier.
+    """
+    with freezing_engine(tmp_path / "data", 40) as engine:
+        written: list[bytes] = []
+        for flush_number in range(4):
+            written.extend(fill_until_frozen(engine, prefix=f"p{flush_number}".encode()))
+        engine.flush_pending()
+        assert engine.compaction_plan.needs_compaction is True
+
+        merged_sequence = max(handle.sequence for handle in engine.sstables) + 1
+        merged_path = engine.directory / sstable_filename(merged_sequence)
+        layout = write_sstable(merged_path, ((key, b"value") for key in sorted(written)))
+        # Private: a compaction would register its output here, and M8.2 is the
+        # story that gives the engine a way to produce one.
+        engine._register_sstable(merged_sequence, layout)
+
+        plan = engine.compaction_plan
+        assert plan.table_count == 5
+        merged_tier = plan.tiers[-1]
+        assert merged_tier.sequences == (merged_sequence,)
+        assert merged_tier.largest_size_bytes == layout.footer_end
+        assert plan.tiers[0].sequences == (3, 2, 1, 0), "the flushed tables stayed together"
+
+
+def test_the_plan_is_never_seen_half_built_while_flushes_re_tier_it(tmp_path: Path) -> None:
+    """The publication claim for the plan, against real background flushes.
+
+    A reader takes no lock, so what it must never see is a plan with an empty tier,
+    a table in two tiers, a tier out of age order, or fewer tables than a plan it
+    already saw. The last of those is the one a plan assembled in place, rather
+    than swapped in whole, would fail.
+    """
+    writers = 4
+    per_writer = 400
+    errors: list[BaseException] = []
+    snapshots = [0]
+    highest_seen = [0]
+    stop = threading.Event()
+
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=400
+    ) as engine:
+
+        def write(thread_id: int) -> None:
+            try:
+                for step in range(per_writer):
+                    engine.put(f"t{thread_id}-k{step:04d}".encode(), b"value")
+            except BaseException as error:
+                errors.append(error)
+
+        def watch() -> None:
+            try:
+                while not stop.is_set():
+                    plan = engine.compaction_plan
+                    snapshots[0] += 1
+                    sequences = [table.sequence for tier in plan.tiers for table in tier.tables]
+                    assert len(set(sequences)) == len(sequences), (
+                        f"a reader saw a table in two tiers: {sequences}"
+                    )
+                    assert plan.table_count == len(sequences)
+                    assert plan.table_count >= highest_seen[0], (
+                        f"the plan shrank from {highest_seen[0]} tables to {plan.table_count}"
+                    )
+                    highest_seen[0] = plan.table_count
+                    for tier in plan.tiers:
+                        assert tier.tables, "a reader saw an empty tier"
+                        assert list(tier.sequences) == sorted(tier.sequences, reverse=True), (
+                            f"a reader saw a tier out of age order: {tier.sequences}"
+                        )
+            except BaseException as error:
+                errors.append(error)
+
+        watcher = threading.Thread(target=watch, daemon=True)
+        threads = [
+            threading.Thread(target=write, args=(thread_id,), daemon=True)
+            for thread_id in range(writers)
+        ]
+        watcher.start()
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=120)
+        stop.set()
+        watcher.join(timeout=60)
+
+        assert not errors, f"a thread raised: {errors[0]!r}"
+        assert all(not thread.is_alive() for thread in threads), "a writer thread did not finish"
+        assert not watcher.is_alive(), "the watcher thread did not finish"
+        assert engine.wait_for_flush(timeout=120), "the background flush never drained"
+        assert engine.flush_error is None
+        assert engine.flush_count > 1, "the run never exercised a repeated flush"
+        assert snapshots[0] > 100, "the watcher barely looked at the plan"
+        assert engine.compaction_plan.table_count == len(engine.sstables)
