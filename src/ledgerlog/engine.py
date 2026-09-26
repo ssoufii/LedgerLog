@@ -1,14 +1,15 @@
 """Engine: the write-ahead log and the memtable wired into one key-value store.
 
-Scope of this module today (stories M3.1, M3.2, M6.1 and M6.2): the write path,
-startup recovery, the freeze-and-swap that retires a memtable once it has grown
-past a configured size, and the background flush that writes a retired memtable
-out as an SSTable and releases it from memory. A put or a delete is appended to
-the WAL first and applied to the memtable second, a get answers from the memtable
-and then from any frozen memtables behind it, and opening an engine over an
-existing log replays that log into a fresh memtable before the caller can issue
-anything. Every acknowledged write is in the log before any reader can see it,
-and a restart brings every one of them back.
+Scope of this module today (stories M3.1, M3.2, M6.1, M6.2, M7.1 and M7.2): the
+write path, startup recovery, the freeze-and-swap that retires a memtable once it
+has grown past a configured size, the background flush that writes a retired
+memtable out as an SSTable and releases it from memory, and the read path that
+walks all of those layers. A put or a delete is appended to the WAL first and
+applied to the memtable second, a get answers from the active memtable, then from
+any frozen memtables behind it, then from the SSTables on disk newest first, and
+opening an engine over an existing log replays that log into a fresh memtable
+before the caller can issue anything. Every acknowledged write is in the log
+before any reader can see it, and a restart brings every one of them back.
 
 Why the WAL comes first, since this ordering is the only reason the module
 exists: the memtable is memory and the log is disk, so the moment a write
@@ -140,15 +141,16 @@ to waiting rather than spinning on a table that just failed; the next freeze
 wakes it and it tries again. Writes keep working throughout, because a write does
 not depend on a flush having succeeded: its record is already in the log.
 
-What a flush does not do yet is trim the log or make the table it wrote readable.
-Both belong to later milestones (the read path across SSTables is M7.2, startup
-discovery is M9.1), and until the first of them lands a key that has been flushed
-and dropped reads as ``None`` from this engine while its record sits in the
-SSTable and in the log. That is a gap in the read path and not lost data: the log
-is never trimmed here, so a restart replays every one of those records and the
-key is readable again. It is called out rather than papered over because the
-alternative, holding every frozen table in memory until M7 arrives, is the
-unbounded growth the flush exists to stop.
+A table a flush commits is readable the moment it is registered: the flush
+publishes it into the table list before it drops the frozen memtable it was
+written from, and the read path below walks that list. So a key does not stop
+being readable by being flushed, which is what lets the flush release the frozen
+table from memory rather than holding every one of them until the process ends.
+
+What a flush still does not do is trim the log. The records it wrote to disk stay
+in the log as well, and replay reads all of them at startup, so a flushed key is
+currently recoverable twice over. Trimming is a later milestone, and until then
+the cost is a log that only grows.
 
 Tracking the tables on disk
 ---------------------------
@@ -183,6 +185,34 @@ those until story M9.1, so a reopened engine starts with an empty list and reads
 the old filenames only to avoid reusing one. Nor is the number of readers held
 open bounded, which is a question for the point where compaction (M8) starts
 producing and retiring tables in bulk.
+
+Reading across the layers
+-------------------------
+
+:meth:`LedgerLog.get` walks the layers newest to oldest, exactly as
+ARCHITECTURE.md section 5 sets them out: the active memtable, then the frozen
+memtables, then the SSTables. It stops at the first layer that holds any record
+for the key, a tombstone included, because a tombstone is a record saying the key
+was deleted after whatever an older layer still remembers. Falling through one
+would resurrect that older value, which is the single failure this ordering
+exists to prevent, and it is why the walk is written in terms of records rather
+than of values: "deleted here" and "not here" have to stay distinguishable all
+the way down (see :meth:`LedgerLog._lookup`).
+
+Each SSTable's bloom filter is consulted before the table is opened. A negative
+there is conclusive, so a table that does not hold the key costs a few hash
+probes and no I/O, which is what keeps a read whose key is absent from every
+table from turning into one data block scan per table. A positive may be wrong,
+and the scan that follows simply finds nothing and moves on to the next table.
+
+One ordering detail in the walk is not cosmetic: the table list is read after the
+frozen memtables have been walked, never before. A flush publishes its table into
+the list first and drops the frozen memtable it came from second, so a list read
+at that point holds every table whose memtable the walk may have just missed.
+Reading the list first would leave a window in which a flush that ran in between
+had already dropped the memtable and published a table that the earlier snapshot
+predates, and a key in neither of the two snapshots would read as absent while
+being on disk the whole time.
 
 Concurrency
 -----------
@@ -237,11 +267,6 @@ wait for a thread whose last act is to take it.
 
 What is deliberately not here yet:
 
-* Answering a :meth:`LedgerLog.get` from an SSTable (story M7.2). The tables are
-  tracked in the order that read will need them and each one's bloom filter and
-  reader are a property access away, but :meth:`LedgerLog.get` still stops at the
-  memtables, so a flushed and dropped key is not readable until a restart replays
-  it (see "Flushing to disk" above).
 * Discovering the tables a previous run flushed (story M9.1). A reopened engine
   reads the existing filenames only to avoid reusing one, and nothing yet opens
   those files or judges whether they are complete.
@@ -266,6 +291,7 @@ from ledgerlog.sstable import (
     SSTableFooter,
     SSTableLayout,
     SSTableReader,
+    SSTableRecord,
     write_sstable,
 )
 from ledgerlog.wal import (
@@ -800,12 +826,15 @@ class LedgerLog:
     def get(self, key: bytes) -> bytes | None:
         """Return the value stored under ``key``, or ``None`` if there is none.
 
-        The active memtable is consulted first and the frozen ones after it,
-        newest first, which is ARCHITECTURE.md section 5's ordering minus the
-        SSTables that do not exist yet (story M7.2). The search stops at the
-        first layer holding any record for the key, including a tombstone: a
-        tombstone means the key was deleted after whatever an older layer still
-        remembers, so falling through it would resurrect that older value.
+        The active memtable is consulted first, the frozen ones after it and the
+        SSTables on disk after those, each newest first, which is
+        ARCHITECTURE.md section 5's ordering. The search stops at the first layer
+        holding any record for the key, including a tombstone: a tombstone means
+        the key was deleted after whatever an older layer still remembers, so
+        falling through it would resurrect that older value.
+
+        A table whose bloom filter rejects the key is not opened at all, so a key
+        no table holds costs hash probes rather than a scan per table.
 
         A deleted key therefore reads as ``None``, the same as a key that was
         never written. The two are different facts internally and the difference
@@ -817,10 +846,18 @@ class LedgerLog:
         carried all the way down into the log's record format, and it survives
         here.
 
-        Takes no lock, and reads the active table before the frozen ones, which
-        is the order the swap publishes in reverse. See this module's docstring
-        for why that is what keeps a concurrent freeze from hiding a record from
-        this call.
+        Takes no lock, and reads each layer in the reverse of the order a freeze
+        or a flush publishes to it: the active table before the frozen ones, and
+        the frozen ones before the table list. See this module's docstring for
+        why that is what keeps a concurrent freeze or flush from hiding a record
+        from this call.
+
+        Raises :class:`ValueError` if the engine has been closed, and can raise
+        the same from a table handle if another thread closes the engine while
+        this call is mid-walk. That is a caller racing its own :meth:`close`,
+        and it is reported rather than swallowed: the alternative, treating a
+        closed table as one that does not hold the key, would answer "not found"
+        for a key that is on disk.
         """
         self._check_open()
 
@@ -829,15 +866,23 @@ class LedgerLog:
             return None
         return entry.value
 
-    def _lookup(self, key: bytes) -> MemtableEntry | None:
+    def _lookup(self, key: bytes) -> MemtableEntry | SSTableRecord | None:
         """Return the newest record held for ``key``, or ``None`` if there is none.
 
         Separate from :meth:`get` because the layers have to be walked with the
         distinction between "deleted here" and "not here" intact, and
         :meth:`Memtable.get` has already thrown it away. Collapsing the two into
-        one loop would mean a tombstone in the active table reading the same as
-        no record at all, and the search moving on to a frozen table that still
+        one loop would mean a tombstone in one layer reading the same as no
+        record at all, and the search moving on to an older layer that still
         holds the deleted value.
+
+        The two record types are handed back as they come, a
+        :class:`~ledgerlog.memtable.MemtableEntry` from memory and an
+        :class:`~ledgerlog.sstable.SSTableRecord` from disk, rather than being
+        converted into one type. They already agree about the two things this
+        engine asks a record, its ``value`` and whether it ``is_tombstone``, so
+        converting would allocate a second object per read to restate what the
+        first one said.
         """
         entry = self._memtable.lookup(key)
         if entry is not None:
@@ -847,6 +892,23 @@ class LedgerLog:
             entry = table.lookup(key)
             if entry is not None:
                 return entry
+
+        # Read after the frozen memtables above, never before them. A flush
+        # publishes its table into this list and only then drops the frozen
+        # memtable it was written from, so a snapshot taken at this point holds
+        # every table whose memtable the walk above may have missed. See this
+        # module's docstring for the window the other order would open.
+        for handle in self._sstables:
+            # A bloom negative is conclusive, so a table that does not hold the
+            # key is skipped without opening its data block at all. A positive
+            # may be wrong, and the lookup below then finds nothing and the walk
+            # carries on to the next table.
+            if not handle.bloom_filter.might_contain(key):
+                continue
+            with handle.borrow_reader() as reader:
+                record = reader.lookup(key)
+            if record is not None:
+                return record
 
         return None
 

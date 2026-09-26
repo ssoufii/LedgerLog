@@ -44,6 +44,7 @@ which records come back. Neither kind stands in for the other.
 
 from __future__ import annotations
 
+import itertools
 import os
 import select
 import signal
@@ -51,14 +52,15 @@ import subprocess
 import sys
 import threading
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import Path
-from typing import NoReturn
+from typing import Any, NoReturn
 
 import pytest
 
 import ledgerlog
 from ledgerlog import LedgerLog
+from ledgerlog import bloom as bloom_module
 from ledgerlog import engine as engine_module
 from ledgerlog import sstable as sstable_module
 from ledgerlog import wal as wal_module
@@ -68,7 +70,7 @@ from ledgerlog.engine import (
     parse_sstable_sequence,
     sstable_filename,
 )
-from ledgerlog.memtable import Memtable, MemtableFrozenError
+from ledgerlog.memtable import Memtable, MemtableEntry, MemtableFrozenError
 from ledgerlog.sstable import (
     SSTableLayout,
     SSTableReader,
@@ -2331,19 +2333,21 @@ def test_no_write_is_lost_or_duplicated_between_the_flushed_tables_and_memory(
         assert placed == expected, "the flush lost, changed or invented a record"
 
 
-def test_a_flushed_key_is_not_readable_until_the_read_path_reaches_sstables(
+def test_a_flushed_key_is_readable_from_the_table_it_was_flushed_to(
     tmp_path: Path,
 ) -> None:
-    """The gap this milestone leaves, pinned so it is a decision rather than a surprise.
+    """The gap milestone 6 left, now closed by story M7.2.
 
-    A key whose table has been flushed and dropped reads as ``None`` from this
-    engine, because ``get`` still only looks in memory (milestone 7 is what adds
-    the SSTable read path). What the second half of this test shows is that this is
-    a gap in the read path and not lost data: the log is never trimmed by a flush,
-    so a restart replays every one of those records and the key is readable again.
+    This test used to pin the opposite: a key whose table had been flushed and
+    dropped read as ``None``, because ``get`` stopped at the memtables. Now that
+    the read path reaches the tables, a flush no longer takes a key away from a
+    reader, which is what lets it release the frozen table from memory.
 
-    Story M7.2 is what makes the first assertion here false, and it should be
-    changed to match rather than deleted.
+    The keys are checked to be out of memory first, so that the values below are
+    answers from disk rather than from a memtable that happened to still hold
+    them. The second half of the test is unchanged and still worth keeping: the
+    log is not trimmed by a flush, so the same records come back from a restart
+    as well.
     """
     directory = tmp_path / "data"
     with LedgerLog(directory, memtable_threshold_bytes=100) as engine:
@@ -2354,7 +2358,18 @@ def test_a_flushed_key_is_not_readable_until_the_read_path_reaches_sstables(
         flushed = [key for table in sstable_paths(engine) for key, _ in sstable_records(table)]
         assert flushed, "nothing was flushed, so this test proves nothing"
         assert len(wal_records(engine)) == 50, "the flush trimmed the log it still depends on"
-        assert engine.get(flushed[0]) is None
+
+        # ``engine._memtable`` on purpose: which layer holds a record is the whole
+        # point of the assertion, and the active table has no public accessor.
+        in_memory = {
+            key
+            for memtable in (*engine.frozen_memtables, engine._memtable)
+            for key, _ in memtable_records(memtable)
+        }
+        readable_only_on_disk = [key for key in flushed if key not in in_memory]
+        assert readable_only_on_disk, "every flushed key is still in memory, so this proves nothing"
+        for key in readable_only_on_disk:
+            assert engine.get(key) == b"value", f"{key!r} was not readable from its table"
 
     with LedgerLog(directory, memtable_threshold_bytes=10**9) as reopened:
         for key in flushed:
@@ -2794,3 +2809,421 @@ def test_concurrent_lookups_through_one_handle_each_get_their_own_record(tmp_pat
 
         assert not errors, f"a reader thread raised: {errors[0]!r}"
         assert all(not thread.is_alive() for thread in threads), "a reader thread did not finish"
+
+
+# ---------------------------------------------------------------------------
+# Story M7.2: get() across the memtables and every SSTable, newest write wins.
+#
+# The claim is an ordering claim about layers, so every test below puts the same
+# key in more than one layer and checks which one answers. A read path that
+# walked the tables in the wrong order, or that fell through a tombstone, would
+# return a value that was true at some point in the past, which is why the older
+# record is asserted to still be on disk in the shadowing tests: without that,
+# a passing test could just as well mean the older write was never written.
+#
+# Which keys share a table is decided by the tests rather than by a byte count,
+# through ``flush_as_one_table``. The engine freezes on size alone, so the helper
+# crosses the threshold with one deliberate filler record, which keeps the whole
+# section on the public API while still pinning each key to a known layer.
+#
+# Criterion 4 is the one that could pass while being false: a read path that
+# opened every table would return the right answer and only be slow. It is pinned
+# by counting, with the bloom filter probes and the data block lookups counted
+# separately, so "the filter was consulted" and "the table was opened anyway" are
+# different failures.
+#
+# The last test uses real threads, per CLAUDE.md, for the concurrency claim the
+# walk order makes: a flush publishes its table before dropping the memtable it
+# came from, so a get that reads the table list after walking the frozen tables
+# sees a key in one layer or the other throughout, and never in neither.
+# ---------------------------------------------------------------------------
+
+
+class _CallCounter:
+    """Counts the calls a wrapped callable takes, and passes each one through.
+
+    Wrapping is a method rather than the constructor's job so that one counter
+    can stand behind a function installed on a class: the wrapper it returns is a
+    plain function, which is what lets an instance method bind ``self`` normally.
+    A callable object installed in its place would not bind, and the real method
+    would receive the key as its ``self``.
+    """
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def wrap(self, real: Callable[..., Any]) -> Callable[..., Any]:
+        def counted(*args: Any, **kwargs: Any) -> Any:
+            self.calls += 1
+            return real(*args, **kwargs)
+
+        return counted
+
+
+def count_bloom_probes(monkeypatch: pytest.MonkeyPatch) -> _CallCounter:
+    """Count every bloom filter membership probe from here on."""
+    counter = _CallCounter()
+    monkeypatch.setattr(
+        bloom_module.BloomFilter,
+        "might_contain",
+        counter.wrap(bloom_module.BloomFilter.might_contain),
+    )
+    return counter
+
+
+def count_data_block_lookups(monkeypatch: pytest.MonkeyPatch) -> _CallCounter:
+    """Count every lookup that reaches an SSTable's data block from here on.
+
+    :meth:`SSTableReader.lookup` is the only way into a table's records, so a
+    count of it is a count of the tables a read actually opened, whatever the
+    read path believed it was doing.
+    """
+    counter = _CallCounter()
+    monkeypatch.setattr(
+        sstable_module.SSTableReader,
+        "lookup",
+        counter.wrap(sstable_module.SSTableReader.lookup),
+    )
+    return counter
+
+
+def layered_engine(directory: Path) -> LedgerLog:
+    """An engine whose flushes happen when a test asks for them and not before.
+
+    Background flushing is off because every test here is about which layer holds
+    a record, and a thread moving records between layers at a moment the test does
+    not control would make those assertions race. The threshold is small so that
+    the filler record :func:`freeze_as_one_table` writes stays small.
+    """
+    return LedgerLog(
+        directory,
+        fsync_policy=FsyncPolicy.NEVER,
+        memtable_threshold_bytes=256,
+        flush_in_background=False,
+    )
+
+
+_filler_sequence = itertools.count()
+
+
+def freeze_as_one_table(engine: LedgerLog, records: Iterable[tuple[bytes, bytes | None]]) -> bytes:
+    """Write ``records`` and freeze them as one snapshot. Returns the filler key used.
+
+    A value of ``None`` writes a tombstone. The engine freezes on size alone, so
+    the batch is followed by one filler record big enough to cross the threshold
+    on its own, which is how these tests decide which keys share a layer without
+    reaching past the public API. The filler keys are numbered so that no two
+    calls write the same one: a repeated filler would itself be a key shadowed
+    across layers, and the record counts below would quietly stop meaning what
+    they say.
+    """
+    for key, value in records:
+        if value is None:
+            engine.delete(key)
+        else:
+            engine.put(key, value)
+
+    filler = f"__filler{next(_filler_sequence):04d}__".encode()
+    engine.put(filler, b"x" * engine.memtable_threshold_bytes)
+    assert engine.frozen_memtables, "the filler record did not cross the freeze threshold"
+    return filler
+
+
+def flush_as_one_table(engine: LedgerLog, records: Iterable[tuple[bytes, bytes | None]]) -> bytes:
+    """Write ``records`` and flush them out as exactly one SSTable."""
+    before = len(engine.sstables)
+    filler = freeze_as_one_table(engine, records)
+    engine.flush_pending()
+    assert len(engine.sstables) == before + 1, "the batch did not come out as exactly one table"
+    return filler
+
+
+def key_rejected_by_every_bloom_filter(engine: LedgerLog) -> bytes:
+    """A key no tracked table's bloom filter accepts, for the skipping test.
+
+    Searched for rather than picked, because a bloom filter is allowed false
+    positives: a hard-coded absent key could collide in one table and turn a
+    correct read path into a failing test on some future change to the hashing.
+    """
+    for index in range(10_000):
+        candidate = f"absent{index:05d}".encode()
+        if all(not handle.bloom_filter.might_contain(candidate) for handle in engine.sstables):
+            return candidate
+    raise AssertionError("every candidate key collided in some bloom filter")
+
+
+def test_a_newer_table_shadows_an_older_tables_value(tmp_path: Path) -> None:
+    with layered_engine(tmp_path / "data") as engine:
+        flush_as_one_table(engine, [(b"shared", b"old")])
+        flush_as_one_table(engine, [(b"shared", b"new")])
+
+        assert len(engine.sstables) == 2
+        oldest, newest = sstable_paths(engine)
+        assert (b"shared", b"old") in sstable_records(oldest), "the old value is not on disk"
+        assert (b"shared", b"new") in sstable_records(newest), "the new value is not on disk"
+        assert engine.get(b"shared") == b"new"
+
+
+def test_the_newest_of_several_tables_holding_a_key_wins(tmp_path: Path) -> None:
+    """Three tables deep, so that "wins" cannot mean "the first or the last one tried"."""
+    with layered_engine(tmp_path / "data") as engine:
+        for generation in range(3):
+            flush_as_one_table(engine, [(b"shared", f"v{generation}".encode())])
+
+        assert [handle.sequence for handle in engine.sstables] == [2, 1, 0]
+        assert engine.get(b"shared") == b"v2"
+
+
+def test_a_tombstone_in_a_newer_table_hides_an_older_tables_value(tmp_path: Path) -> None:
+    with layered_engine(tmp_path / "data") as engine:
+        flush_as_one_table(engine, [(b"gone", b"value")])
+        flush_as_one_table(engine, [(b"gone", None)])
+
+        oldest, newest = sstable_paths(engine)
+        assert (b"gone", b"value") in sstable_records(oldest), "the value never reached disk"
+        assert (b"gone", None) in sstable_records(newest), "the delete did not write a tombstone"
+        assert engine.get(b"gone") is None
+
+
+def test_a_value_written_after_a_tombstone_on_disk_is_visible_again(tmp_path: Path) -> None:
+    """A tombstone shadows what is older than it and nothing newer."""
+    with layered_engine(tmp_path / "data") as engine:
+        flush_as_one_table(engine, [(b"key", b"first")])
+        flush_as_one_table(engine, [(b"key", None)])
+        flush_as_one_table(engine, [(b"key", b"second")])
+
+        assert engine.get(b"key") == b"second"
+
+
+def test_the_oldest_table_answers_for_a_key_nothing_newer_holds(tmp_path: Path) -> None:
+    """The walk does not stop at the newest table, only at the newest record."""
+    with layered_engine(tmp_path / "data") as engine:
+        for index in range(4):
+            flush_as_one_table(engine, [(f"key{index}".encode(), f"value{index}".encode())])
+
+        for index in range(4):
+            assert engine.get(f"key{index}".encode()) == f"value{index}".encode()
+
+
+def test_an_empty_value_on_disk_reads_back_as_an_empty_value(tmp_path: Path) -> None:
+    """A tombstone and an empty value stay different all the way through the table."""
+    with layered_engine(tmp_path / "data") as engine:
+        flush_as_one_table(engine, [(b"empty", b"")])
+
+        assert engine.get(b"empty") == b""
+
+
+def test_a_key_in_the_active_memtable_is_answered_without_consulting_an_sstable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with layered_engine(tmp_path / "data") as engine:
+        flush_as_one_table(engine, [(b"shared", b"on-disk")])
+        engine.put(b"shared", b"in-memory")
+        assert engine.sstables, "there is no table to skip, so this test proves nothing"
+
+        probes = count_bloom_probes(monkeypatch)
+        reads = count_data_block_lookups(monkeypatch)
+
+        assert engine.get(b"shared") == b"in-memory"
+        assert probes.calls == 0, "a bloom filter was consulted for a key already in memory"
+        assert reads.calls == 0, "a table was opened for a key already in memory"
+
+
+def test_a_key_in_a_frozen_memtable_is_answered_without_consulting_an_sstable(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    with layered_engine(tmp_path / "data") as engine:
+        flush_as_one_table(engine, [(b"shared", b"on-disk")])
+        freeze_as_one_table(engine, [(b"shared", b"frozen")])
+        assert engine.frozen_memtables, "nothing was frozen, so this test proves nothing"
+        assert engine.sstables, "there is no table to skip, so this test proves nothing"
+
+        probes = count_bloom_probes(monkeypatch)
+        reads = count_data_block_lookups(monkeypatch)
+
+        assert engine.get(b"shared") == b"frozen"
+        assert probes.calls == 0, "a bloom filter was consulted for a key already in memory"
+        assert reads.calls == 0, "a table was opened for a key already in memory"
+
+
+def test_a_tombstone_in_the_memtable_hides_a_value_on_disk(tmp_path: Path) -> None:
+    with layered_engine(tmp_path / "data") as engine:
+        flush_as_one_table(engine, [(b"gone", b"value")])
+        engine.delete(b"gone")
+
+        assert (b"gone", b"value") in sstable_records(sstable_paths(engine)[0])
+        assert engine.get(b"gone") is None
+
+
+def test_a_key_no_table_holds_is_not_looked_up_in_any_data_block(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Criterion 4: a bloom negative has to stop the read before the table is opened."""
+    with layered_engine(tmp_path / "data") as engine:
+        for index in range(6):
+            flush_as_one_table(engine, [(f"key{index:02d}".encode(), b"value")])
+        assert len(engine.sstables) == 6
+
+        absent = key_rejected_by_every_bloom_filter(engine)
+        probes = count_bloom_probes(monkeypatch)
+        reads = count_data_block_lookups(monkeypatch)
+
+        assert engine.get(absent) is None
+        assert reads.calls == 0, "a table was opened for a key its bloom filter had rejected"
+        assert probes.calls == len(engine.sstables), "a table was passed over without being asked"
+
+
+def test_only_the_tables_whose_bloom_filter_accepts_the_key_are_opened(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same criterion for a key that is found, in the oldest table of several.
+
+    Every newer table has to be considered and, unless its filter collides, not
+    opened. The expected count is computed from the filters themselves rather
+    than assumed to be zero, so a false positive makes this test slower and not
+    wrong.
+    """
+    with layered_engine(tmp_path / "data") as engine:
+        flush_as_one_table(engine, [(b"wanted", b"value")])
+        for index in range(5):
+            flush_as_one_table(engine, [(f"other{index:02d}".encode(), b"value")])
+
+        newer = engine.sstables[:-1]
+        accepting = [handle for handle in newer if handle.bloom_filter.might_contain(b"wanted")]
+        assert len(accepting) < len(newer), "no table was skipped, so this test proves nothing"
+
+        probes = count_bloom_probes(monkeypatch)
+        reads = count_data_block_lookups(monkeypatch)
+
+        assert engine.get(b"wanted") == b"value"
+        assert reads.calls == len(accepting) + 1, "a table was opened that no filter had accepted"
+        assert probes.calls == len(engine.sstables), "a table was passed over without being asked"
+
+
+def test_a_reopened_engine_reads_a_flushed_key_out_of_the_log(tmp_path: Path) -> None:
+    """The tables of an earlier run are not discovered yet, and no key is lost to that.
+
+    Startup discovery is story M9.1. Until it lands, a reopened engine tracks no
+    tables and answers from the replayed log instead, which is why the flush does
+    not trim it. Pinned here so that M9.1 changing where these answers come from
+    is a visible change rather than a silent one.
+    """
+    directory = tmp_path / "data"
+    with layered_engine(directory) as engine:
+        flush_as_one_table(engine, [(b"key", b"value")])
+        assert engine.sstables
+
+    with layered_engine(directory) as reopened:
+        assert reopened.sstables == ()
+        assert reopened.get(b"key") == b"value"
+
+
+def test_a_flush_that_lands_mid_read_does_not_hide_the_key_it_moved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The walk order's claim, arranged rather than raced for.
+
+    The hazard is a read that takes its snapshot of the table list before it
+    walks the frozen memtables: a flush landing in between drops the memtable
+    the walk was about to find the key in and publishes a table that the read's
+    own snapshot predates, so the key is in neither and reads as absent although
+    nothing ever deleted it. The window is a few instructions wide, which is why
+    this test arranges it instead of hoping for it: the flush is run from inside
+    the first step of the very read being tested, which puts a whole flush
+    between that read's first step and its second.
+
+    ``engine._memtable`` on purpose: the active table is the read's first step
+    and it has no public accessor, and where in a read the flush lands is the
+    whole point.
+    """
+    with layered_engine(tmp_path / "data") as engine:
+        freeze_as_one_table(engine, [(b"moved", b"value")])
+        assert engine.frozen_memtables, "nothing was frozen, so there is nothing to move"
+        assert not engine.sstables, "the key is already on disk, so the window never opens"
+
+        real_lookup = Memtable.lookup
+        flushed = False
+
+        def lookup_then_flush(self: Memtable, key: bytes) -> MemtableEntry | None:
+            nonlocal flushed
+            entry = real_lookup(self, key)
+            if not flushed and self is engine._memtable:
+                flushed = True
+                engine.flush_pending()
+            return entry
+
+        monkeypatch.setattr(Memtable, "lookup", lookup_then_flush)
+
+        assert engine.get(b"moved") == b"value"
+        assert flushed, "the flush never ran, so the window was never opened"
+        assert engine.sstables, "the flush committed no table"
+        assert not engine.frozen_memtables, "the flush did not drop the memtable it wrote"
+
+
+def test_a_reader_never_misses_a_key_while_the_engine_flushes(tmp_path: Path) -> None:
+    """The same claim under real threads and a real background flush.
+
+    A flush publishes its table into the list and then drops the frozen memtable
+    it was written from, so a get that walks the frozen memtables and only then
+    reads the list sees every key in one layer or the other, and at the changeover
+    in both. The readers only ask for keys the writer has already acknowledged, so
+    a miss here is never a read that simply arrived early.
+
+    This is a stress test and it samples the window rather than pinning it, which
+    is why the test above arranges the same case deterministically. What this one
+    adds is everything a contrived read cannot: many readers, a writer and the
+    engine's own flush thread all crossing each other, with no reader holding a
+    lock.
+    """
+    keys = [f"key{index:04d}".encode() for index in range(400)]
+    misses: list[bytes] = []
+    errors: list[BaseException] = []
+    stop = threading.Event()
+    written = 0
+
+    with LedgerLog(
+        tmp_path / "data", fsync_policy=FsyncPolicy.NEVER, memtable_threshold_bytes=400
+    ) as engine:
+
+        def write() -> None:
+            nonlocal written
+            try:
+                for index, key in enumerate(keys):
+                    engine.put(key, b"value")
+                    written = index + 1
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                stop.set()
+
+        def read() -> None:
+            try:
+                while not stop.is_set():
+                    # Every acknowledged key, not just the newest ones: a sweep
+                    # that walks the whole table list keeps a read in flight for
+                    # long enough to overlap the publish-and-drop it has to
+                    # survive, which reading only the tail does not.
+                    for key in keys[:written]:
+                        if engine.get(key) != b"value":
+                            misses.append(key)
+            except BaseException as error:
+                errors.append(error)
+
+        writer = threading.Thread(target=write, daemon=True)
+        readers = [threading.Thread(target=read, daemon=True) for _ in range(6)]
+        writer.start()
+        for thread in readers:
+            thread.start()
+        writer.join(timeout=120)
+        for thread in readers:
+            thread.join(timeout=120)
+
+        assert not errors, f"a thread raised: {errors[0]!r}"
+        assert not writer.is_alive(), "the writer thread did not finish"
+        assert all(not thread.is_alive() for thread in readers), "a reader thread did not finish"
+        assert not misses, f"{misses[0]!r} read as absent while the engine was flushing"
+        assert engine.wait_for_flush(timeout=120), "the background flush never drained"
+        assert engine.flush_error is None
+        assert engine.flush_count > 1, "the run never exercised a repeated flush"
+        for key in keys:
+            assert engine.get(key) == b"value", f"{key!r} was lost across the flushes"
