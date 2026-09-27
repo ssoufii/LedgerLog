@@ -1,10 +1,36 @@
-"""Tests for size-tier grouping and the compaction trigger, story M8.1.
+"""Tests for size-tier grouping and the tier merge, stories M8.1 and M8.2.
 
-The story's claims are about metadata, so these tests need no files, no engine and
-no threads: a table, to this planner, is an age and a size, and the stand-in below
-is exactly that. The engine side of the story, that a table arriving from a flush
+M8.1's claims are about metadata, so those tests need no files, no engine and no
+threads: a table, to the planner, is an age and a size, and the stand-in below is
+exactly that. The engine side of that story, that a table arriving from a flush
 re-tiers what the engine holds, is tested against the real engine in
 ``test_engine.py``, where a real flush can produce the table.
+
+M8.2's claims are about bytes, so the second half of this file writes real tables
+and reads the merged one back. It splits the same way the code does: the newest
+wins rule is checked over in-memory streams, against expectations computed by hand
+and against a reference implementation over random inputs, and the file level
+merge is then checked for the things only a file can be wrong about (a valid
+table with every section, sources left untouched, nothing left behind when a
+damaged source stops the merge partway).
+
+What could pass a loose reading of M8.2 while being false:
+
+* Newest wins can be satisfied by accident when the newest table happens to hold
+  every key. The tables below shadow each other in both directions, and some keys
+  live only in the oldest table, so a merge that simply preferred one table would
+  fail.
+* "Merged output is a valid SSTable" can be read as "the file exists". It is
+  checked by reading it back through the real reader, by iterating its data block
+  to confirm the key order on disk, by counting its sparse index entries, and by
+  asking the bloom filter it carries for every key the table holds.
+* A merge that loaded both sources into a dict would pass every correctness test
+  here and still be unable to merge a tier larger than memory, which is the case
+  compaction exists for. Pinned by counting how many records a merge pulls before
+  it yields its first pair.
+* Tombstones are the one thing a merge must keep for now (dropping them is M8.3),
+  and a merge that dropped them would look tidier and resurrect deleted keys.
+  Checked in the merged output on disk, not just in the stream.
 
 What could pass inspection while being false, and how each is pinned here:
 
@@ -33,8 +59,13 @@ neither of which a fixed example set reliably lands on.
 from __future__ import annotations
 
 import math
+import os
 import random
+import struct
+import threading
+from collections.abc import Iterator, Sequence
 from dataclasses import FrozenInstanceError, dataclass
+from pathlib import Path
 
 import pytest
 from hypothesis import given, settings
@@ -46,8 +77,29 @@ from ledgerlog.compaction import (
     CompactionPlan,
     CompactionPolicy,
     CompactionTier,
+    MergeableTable,
+    MergeSourceOrderError,
     SizedTable,
+    merge_records,
+    merge_sstables,
+    merge_tier,
     plan_compaction,
+)
+from ledgerlog.sstable import (
+    FILE_HEADER_SIZE,
+    FOOTER_SIZE,
+    SSTableFooter,
+    SSTableIncompleteError,
+    SSTableReader,
+    SSTableRecord,
+    SSTableStatus,
+    SSTableTruncatedRecordError,
+    SSTableUnsupportedVersionError,
+    inspect_sstable,
+    iter_records,
+    read_bloom_filter,
+    read_footer,
+    write_sstable,
 )
 
 
@@ -530,3 +582,683 @@ def test_anything_with_a_sequence_and_a_size_is_a_sized_table() -> None:
     """The protocol is structural on purpose: the planner must not need the engine."""
     assert isinstance(StubTable(sequence=0, size_bytes=1), SizedTable)
     assert not isinstance(object(), SizedTable)
+
+
+# ---------------------------------------------------------------------------
+# The merge, story M8.2: newest wins over sorted streams, with no files yet.
+# ---------------------------------------------------------------------------
+
+Pair = tuple[bytes, bytes | None]
+
+
+def stream(*pairs: Pair) -> Iterator[SSTableRecord]:
+    """One source's records, in the order an SSTable's data block holds them.
+
+    The offsets are made up and ascending, because a record read from a real table
+    carries the span of the file it came from and the merge must not care: the
+    merged table's offsets are the writer's, and a merge that passed a source's
+    offsets through would be describing the wrong file.
+    """
+    return iter(
+        [
+            SSTableRecord(key=key, value=value, offset=index * 100, end_offset=index * 100 + 100)
+            for index, (key, value) in enumerate(pairs)
+        ]
+    )
+
+
+def counted(pairs: Sequence[Pair], counter: list[int], rank: int) -> Iterator[SSTableRecord]:
+    """A source stream that records how many of its records have been pulled."""
+    for record in stream(*pairs):
+        counter[rank] += 1
+        yield record
+
+
+def test_a_key_in_several_sources_takes_the_newest_sources_value() -> None:
+    """The story's first criterion, over sources that shadow each other both ways.
+
+    ``b"shared"`` is in all three tables and only the newest value may survive;
+    ``b"middle"`` is in the two older ones, so the winner is not simply the newest
+    table; ``b"oldest"`` is only in the oldest table and must not be lost.
+    """
+    newest = stream((b"apple", b"n1"), (b"shared", b"n2"))
+    middle = stream((b"middle", b"m1"), (b"shared", b"m2"))
+    oldest = stream((b"middle", b"o1"), (b"oldest", b"o2"), (b"shared", b"o3"))
+
+    assert list(merge_records([newest, middle, oldest])) == [
+        (b"apple", b"n1"),
+        (b"middle", b"m1"),
+        (b"oldest", b"o2"),
+        (b"shared", b"n2"),
+    ]
+
+
+def test_a_newer_tombstone_shadows_an_older_value_and_is_kept() -> None:
+    """A tombstone wins its key like any other record, and stays in the output.
+
+    Dropping it is only safe once no older table outside the merge can hold the
+    key, which is story M8.3. A merge that dropped it here would let the older
+    value below resurface, which is the resurrection ARCHITECTURE.md section 4
+    warns about.
+    """
+    newest = stream((b"gone", None))
+    oldest = stream((b"gone", b"value"))
+
+    assert list(merge_records([newest, oldest])) == [(b"gone", None)]
+
+
+def test_a_newer_value_shadows_an_older_tombstone() -> None:
+    """A key deleted and then written again is present, with the newer value."""
+    newest = stream((b"back", b"again"))
+    oldest = stream((b"back", None))
+
+    assert list(merge_records([newest, oldest])) == [(b"back", b"again")]
+
+
+def test_sources_with_no_keys_in_common_interleave_into_one_sorted_run() -> None:
+    newest = stream((b"a", b"1"), (b"d", b"4"))
+    oldest = stream((b"b", b"2"), (b"c", b"3"), (b"e", b"5"))
+
+    assert list(merge_records([newest, oldest])) == [
+        (b"a", b"1"),
+        (b"b", b"2"),
+        (b"c", b"3"),
+        (b"d", b"4"),
+        (b"e", b"5"),
+    ]
+
+
+def test_one_source_merges_to_its_own_records() -> None:
+    pairs: list[Pair] = [(b"a", b"1"), (b"b", None), (b"c", b"3")]
+
+    assert list(merge_records([stream(*pairs)])) == pairs
+
+
+def test_merging_nothing_yields_nothing() -> None:
+    assert list(merge_records([])) == []
+    assert list(merge_records([stream(), stream()])) == []
+
+
+def test_an_empty_source_beside_a_full_one_changes_nothing() -> None:
+    assert list(merge_records([stream(), stream((b"a", b"1"))])) == [(b"a", b"1")]
+
+
+def test_the_merge_holds_one_record_per_source_rather_than_reading_them_in() -> None:
+    """The claim that makes a merge usable on a tier larger than memory.
+
+    A merge that loaded its sources would pull every record before yielding
+    anything, and would pass every other test in this file. After one pair has
+    been taken, each source may have been pulled at most twice: once to seed the
+    heap, and once more for the source the pair came from.
+    """
+    pulled = [0, 0]
+    long_run: list[Pair] = [(bytes([index]), b"v") for index in range(1, 50)]
+    merged = merge_records(
+        [counted(long_run, pulled, 0), counted(long_run, pulled, 1)],
+    )
+
+    first = next(merged)
+
+    assert first == (b"\x01", b"v")
+    assert pulled == [2, 2]
+
+
+def test_a_source_whose_keys_do_not_ascend_is_refused_by_name() -> None:
+    """A sorted run is what a source is, and the merge says which one was not.
+
+    Re-sorting it would mean deciding which of two values for one key the table
+    meant to be newer, which is information the file no longer carries.
+    """
+    merged = merge_records(
+        [stream((b"b", b"1"), (b"a", b"2"))],
+        source_names=["sstable-0000000007.sst"],
+    )
+
+    with pytest.raises(MergeSourceOrderError, match="sstable-0000000007.sst"):
+        list(merged)
+
+
+def test_a_source_that_repeats_a_key_is_refused() -> None:
+    """Strictly ascending, not merely non-descending: one table, one record per key."""
+    with pytest.raises(MergeSourceOrderError, match="ascending"):
+        list(merge_records([stream((b"a", b"1"), (b"a", b"2"))]))
+
+
+def test_an_unsorted_source_is_named_by_index_when_no_names_were_given() -> None:
+    with pytest.raises(MergeSourceOrderError, match="index 1"):
+        list(merge_records([stream((b"a", b"1")), stream((b"z", b"1"), (b"b", b"2"))]))
+
+
+def test_a_name_per_source_is_required_when_names_are_given() -> None:
+    with pytest.raises(ValueError, match="source names"):
+        merge_records([stream(), stream()], source_names=["only-one"])
+
+
+@settings(max_examples=200, deadline=None)
+@given(
+    st.lists(
+        st.dictionaries(
+            keys=st.binary(min_size=1, max_size=3),
+            values=st.one_of(st.none(), st.binary(max_size=3)),
+            max_size=8,
+        ),
+        max_size=4,
+    )
+)
+def test_the_merge_matches_a_reference_newest_wins_computation(
+    sources: list[dict[bytes, bytes | None]],
+) -> None:
+    """The rule, checked against the obvious slow implementation over random input.
+
+    The reference loads everything into one dict, oldest source first so that
+    newer writes overwrite older ones, and sorts at the end. That is what the
+    streaming merge must agree with on every input, including the shapes a fixed
+    example set does not reach: sources of very different lengths, keys that are
+    prefixes of each other, and a key held by every source.
+    """
+    streams = [stream(*sorted(source.items())) for source in sources]
+    reference: dict[bytes, bytes | None] = {}
+    for source in reversed(sources):
+        reference.update(source)
+
+    assert list(merge_records(streams)) == sorted(reference.items())
+
+
+# ---------------------------------------------------------------------------
+# The merge against real files: a valid table out, sources untouched.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class StubMergeTable:
+    """An age, a size and a path, which is all :func:`merge_tier` is allowed to need.
+
+    Deliberately not :class:`~ledgerlog.engine.SSTableHandle`: the merge is meant
+    to be usable without the engine (CLAUDE.md), so the tier it is handed here is
+    built from a stand-in that satisfies the protocol and nothing else.
+    """
+
+    sequence: int
+    size_bytes: int
+    path: Path
+
+
+def write_table(path: Path, pairs: Sequence[Pair], *, index_interval: int = 64) -> Path:
+    """Write one real SSTable holding ``pairs``, which must be in ascending key order."""
+    write_sstable(path, pairs, index_interval=index_interval, expected_keys=len(pairs))
+    return path
+
+
+def table_records(path: Path) -> list[Pair]:
+    """Every record in the table's data block, in the order the bytes hold them.
+
+    Read by walking the block rather than by looking keys up, so that the merged
+    table's ordering on disk is asserted rather than assumed: a reader's binary
+    search would find a key in an unsorted table often enough to hide the bug.
+    """
+    with open(path, "rb") as handle:
+        footer = read_footer(handle)
+        return [
+            (record.key, record.value)
+            for record in iter_records(
+                handle,
+                start_offset=footer.data_block_offset,
+                end_offset=footer.data_block_end,
+            )
+        ]
+
+
+def tier_of(paths: Sequence[Path]) -> CompactionTier[StubMergeTable]:
+    """A tier holding ``paths``, newest first, as :attr:`CompactionTier.tables` requires."""
+    return CompactionTier(
+        tables=tuple(
+            StubMergeTable(
+                sequence=len(paths) - index,
+                size_bytes=path.stat().st_size,
+                path=path,
+            )
+            for index, path in enumerate(paths)
+        ),
+        ready=True,
+    )
+
+
+def three_shadowing_tables(directory: Path) -> tuple[list[Path], list[Pair]]:
+    """Three real tables that shadow each other, and the newest-wins result by hand.
+
+    Written oldest to newest so the ages in the filenames read the way the engine's
+    do, and returned newest first, which is the order a merge takes.
+    """
+    oldest = write_table(
+        directory / "oldest.sst",
+        [(b"k1", b"old-1"), (b"k2", b"old-2"), (b"k3", b"old-3"), (b"k9", b"old-9")],
+    )
+    middle = write_table(
+        directory / "middle.sst",
+        [(b"k2", b"mid-2"), (b"k4", b"mid-4"), (b"k9", None)],
+    )
+    newest = write_table(
+        directory / "newest.sst",
+        [(b"k1", b"new-1"), (b"k5", b"new-5")],
+    )
+    expected: list[Pair] = [
+        (b"k1", b"new-1"),
+        (b"k2", b"mid-2"),
+        (b"k3", b"old-3"),
+        (b"k4", b"mid-4"),
+        (b"k5", b"new-5"),
+        (b"k9", None),
+    ]
+    return [newest, middle, oldest], expected
+
+
+def test_the_merged_table_holds_the_newest_write_of_every_key(tmp_path: Path) -> None:
+    """The story's merge correctness criterion, against a hand-computed expectation."""
+    sources, expected = three_shadowing_tables(tmp_path)
+
+    layout = merge_sstables(sources, tmp_path / "merged.sst")
+
+    assert layout.path == tmp_path / "merged.sst"
+    assert layout.record_count == len(expected)
+    assert table_records(layout.path) == expected
+
+
+def test_the_merged_table_is_a_valid_sstable_with_every_section(tmp_path: Path) -> None:
+    """Valid as the rest of the codebase judges validity, not merely present on disk.
+
+    The sparse index is checked by count (one entry per ``index_interval``
+    records, starting at the first) and by using it: every key is looked up
+    through the real reader, which finds a record only by binary searching that
+    index and scanning forward from it. The bloom filter is read back out of the
+    file rather than taken from the layout, so the section the footer points at is
+    what gets asked.
+    """
+    pairs: list[Pair] = [(f"key-{index:04d}".encode(), b"v") for index in range(120)]
+    first = write_table(tmp_path / "first.sst", pairs[::2])
+    second = write_table(tmp_path / "second.sst", pairs[1::2])
+
+    layout = merge_sstables([first, second], tmp_path / "merged.sst", index_interval=16)
+
+    assert inspect_sstable(layout.path).status is SSTableStatus.VALID
+    assert layout.record_count == len(pairs)
+    assert len(layout.index) == math.ceil(len(pairs) / 16)
+    with open(layout.path, "rb") as handle:
+        footer = read_footer(handle)
+        bloom = read_bloom_filter(handle, footer)
+    assert all(bloom.might_contain(key) for key, _ in pairs)
+    with SSTableReader.open(layout.path) as reader:
+        assert reader.record_count == len(pairs)
+        assert all(reader.lookup(key) is not None for key, _ in pairs)
+
+
+def test_tombstones_survive_the_merge_as_tombstones(tmp_path: Path) -> None:
+    """On disk, not just in the stream: a reader must see the delete, not a miss.
+
+    A merge that dropped the tombstone would make ``get`` on that key fall through
+    to any older table beyond this merge, which is the resurrection M8.3 exists to
+    make safe. Until then the tombstone stays.
+    """
+    newer = write_table(tmp_path / "newer.sst", [(b"deleted", None)])
+    older = write_table(tmp_path / "older.sst", [(b"deleted", b"value"), (b"kept", b"value")])
+
+    layout = merge_sstables([newer, older], tmp_path / "merged.sst")
+
+    with SSTableReader.open(layout.path) as reader:
+        deleted = reader.lookup(b"deleted")
+        kept = reader.lookup(b"kept")
+    assert deleted is not None and deleted.is_tombstone
+    assert kept is not None and kept.value == b"value"
+
+
+def test_the_merged_table_can_be_merged_again(tmp_path: Path) -> None:
+    """The output is an ordinary table, which is what bounds write amplification.
+
+    A record passes through one merge per tier, so a merged table has to be a
+    legal source for the next merge up. Merging the merged table with a newer one
+    also checks the output's records are framed exactly as a flush's are, since
+    the second merge reads them back through the normal record path.
+    """
+    sources, expected = three_shadowing_tables(tmp_path)
+    first_pass = merge_sstables(sources, tmp_path / "merged-1.sst")
+    newer = write_table(tmp_path / "newer.sst", [(b"k3", b"newer-3")])
+
+    second_pass = merge_sstables([newer, first_pass.path], tmp_path / "merged-2.sst")
+
+    assert table_records(second_pass.path) == [
+        (key, b"newer-3" if key == b"k3" else value) for key, value in expected
+    ]
+
+
+def test_the_sources_are_left_exactly_as_they_were(tmp_path: Path) -> None:
+    """A merge reads its sources and nothing else, which is what M8.5 rests on.
+
+    Deleting a source is M8.5's decision and it can only be made once the merged
+    table is on disk and valid. A merge that truncated or rewrote a source would
+    leave nothing for a crash mid-compaction to recover from.
+    """
+    sources, _ = three_shadowing_tables(tmp_path)
+    before = {path: path.read_bytes() for path in sources}
+
+    merge_sstables(sources, tmp_path / "merged.sst")
+
+    assert {path: path.read_bytes() for path in sources} == before
+
+
+def test_a_merge_leaves_no_temporary_file_behind(tmp_path: Path) -> None:
+    sources, _ = three_shadowing_tables(tmp_path)
+
+    merge_sstables(sources, tmp_path / "merged.sst")
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "merged.sst",
+        "middle.sst",
+        "newest.sst",
+        "oldest.sst",
+    ]
+
+
+def test_merge_tier_reads_a_tier_newest_first(tmp_path: Path) -> None:
+    """The tier's own ordering is what decides which write wins.
+
+    Built with the sequence numbers descending across the tier, as
+    :class:`CompactionTier` requires, and with the newest table holding the
+    losing-looking value for one key so that a merge reading the tier backwards
+    would produce a different, detectably wrong table.
+    """
+    sources, expected = three_shadowing_tables(tmp_path)
+
+    layout = merge_tier(tier_of(sources), tmp_path / "merged.sst")
+
+    assert table_records(layout.path) == expected
+
+
+def test_merge_tier_merges_the_tier_the_plan_picked(tmp_path: Path) -> None:
+    """Plan then merge, the two halves of M8 as a caller will use them."""
+    paths = [
+        write_table(tmp_path / f"table-{index}.sst", [(f"k{index}".encode(), b"v")])
+        for index in range(DEFAULT_MIN_TIER_TABLES)
+    ]
+    tables = [
+        StubMergeTable(sequence=index, size_bytes=path.stat().st_size, path=path)
+        for index, path in enumerate(paths)
+    ]
+    plan = plan_compaction(tables)
+    next_tier = plan.next_tier
+    assert next_tier is not None
+
+    layout = merge_tier(next_tier, tmp_path / "merged.sst")
+
+    assert table_records(layout.path) == [
+        (f"k{index}".encode(), b"v") for index in range(len(paths))
+    ]
+
+
+def test_a_tier_below_the_threshold_still_merges(tmp_path: Path) -> None:
+    """Readiness is the caller's question. Merging two tables is correct, just cheap."""
+    newer = write_table(tmp_path / "newer.sst", [(b"k", b"new")])
+    older = write_table(tmp_path / "older.sst", [(b"k", b"old")])
+    tier = CompactionTier(
+        tables=(
+            StubMergeTable(sequence=1, size_bytes=newer.stat().st_size, path=newer),
+            StubMergeTable(sequence=0, size_bytes=older.stat().st_size, path=older),
+        ),
+        ready=False,
+    )
+
+    layout = merge_tier(tier, tmp_path / "merged.sst")
+
+    assert table_records(layout.path) == [(b"k", b"new")]
+
+
+def test_a_table_with_a_path_satisfies_the_mergeable_protocol() -> None:
+    """Structural, so that a merge needs no engine type and a tier needs no file."""
+    with_path = StubMergeTable(sequence=0, size_bytes=1, path=Path("x.sst"))
+
+    assert isinstance(with_path, MergeableTable)
+    assert isinstance(with_path, SizedTable)
+    assert not isinstance(StubTable(sequence=0, size_bytes=1), MergeableTable)
+
+
+# ---------------------------------------------------------------------------
+# A merge that cannot finish: damaged sources, and what is left behind.
+# ---------------------------------------------------------------------------
+
+
+def test_a_source_without_a_footer_stops_the_merge(tmp_path: Path) -> None:
+    """A file with no footer is not a table, and a merge must not guess at its records.
+
+    This is what an interrupted flush leaves. Discovery discards it and the WAL
+    covers its writes (ARCHITECTURE.md section 6), so a merge that read it would
+    be merging records nothing has committed.
+    """
+    good = write_table(tmp_path / "good.sst", [(b"k", b"v")])
+    partial = write_table(tmp_path / "partial.sst", [(b"k2", b"v2")])
+    with open(partial, "r+b") as handle:
+        handle.truncate(FILE_HEADER_SIZE + 4)
+
+    with pytest.raises(SSTableIncompleteError):
+        merge_sstables([good, partial], tmp_path / "merged.sst")
+
+    assert not (tmp_path / "merged.sst").exists()
+
+
+def test_a_source_claiming_a_record_longer_than_its_block_stops_the_merge(
+    tmp_path: Path,
+) -> None:
+    """A length off a damaged disk is measured before it is used, not allocated from.
+
+    The length prefix of the first record is rewritten to claim a megabyte inside
+    a data block holding a few bytes. The merge has to refuse it rather than read
+    past the block into the index, or size an allocation from a number no writer
+    wrote.
+    """
+    good = write_table(tmp_path / "good.sst", [(b"k", b"v")])
+    damaged = write_table(tmp_path / "damaged.sst", [(b"k2", b"v2")])
+    with open(damaged, "r+b") as handle:
+        handle.seek(FILE_HEADER_SIZE)
+        handle.write(struct.pack("<I", 1_000_000))
+
+    with pytest.raises(SSTableTruncatedRecordError):
+        merge_sstables([good, damaged], tmp_path / "merged.sst")
+
+    assert not (tmp_path / "merged.sst").exists()
+
+
+def test_a_source_in_an_unknown_format_version_is_refused(tmp_path: Path) -> None:
+    """Per CLAUDE.md: a layout this build does not know is reported, never guessed at."""
+    good = write_table(tmp_path / "good.sst", [(b"k", b"v")])
+    future = write_table(tmp_path / "future.sst", [(b"k2", b"v2")])
+    with open(future, "r+b") as handle:
+        handle.seek(FILE_HEADER_SIZE - 1)
+        handle.write(bytes([99]))
+
+    with pytest.raises(SSTableUnsupportedVersionError):
+        merge_sstables([good, future], tmp_path / "merged.sst")
+
+    assert not (tmp_path / "merged.sst").exists()
+
+
+def test_a_merge_that_fails_partway_leaves_no_partial_table_behind(tmp_path: Path) -> None:
+    """The failure has to happen after records have been written, not before.
+
+    The damaged record is the second one in its source, so the writer has already
+    taken a record and opened its temporary file when the merge raises. What must
+    not survive is a file at the destination name, which a later discovery pass
+    would load as a table, or a temporary file nobody owns any more.
+    """
+    good = write_table(tmp_path / "good.sst", [(b"a", b"v"), (b"b", b"v")])
+    damaged = write_table(tmp_path / "damaged.sst", [(b"c", b"v"), (b"d", b"v")])
+    with open(damaged, "rb") as handle:
+        footer = read_footer(handle)
+        records = list(
+            iter_records(
+                handle,
+                start_offset=footer.data_block_offset,
+                end_offset=footer.data_block_end,
+            )
+        )
+    with open(damaged, "r+b") as handle:
+        handle.seek(records[1].offset)
+        handle.write(struct.pack("<I", 1_000_000))
+
+    with pytest.raises(SSTableTruncatedRecordError):
+        merge_sstables([good, damaged], tmp_path / "merged.sst")
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["damaged.sst", "good.sst"]
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="counting open descriptors needs /proc",
+)
+def test_a_failed_merge_closes_every_source_it_opened(tmp_path: Path) -> None:
+    """Handles are released on the way out, whether the merge finished or raised.
+
+    A compaction pass that leaked one descriptor per source would run out within a
+    few tiers, and the leak would not show up in any correctness test. Counted
+    around both a successful merge and a failed one.
+    """
+    good = write_table(tmp_path / "good.sst", [(b"a", b"v")])
+    damaged = write_table(tmp_path / "damaged.sst", [(b"c", b"v")])
+    with open(damaged, "r+b") as handle:
+        handle.seek(FILE_HEADER_SIZE)
+        handle.write(struct.pack("<I", 1_000_000))
+
+    def open_descriptors() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    before = open_descriptors()
+    merge_sstables([good], tmp_path / "merged.sst")
+    after_success = open_descriptors()
+    with pytest.raises(SSTableTruncatedRecordError):
+        merge_sstables([good, damaged], tmp_path / "failed.sst")
+
+    assert after_success == before
+    assert open_descriptors() == before
+
+
+# ---------------------------------------------------------------------------
+# Arguments a merge refuses, because finishing one would destroy data.
+# ---------------------------------------------------------------------------
+
+
+def test_a_merge_needs_at_least_one_source(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="at least one source"):
+        merge_sstables([], tmp_path / "merged.sst")
+
+
+def test_the_same_source_cannot_be_listed_twice(tmp_path: Path) -> None:
+    """Two copies of one table give a key two writes with no way to age them."""
+    source = write_table(tmp_path / "source.sst", [(b"k", b"v")])
+
+    with pytest.raises(ValueError, match="listed twice"):
+        merge_sstables([source, source], tmp_path / "merged.sst")
+
+
+def test_the_destination_cannot_be_one_of_the_sources(tmp_path: Path) -> None:
+    """Finishing renames over the destination, which would be a source mid-read."""
+    first = write_table(tmp_path / "first.sst", [(b"k", b"v")])
+    second = write_table(tmp_path / "second.sst", [(b"k2", b"v2")])
+
+    with pytest.raises(ValueError, match="also a source"):
+        merge_sstables([first, second], first)
+
+    assert table_records(first) == [(b"k", b"v")]
+
+
+def test_an_existing_destination_is_refused_rather_than_replaced(tmp_path: Path) -> None:
+    """A merge names a new table. Renaming over a live one would discard it silently."""
+    source = write_table(tmp_path / "source.sst", [(b"k", b"v")])
+    occupied = write_table(tmp_path / "occupied.sst", [(b"other", b"value")])
+
+    with pytest.raises(ValueError, match="already exists"):
+        merge_sstables([source], occupied)
+
+    assert table_records(occupied) == [(b"other", b"value")]
+
+
+# ---------------------------------------------------------------------------
+# A merge alongside readers, since an SSTable is immutable and both may run.
+# ---------------------------------------------------------------------------
+
+
+def test_a_merge_does_not_disturb_readers_of_the_same_source_tables(tmp_path: Path) -> None:
+    """Real threads, because the claim is about handles and only threads can test it.
+
+    The merge opens each source itself instead of borrowing a reader's handle, so
+    a ``get`` being served from a source table while a compaction reads it must
+    see its own file position. If the two shared a cursor, the reads below would
+    return the wrong records or fail to decode, and the merged table would be
+    damaged too.
+    """
+    pairs: list[Pair] = [
+        (f"key-{index:04d}".encode(), f"v{index}".encode()) for index in range(200)
+    ]
+    newer = write_table(tmp_path / "newer.sst", pairs[100:])
+    older = write_table(tmp_path / "older.sst", pairs[:100])
+    start = threading.Barrier(3)
+    stop = threading.Event()
+    failures: list[BaseException] = []
+
+    def read_until_stopped(path: Path, expected: Sequence[Pair]) -> None:
+        try:
+            with SSTableReader.open(path) as reader:
+                start.wait(timeout=10)
+                while not stop.is_set():
+                    for key, value in expected:
+                        record = reader.lookup(key)
+                        assert record is not None and record.value == value
+        except BaseException as error:  # reported to the main thread, never swallowed
+            failures.append(error)
+
+    readers = [
+        threading.Thread(target=read_until_stopped, args=(newer, pairs[100:])),
+        threading.Thread(target=read_until_stopped, args=(older, pairs[:100])),
+    ]
+    for thread in readers:
+        thread.start()
+    try:
+        start.wait(timeout=10)
+        layout = merge_sstables([newer, older], tmp_path / "merged.sst")
+    finally:
+        stop.set()
+        for thread in readers:
+            thread.join(timeout=10)
+
+    assert failures == []
+    assert table_records(layout.path) == pairs
+
+
+def test_a_footer_claiming_impossibly_many_records_does_not_size_the_merge(
+    tmp_path: Path,
+) -> None:
+    """A count off a damaged disk must not become the size of an allocation.
+
+    The footer's record count is only checked for being non-negative when it is
+    read, and the merge uses it to size the output's bloom filter. Left unbounded,
+    the footer rewritten below (a valid checksum over a count of a trillion) would
+    ask the filter for more than a gigabyte of bits, or be refused outright by the
+    sizing formula, before a single record had been read. The data block's extent
+    bounds it instead, so the merge proceeds on the records that are really there.
+    """
+    good = write_table(tmp_path / "good.sst", [(b"k", b"v")])
+    lying = write_table(tmp_path / "lying.sst", [(b"k2", b"v2")])
+    with open(lying, "r+b") as handle:
+        footer = read_footer(handle)
+        handle.seek(lying.stat().st_size - FOOTER_SIZE)
+        handle.write(
+            SSTableFooter(
+                data_block_offset=footer.data_block_offset,
+                data_block_end=footer.data_block_end,
+                index_offset=footer.index_offset,
+                index_end=footer.index_end,
+                bloom_filter_offset=footer.bloom_filter_offset,
+                bloom_filter_end=footer.bloom_filter_end,
+                record_count=2**40,
+            ).encode()
+        )
+
+    layout = merge_sstables([good, lying], tmp_path / "merged.sst")
+
+    assert table_records(layout.path) == [(b"k", b"v"), (b"k2", b"v2")]
+    assert layout.bloom_filter.bit_count < 1024
