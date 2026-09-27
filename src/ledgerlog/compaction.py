@@ -1,18 +1,29 @@
 """Compaction: which SSTables belong together, and merging a group into one.
 
-Scope of this module today (stories M8.1 and M8.2): grouping the tables an engine
+Scope of this module today (stories M8.1 to M8.3): grouping the tables an engine
 holds into size tiers, saying which of those tiers has accumulated enough tables
-to be worth merging, and merging one of those tiers into a single new SSTable
-under newest write wins semantics. Planning takes a set of tables, each of which
+to be worth merging, merging one of those tiers into a single new SSTable under
+newest write wins semantics, and dropping from that merge the tombstones nothing
+older can still be hiding behind. Planning takes a set of tables, each of which
 knows its own age and its own size, and returns a plan: the tiers, and a flag per
 tier saying whether it is ready. Merging takes the tables of one tier and writes
 their records out once, deduplicated, keeping the newest write for each key.
 
-What is still not here: a merge drops nothing it is handed, so the tombstone rule
-(M8.3) and the expiry rule (M8.4) are yet to come, and nothing in this module
-deletes a source table or tells the engine to start reading the merged one, which
-is the atomic swap of M8.5. A merge today produces a new file and reports where it
-is, and that is all.
+The tombstone rule (M8.3, ARCHITECTURE.md section 4) is the one part of a merge
+that cannot be decided from the tier alone. A tombstone exists to hide older
+writes of its key, so it is dead weight once nothing older holds that key, and
+dropping it one merge too early resurrects a deleted key: a read would fall
+through to a value in some older table the merge never looked at. So a merge is
+told which tables lie outside it and are older than it, through
+``older_tables`` on :func:`merge_sstables` or ``other_tables`` on
+:func:`merge_tier`, and keeps exactly the tombstones those tables make necessary.
+A merge told nothing keeps every tombstone, because that is the only answer that
+is safe when what is outside the merge is unknown.
+
+What is still not here: the expiry rule (M8.4), and nothing in this module deletes
+a source table or tells the engine to start reading the merged one, which is the
+atomic swap of M8.5. A merge today produces a new file and reports where it is,
+and that is all.
 
 Why the planning is a separate, file-free step: what to compact is a policy
 decision made from metadata alone, and it is the part of compaction with the most
@@ -69,12 +80,13 @@ from __future__ import annotations
 import heapq
 import math
 import os
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Generic, Protocol, TypeVar, runtime_checkable
 
+from ledgerlog.bloom import BloomFilter
 from ledgerlog.sstable import (
     DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
     DEFAULT_INDEX_INTERVAL,
@@ -83,10 +95,12 @@ from ledgerlog.sstable import (
     SSTABLE_FORMAT_VERSION,
     SSTableFooter,
     SSTableLayout,
+    SSTableReader,
     SSTableRecord,
     SSTableUnsupportedVersionError,
     SSTableWriter,
     iter_records,
+    read_bloom_filter,
     read_file_header,
     read_footer,
 )
@@ -452,10 +466,134 @@ class MergeSourceOrderError(ValueError):
     """
 
 
+OlderValueProbe = Callable[[bytes], bool]
+"""Asked, for the key of a tombstone a merge is about to emit, whether to keep it.
+
+Returns true when some SSTable outside the merge, and older than it, still holds
+a live value for that key. That single answer is the whole of the tombstone rule
+in ARCHITECTURE.md section 4: a tombstone is only ever hiding older writes of its
+key, so it is dead weight once nothing older can surface, and dropping it while
+something older can surface would let a deleted key come back.
+
+A callable rather than a list of tables, so that :func:`merge_records` stays a
+rule over sorted streams with no notion of a file, testable against hand-written
+answers, and so that a caller which knows what is older by some other means (a
+manifest, a test's own bookkeeping) can answer without opening anything.
+:class:`OlderTableProbe` is this answer read off real tables.
+"""
+
+
+@dataclass(frozen=True)
+class OlderTable:
+    """One SSTable outside a merge and older than it, ready to be asked about a key.
+
+    Pairs a reader with the table's bloom filter, because the two answer the same
+    question at very different prices. Most keys a merge asks about are in no
+    given older table at all, and the filter settles those with a few hash probes
+    and no seek (ARCHITECTURE.md section 5); only a key the filter admits costs an
+    index search and a scan of one index interval. The filter may be ``None`` when
+    a caller has not loaded one, and then every question costs the lookup and
+    gets the same answer, slower.
+
+    The reader is borrowed, not owned. Closing it belongs to whoever opened it,
+    which for :func:`merge_sstables` is the stack that closes every handle the
+    merge opened, whatever way the merge ends.
+    """
+
+    reader: SSTableReader
+    bloom_filter: BloomFilter | None = None
+
+    def holds_value(self, key: bytes) -> bool:
+        """True if this table holds a live value, not a tombstone, for ``key``.
+
+        A tombstone here does not count, which is why the table itself is asked
+        and not just its filter (a filter cannot tell the two apart). If this
+        older table also says the key is deleted, then a read that falls through
+        the merged table reaches this tombstone and still answers not-found, so
+        the merge's own tombstone was not what kept the key deleted and may go.
+        What has to be kept is a tombstone standing over a value.
+
+        That stays true as these older tables are themselves compacted later,
+        because every merge applies this same rule to whatever is older than it:
+        the tombstone relied on here can only be dropped once nothing older holds
+        a value for the key either.
+        """
+        if self.bloom_filter is not None and not self.bloom_filter.might_contain(key):
+            return False
+        record = self.reader.lookup(key)
+        return record is not None and not record.is_tombstone
+
+
+class OlderTableProbe:
+    """An :data:`OlderValueProbe` that reads the answer off real SSTables.
+
+    Holds the tables outside a merge that are older than it and answers a key by
+    asking each in turn. Which one holds the value does not matter and no order
+    is imposed: the question is only whether any of them does.
+
+    A class rather than a closure so that the tables it consults can be read back
+    by a test. "The tombstone was kept because this table still holds the key"
+    and "the tombstone was kept because the merge dropped none" look identical in
+    the output file, and telling them apart is the difference between testing the
+    rule and testing nothing.
+    """
+
+    def __init__(self, tables: Iterable[OlderTable]) -> None:
+        self._tables = tuple(tables)
+
+    @property
+    def tables(self) -> tuple[OlderTable, ...]:
+        """The older tables this probe consults."""
+        return self._tables
+
+    def __call__(self, key: bytes) -> bool:
+        """True if any of the older tables still holds a value for ``key``."""
+        return any(table.holds_value(key) for table in self._tables)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}(tables={len(self._tables)})"
+
+
+def older_outside_tables(
+    tier: CompactionTier[MergeableTableT],
+    tables: Iterable[MergeableTableT],
+) -> tuple[MergeableTableT, ...]:
+    """Return the tables of ``tables`` that a merge of ``tier`` would leave older than it.
+
+    ``tables`` is meant to be everything the engine holds. Members of ``tier`` are
+    recognised by sequence number and left out, so a caller can pass its whole
+    table list rather than computing the difference itself and risking a table
+    counted as both inside and outside the merge. The result is newest first, the
+    order tiers and the engine's table list already use.
+
+    Older is measured against the tier's newest table, not its oldest. A tier
+    groups tables by size, so it is not necessarily a contiguous run of sequence
+    numbers, and a table outside the tier whose sequence falls between the tier's
+    oldest and newest is still older than at least one source of the merge. Its
+    values can therefore surface under a tombstone the merge emits, which makes it
+    one of the tables that tombstone is there to stop. Measuring from the tier's
+    oldest table would leave exactly those out, and leaving one out is a
+    resurrected key, so the wider bound is the correct one: it can only keep a
+    tombstone that was already safe to keep.
+    """
+    # A tier always holds at least one table, which CompactionTier enforces, so
+    # this maximum always has something to take.
+    tier_sequences = {table.sequence for table in tier.tables}
+    newest_in_tier = max(tier_sequences)
+    outside = [
+        table
+        for table in tables
+        if table.sequence not in tier_sequences and table.sequence < newest_in_tier
+    ]
+    outside.sort(key=lambda table: table.sequence, reverse=True)
+    return tuple(outside)
+
+
 def merge_records(
     streams: Sequence[Iterable[SSTableRecord]],
     *,
     source_names: Sequence[str] | None = None,
+    has_older_value: OlderValueProbe | None = None,
 ) -> Iterator[tuple[bytes, bytes | None]]:
     """Merge sorted record streams, newest first, into one sorted run of records.
 
@@ -471,12 +609,20 @@ def merge_records(
     those writes is live. Every older copy is dropped here, and dropping them is
     the space compaction reclaims.
 
-    A tombstone (a value of ``None``) wins its key like any other record and is
-    yielded like any other record. Dropping it would be a decision about tables
-    outside this merge, which this function cannot see and story M8.3 is where it
-    is made: an older table beyond the tier can still hold a value for that key,
-    and a merge that dropped the tombstone would let that value resurrect a
-    deleted key (ARCHITECTURE.md section 4).
+    A tombstone (a value of ``None``) wins its key like any other record. Whether
+    it is then yielded or dropped is ``has_older_value``'s to say, and dropping it
+    is how compaction reclaims the space a delete goes on costing
+    (ARCHITECTURE.md section 4). It is called with the winning key and returns
+    true when an SSTable outside this merge, older than it, still holds a value
+    for that key: the tombstone is what keeps that value hidden, so it is yielded.
+    It returns false when nothing older can surface, and the tombstone is dropped
+    along with the older copies of its key.
+
+    Left as ``None``, every tombstone is yielded. That is silence read safely
+    rather than a default worth having: a caller that has not said what lies
+    outside the merge may have older tables there, and a merge that assumed
+    otherwise would resurrect deleted keys. Callers that know pass a probe, and
+    :func:`merge_sstables` builds one from the tables it is told about.
 
     Pairs rather than :class:`~ledgerlog.sstable.SSTableRecord` objects, because
     the offsets a record carries describe the file it was read from and mean
@@ -502,12 +648,14 @@ def merge_records(
     return _merge_records(
         tuple(streams),
         tuple(source_names) if source_names is not None else None,
+        has_older_value,
     )
 
 
 def _merge_records(
     streams: tuple[Iterable[SSTableRecord], ...],
     source_names: tuple[str, ...] | None,
+    has_older_value: OlderValueProbe | None,
 ) -> Iterator[tuple[bytes, bytes | None]]:
     """Generator half of :func:`merge_records`, kept separate so its checks run eagerly."""
     cursors = [iter(stream) for stream in streams]
@@ -555,6 +703,13 @@ def _merge_records(
             _, shadowed_rank = heapq.heappop(heap)
             pending.pop(shadowed_rank)
             advance(shadowed_rank)
+        if winner.is_tombstone and has_older_value is not None and not has_older_value(key):
+            # A tombstone with nothing older left to hide. Dropped after the
+            # shadowed streams above were stepped past, not instead of stepping
+            # past them: the older copies of this key in this merge go either
+            # way, and skipping that would leave them to be emitted as if they
+            # were live.
+            continue
         yield winner.key, winner.value
 
 
@@ -562,6 +717,7 @@ def merge_sstables(
     sources: Sequence[str | os.PathLike[str]],
     destination: str | os.PathLike[str],
     *,
+    older_tables: Sequence[str | os.PathLike[str]] | None = None,
     index_interval: int = DEFAULT_INDEX_INTERVAL,
     bloom_false_positive_rate: float = DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
 ) -> SSTableLayout:
@@ -594,6 +750,25 @@ def merge_sstables(
     length nobody wrote or decoding the index as records. The bounds on each
     record are :func:`~ledgerlog.sstable.iter_records`' to enforce, for the same
     reason.
+
+    ``older_tables`` is what lets the tombstone rule of ARCHITECTURE.md section 4
+    run here. It lists the tables that will still be outside this merge and older
+    than it once the merge lands, and a tombstone whose key none of them holds a
+    value for is dropped from the output instead of being copied forward. Passing
+    an empty sequence states that there are no such tables, so every tombstone
+    that wins its key may go; leaving the argument out states nothing at all, and
+    then every tombstone is kept. The two are deliberately different: "I checked,
+    nothing older holds this key" and "nobody said" are different facts, and
+    collapsing them would make the unsafe reading the default. Which tables are
+    older is the caller's to decide, and :func:`older_outside_tables` is that
+    decision for a tier.
+
+    An older table is opened, validated and handled exactly as a source is, and
+    through a handle of its own for the same reasons, but it is never merged from
+    and never written to: the only thing taken from it is its answer to "do you
+    still hold a value for this key". It must not be one of the sources or the
+    destination, because a table inside the merge is not outside it, and asking
+    one would hold back every tombstone the merge could have dropped.
 
     ``destination`` must not exist and must not be one of the sources. The write
     ends in a rename over that path, which would replace an existing table rather
@@ -637,6 +812,28 @@ def merge_sstables(
             "over its destination, which would discard whatever is there"
         )
 
+    older_paths = [Path(older) for older in older_tables] if older_tables is not None else None
+    if older_paths is not None:
+        older_seen: dict[Path, Path] = {}
+        for older_path in older_paths:
+            resolved = older_path.resolve()
+            if resolved in seen:
+                raise ValueError(
+                    f"table {older_path} is both a source of the merge and listed as older than "
+                    "it, and a table inside a merge cannot also be outside it"
+                )
+            if resolved == destination_path.resolve():
+                raise ValueError(
+                    f"table {older_path} is the destination of the merge and cannot also be a "
+                    "table older than it"
+                )
+            if resolved in older_seen:
+                raise ValueError(
+                    f"table {older_path} is listed twice among the older tables (also as "
+                    f"{older_seen[resolved]}), so it would be consulted twice for every tombstone"
+                )
+            older_seen[resolved] = older_path
+
     with ExitStack() as stack:
         streams: list[Iterator[SSTableRecord]] = []
         expected_keys = 0
@@ -657,7 +854,27 @@ def merge_sstables(
                 )
             )
 
-        merged = merge_records(streams, source_names=[str(path) for path in source_paths])
+        probe: OlderValueProbe | None = None
+        if older_paths is not None:
+            outside: list[OlderTable] = []
+            for older_path in older_paths:
+                # Not owned by the reader: the stack closes it, so a probe built
+                # here cannot outlive the merge holding a descriptor open.
+                older_handle = stack.enter_context(open(older_path, "rb"))
+                older_reader = SSTableReader(older_handle, path=older_path)
+                outside.append(
+                    OlderTable(
+                        older_reader,
+                        read_bloom_filter(older_handle, older_reader.footer),
+                    )
+                )
+            probe = OlderTableProbe(outside)
+
+        merged = merge_records(
+            streams,
+            source_names=[str(path) for path in source_paths],
+            has_older_value=probe,
+        )
         with SSTableWriter(
             destination_path,
             index_interval=index_interval,
@@ -697,6 +914,7 @@ def merge_tier(
     tier: CompactionTier[MergeableTableT],
     destination: str | os.PathLike[str],
     *,
+    other_tables: Iterable[MergeableTableT] | None = None,
     index_interval: int = DEFAULT_INDEX_INTERVAL,
     bloom_false_positive_rate: float = DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
 ) -> SSTableLayout:
@@ -707,14 +925,28 @@ def merge_tier(
     tier lists them, which is newest first, so the resulting table holds the
     newest write of every key the tier held. The tier's files are left in place.
 
+    ``other_tables`` is every table the engine holds besides this tier, and it is
+    what allows tombstones to be dropped (story M8.3). The ones older than the
+    tier are picked out by :func:`older_outside_tables`, which is also what
+    ignores any tier member passed in here, so a caller can hand over its whole
+    table list. Omitting it keeps every tombstone, as it does on
+    :func:`merge_sstables`, and passing an empty sequence says the tier is all
+    there is, so nothing older can resurrect and every tombstone may go.
+
     Nothing checks that the tier is :attr:`~CompactionTier.ready`. Readiness says
     that merging the tier is worth the bytes it costs, which is a question for
     whoever decides to compact, and a merge of a tier below the threshold is
     correct, just not usually worth doing.
     """
+    older_paths = (
+        [table.path for table in older_outside_tables(tier, other_tables)]
+        if other_tables is not None
+        else None
+    )
     return merge_sstables(
         [table.path for table in tier.tables],
         destination,
+        older_tables=older_paths,
         index_interval=index_interval,
         bloom_false_positive_rate=bloom_false_positive_rate,
     )
