@@ -1,4 +1,4 @@
-"""Tests for size-tier grouping and the tier merge, stories M8.1 and M8.2.
+"""Tests for size-tier grouping, the tier merge and the tombstone rule: M8.1 to M8.3.
 
 M8.1's claims are about metadata, so those tests need no files, no engine and no
 threads: a table, to the planner, is an age and a size, and the stand-in below is
@@ -28,9 +28,29 @@ What could pass a loose reading of M8.2 while being false:
   here and still be unable to merge a tier larger than memory, which is the case
   compaction exists for. Pinned by counting how many records a merge pulls before
   it yields its first pair.
-* Tombstones are the one thing a merge must keep for now (dropping them is M8.3),
-  and a merge that dropped them would look tidier and resurrect deleted keys.
-  Checked in the merged output on disk, not just in the stream.
+* Tombstones are what a merge must keep unless it has been told what lies
+  outside it, and a merge that dropped them by default would look tidier and
+  resurrect deleted keys. Checked in the merged output on disk, not just in the
+  stream.
+
+What could pass a loose reading of M8.3 while being false, since "the tombstone
+was dropped" and "the tombstone was kept" are each satisfied by a merge that
+always does that one thing:
+
+* A merge that dropped every tombstone passes the drop criterion. So the same
+  two source tables are merged three ways below, changing only what is said to
+  lie outside the merge, and the three outputs are asserted to differ in exactly
+  the tombstones the rule predicts.
+* A merge that kept every tombstone passes the retain criterion, and is what the
+  code did before this story. Pinned by asserting the dropped key is absent from
+  the merged table's data block, not merely that the surviving ones are present.
+* "No older value outside the merge" can be read as "no older table outside the
+  merge", which would keep a tombstone forever behind any older table at all.
+  Tested with an older table that does not hold the key, and with one that holds
+  only a tombstone for it.
+* The point of retaining is that a read must not resurrect the key. That is
+  asserted as a read, walking the tables newest first the way the engine does,
+  rather than by inspecting the merged file alone.
 
 What could pass inspection while being false, and how each is pinned here:
 
@@ -79,15 +99,19 @@ from ledgerlog.compaction import (
     CompactionTier,
     MergeableTable,
     MergeSourceOrderError,
+    OlderTable,
+    OlderTableProbe,
     SizedTable,
     merge_records,
     merge_sstables,
     merge_tier,
+    older_outside_tables,
     plan_compaction,
 )
 from ledgerlog.sstable import (
     FILE_HEADER_SIZE,
     FOOTER_SIZE,
+    SSTABLE_FORMAT_VERSION,
     SSTableFooter,
     SSTableIncompleteError,
     SSTableReader,
@@ -894,9 +918,11 @@ def test_the_merged_table_is_a_valid_sstable_with_every_section(tmp_path: Path) 
 def test_tombstones_survive_the_merge_as_tombstones(tmp_path: Path) -> None:
     """On disk, not just in the stream: a reader must see the delete, not a miss.
 
-    A merge that dropped the tombstone would make ``get`` on that key fall through
-    to any older table beyond this merge, which is the resurrection M8.3 exists to
-    make safe. Until then the tombstone stays.
+    A merge told nothing about what lies outside it keeps every tombstone, which
+    is what this asserts. Dropping one would make ``get`` on that key fall through
+    to any older table beyond the merge, and since a merge given no
+    ``older_tables`` has no idea whether such a table exists, keeping is the only
+    safe answer. What happens once it is told is M8.3, tested below.
     """
     newer = write_table(tmp_path / "newer.sst", [(b"deleted", None)])
     older = write_table(tmp_path / "older.sst", [(b"deleted", b"value"), (b"kept", b"value")])
@@ -1262,3 +1288,692 @@ def test_a_footer_claiming_impossibly_many_records_does_not_size_the_merge(
 
     assert table_records(layout.path) == [(b"k", b"v"), (b"k2", b"v2")]
     assert layout.bloom_filter.bit_count < 1024
+
+
+# ---------------------------------------------------------------------------
+# M8.3: a tombstone is dropped only once nothing older can resurrect its key.
+# ---------------------------------------------------------------------------
+
+
+class RecordingProbe:
+    """An :data:`~ledgerlog.compaction.OlderValueProbe` with a fixed answer and a log.
+
+    The answer is fixed so a stream-level test can state "something older holds
+    this key" without a file behind it, and the log is what distinguishes a merge
+    that consults the rule from one that happens to agree with it.
+    """
+
+    def __init__(self, answer: bool = False, *, keys: Sequence[bytes] = ()) -> None:
+        self.answer = answer
+        self.keys: set[bytes] = set(keys)
+        self.asked: list[bytes] = []
+
+    def __call__(self, key: bytes) -> bool:
+        self.asked.append(key)
+        return self.answer or key in self.keys
+
+
+class CountingReader(SSTableReader):
+    """A real reader that records every key it was asked to look up.
+
+    A subclass rather than a stand-in, so that what the bloom filter is being
+    credited with skipping is a real index search and a real scan.
+    """
+
+    def __init__(
+        self,
+        stream: object,
+        *,
+        path: Path | None = None,
+        owns_stream: bool = False,
+    ) -> None:
+        super().__init__(stream, path=path, owns_stream=owns_stream)  # type: ignore[arg-type]
+        self.lookups: list[bytes] = []
+
+    def lookup(self, key: bytes) -> SSTableRecord | None:
+        self.lookups.append(key)
+        return super().lookup(key)
+
+
+def read_newest_first(paths: Sequence[Path], key: bytes) -> bytes | None:
+    """Answer ``key`` the way the engine's read path does, newest table first.
+
+    Returns the value, or ``None`` for not-found, which is what both a tombstone
+    and running out of tables mean. Written out here rather than borrowed from
+    the engine because the claim under test is about what the files say, and a
+    test that reused the engine's own walk could only agree with it.
+    """
+    for path in paths:
+        with SSTableReader.open(path) as reader:
+            record = reader.lookup(key)
+            if record is not None:
+                return record.value
+    return None
+
+
+def merge_over_a_deleted_key(directory: Path) -> tuple[list[Path], Path]:
+    """Two tables to merge, plus one older table left outside the merge.
+
+    The sources hold two tombstones that differ in exactly one way: ``shadowed``
+    has an older value in the outside table and ``solo`` does not. So one merge
+    over one pair of sources exercises both halves of the rule, and a merge that
+    always dropped or always kept cannot pass both.
+
+    Returned as (sources newest first, outside table).
+    """
+    outside = write_table(directory / "outside.sst", [(b"shadowed", b"outside")])
+    older = write_table(
+        directory / "older.sst",
+        [(b"live", b"inside"), (b"shadowed", b"inside"), (b"solo", b"inside")],
+    )
+    newer = write_table(directory / "newer.sst", [(b"shadowed", None), (b"solo", None)])
+    return [newer, older], outside
+
+
+def test_a_tombstone_with_no_older_value_outside_the_merge_is_dropped(tmp_path: Path) -> None:
+    """The story's first criterion, with the outside table stated to hold nothing older.
+
+    Asserted as absence from the merged table's data block, not just as a reader
+    returning not-found: a retained tombstone also reads as not-found, so a
+    lookup alone would pass either way.
+    """
+    sources, _ = merge_over_a_deleted_key(tmp_path)
+
+    layout = merge_sstables(sources, tmp_path / "merged.sst", older_tables=[])
+
+    assert table_records(layout.path) == [(b"live", b"inside")]
+    assert layout.record_count == 1
+
+
+def test_a_tombstone_with_an_older_value_outside_the_merge_is_retained(tmp_path: Path) -> None:
+    """The story's second criterion: the key that outside still holds keeps its tombstone.
+
+    ``solo`` is in the same merge and has no older value anywhere, so it goes.
+    The difference between the two is the rule, and a merge that kept both or
+    dropped both fails this.
+    """
+    sources, outside = merge_over_a_deleted_key(tmp_path)
+
+    layout = merge_sstables(sources, tmp_path / "merged.sst", older_tables=[outside])
+
+    assert table_records(layout.path) == [(b"live", b"inside"), (b"shadowed", None)]
+
+
+def test_drop_and_retain_differ_only_in_what_lies_outside_the_merge(tmp_path: Path) -> None:
+    """The story's third criterion: both cases simulated over one set of sources.
+
+    Three merges of the same two tables, differing only in what they are told is
+    outside them. The outputs have to differ in exactly the tombstones the rule
+    predicts, which is what rules out a merge with a fixed opinion about
+    tombstones.
+    """
+    sources, outside = merge_over_a_deleted_key(tmp_path)
+
+    told_nothing = merge_sstables(sources, tmp_path / "told-nothing.sst")
+    told_empty = merge_sstables(sources, tmp_path / "told-empty.sst", older_tables=[])
+    told_outside = merge_sstables(sources, tmp_path / "told-outside.sst", older_tables=[outside])
+
+    assert table_records(told_nothing.path) == [
+        (b"live", b"inside"),
+        (b"shadowed", None),
+        (b"solo", None),
+    ]
+    assert table_records(told_empty.path) == [(b"live", b"inside")]
+    assert table_records(told_outside.path) == [(b"live", b"inside"), (b"shadowed", None)]
+
+
+def test_a_retained_tombstone_keeps_the_deleted_key_deleted_on_the_read_path(
+    tmp_path: Path,
+) -> None:
+    """The reason the tombstone is retained, asserted as a read rather than as a file.
+
+    The engine after this compaction holds the merged table and the outside table,
+    newest first. A read of ``shadowed`` must stop at the merged table's tombstone
+    instead of falling through to the value the outside table still holds.
+    """
+    sources, outside = merge_over_a_deleted_key(tmp_path)
+
+    layout = merge_sstables(sources, tmp_path / "merged.sst", older_tables=[outside])
+
+    assert read_newest_first([layout.path, outside], b"shadowed") is None
+    assert read_newest_first([layout.path, outside], b"live") == b"inside"
+    assert read_newest_first([layout.path, outside], b"solo") is None
+
+
+def test_dropping_a_tombstone_that_outside_still_holds_would_resurrect_the_key(
+    tmp_path: Path,
+) -> None:
+    """The failure the rule prevents, shown by merging as though outside did not exist.
+
+    Not a test of the rule but of the stakes: told there is nothing older, the
+    merge drops the tombstone, and the same newest-first read then finds the
+    outside table's value for a key that was deleted. If this ever stops
+    resurrecting, the test above has stopped proving anything.
+    """
+    sources, outside = merge_over_a_deleted_key(tmp_path)
+
+    layout = merge_sstables(sources, tmp_path / "merged.sst", older_tables=[])
+
+    assert read_newest_first([layout.path, outside], b"shadowed") == b"outside"
+
+
+def test_an_outside_table_that_does_not_hold_the_key_does_not_keep_the_tombstone(
+    tmp_path: Path,
+) -> None:
+    """Older tables alone do not keep a tombstone alive, only an older value does.
+
+    A rule that kept a tombstone whenever any older table existed would never
+    reclaim anything in an engine with more than one tier.
+    """
+    outside = write_table(tmp_path / "outside.sst", [(b"unrelated", b"outside")])
+    newer = write_table(tmp_path / "newer.sst", [(b"deleted", None)])
+    older = write_table(tmp_path / "older.sst", [(b"deleted", b"inside")])
+
+    layout = merge_sstables([newer, older], tmp_path / "merged.sst", older_tables=[outside])
+
+    assert table_records(layout.path) == []
+    assert layout.record_count == 0
+
+
+def test_an_outside_table_holding_only_a_tombstone_does_not_keep_the_tombstone(
+    tmp_path: Path,
+) -> None:
+    """A delete outside the merge keeps the key deleted by itself, so ours may go.
+
+    A read falling through the merged table reaches the outside tombstone and
+    still answers not-found, which is asserted here rather than argued: the merged
+    table is empty and the key is still gone.
+    """
+    outside = write_table(tmp_path / "outside.sst", [(b"deleted", None)])
+    newer = write_table(tmp_path / "newer.sst", [(b"deleted", None)])
+    older = write_table(tmp_path / "older.sst", [(b"deleted", b"inside")])
+
+    layout = merge_sstables([newer, older], tmp_path / "merged.sst", older_tables=[outside])
+
+    assert table_records(layout.path) == []
+    assert read_newest_first([layout.path, outside], b"deleted") is None
+
+
+def test_a_merge_that_drops_a_tombstone_still_writes_a_valid_sstable(tmp_path: Path) -> None:
+    """Dropping records must not leave the index, the filter or the footer disagreeing.
+
+    A dropped key is not added to the bloom filter and not counted, so a writer
+    that had already committed to a count or an index entry before the drop would
+    produce a table that fails validation or answers for a key it does not hold.
+    """
+    kept: list[Pair] = [(f"key-{index:04d}".encode(), b"v") for index in range(0, 120, 2)]
+    deleted: list[Pair] = [(f"key-{index:04d}".encode(), None) for index in range(1, 120, 2)]
+    newer = write_table(tmp_path / "newer.sst", deleted)
+    older = write_table(tmp_path / "older.sst", kept)
+
+    layout = merge_sstables(
+        [newer, older], tmp_path / "merged.sst", index_interval=8, older_tables=[]
+    )
+
+    assert inspect_sstable(layout.path).status is SSTableStatus.VALID
+    assert table_records(layout.path) == kept
+    assert layout.record_count == len(kept)
+    assert len(layout.index) == math.ceil(len(kept) / 8)
+    with open(layout.path, "rb") as handle:
+        bloom = read_bloom_filter(handle, read_footer(handle))
+    assert all(bloom.might_contain(key) for key, _ in kept)
+    with SSTableReader.open(layout.path) as reader:
+        assert all(reader.lookup(key) is None for key, _ in deleted)
+
+
+def test_a_merge_can_drop_every_record_it_was_given(tmp_path: Path) -> None:
+    """An all-tombstone tier merges to an empty but valid table, which is the win.
+
+    The case compaction exists for at the extreme: a tier that is nothing but
+    deletes collapses to a table holding nothing, rather than to a file that
+    cannot be read back.
+    """
+    newer = write_table(tmp_path / "newer.sst", [(b"a", None), (b"b", None)])
+    older = write_table(tmp_path / "older.sst", [(b"a", b"v"), (b"b", b"v")])
+
+    layout = merge_sstables([newer, older], tmp_path / "merged.sst", older_tables=[])
+
+    assert inspect_sstable(layout.path).status is SSTableStatus.VALID
+    assert table_records(layout.path) == []
+    with SSTableReader.open(layout.path) as reader:
+        assert reader.lookup(b"a") is None
+
+
+# ---------------------------------------------------------------------------
+# The rule itself, over streams, with no files in the way.
+# ---------------------------------------------------------------------------
+
+
+def records(pairs: Sequence[Pair]) -> list[SSTableRecord]:
+    """Records for ``pairs`` at throwaway offsets, since a merge ignores offsets."""
+    return [
+        SSTableRecord(key=key, value=value, offset=index, end_offset=index + 1)
+        for index, (key, value) in enumerate(pairs)
+    ]
+
+
+def test_the_probe_is_asked_only_about_the_keys_a_tombstone_wins() -> None:
+    """A lookup per live key would make every merge pay for a rule about deletes.
+
+    The probe costs an index search and a scan per older table, so asking it
+    about keys that are not being deleted would add that cost to every record in
+    every merge and change no answer.
+    """
+    probe = RecordingProbe(answer=False)
+    stream = records([(b"a", b"v"), (b"b", None), (b"c", b"v")])
+
+    merged = list(merge_records([stream], has_older_value=probe))
+
+    assert merged == [(b"a", b"v"), (b"c", b"v")]
+    assert probe.asked == [b"b"]
+
+
+def test_a_tombstone_shadowing_a_value_inside_the_merge_is_still_asked_about() -> None:
+    """The older copy inside the merge is dropped either way, so it decides nothing.
+
+    What matters is whether something older sits outside, and the merge cannot
+    see that. A merge that skipped the probe when it had already seen an older
+    copy of the key would keep exactly the tombstones it could most safely drop.
+    """
+    probe = RecordingProbe(answer=False)
+    newer = records([(b"k", None)])
+    older = records([(b"k", b"old")])
+
+    merged = list(merge_records([newer, older], has_older_value=probe))
+
+    assert merged == []
+    assert probe.asked == [b"k"]
+
+
+def test_a_kept_tombstone_is_yielded_where_its_key_belongs() -> None:
+    """Dropping some tombstones must not disturb the sorted run around them."""
+    probe = RecordingProbe(keys={b"b"})
+    stream = records([(b"a", None), (b"b", None), (b"c", b"v"), (b"d", None)])
+
+    merged = list(merge_records([stream], has_older_value=probe))
+
+    assert merged == [(b"b", None), (b"c", b"v")]
+    assert probe.asked == [b"a", b"b", b"d"]
+
+
+def test_without_a_probe_no_tombstone_is_dropped() -> None:
+    """The default, stated as a test because it is the safe reading of silence."""
+    stream = records([(b"a", None), (b"b", b"v")])
+
+    assert list(merge_records([stream])) == [(b"a", None), (b"b", b"v")]
+
+
+def test_the_probe_decides_per_key_rather_than_once() -> None:
+    """A merge that cached the first answer would drop or keep every tombstone."""
+    probe = RecordingProbe(keys={b"b", b"d"})
+    stream = records([(b"a", None), (b"b", None), (b"c", None), (b"d", None)])
+
+    merged = list(merge_records([stream], has_older_value=probe))
+
+    assert merged == [(b"b", None), (b"d", None)]
+    assert probe.asked == [b"a", b"b", b"c", b"d"]
+
+
+# ---------------------------------------------------------------------------
+# Reading the answer off real tables: OlderTable and OlderTableProbe.
+# ---------------------------------------------------------------------------
+
+
+def test_an_older_table_reports_a_value_and_not_a_tombstone(tmp_path: Path) -> None:
+    table = write_table(tmp_path / "older.sst", [(b"gone", None), (b"here", b"v")])
+
+    with SSTableReader.open(table) as reader:
+        older = OlderTable(reader)
+
+        assert older.holds_value(b"here") is True
+        assert older.holds_value(b"gone") is False
+        assert older.holds_value(b"absent") is False
+
+
+def test_the_bloom_filter_spares_the_older_table_a_lookup(tmp_path: Path) -> None:
+    """The filter is why consulting older tables is affordable per tombstone.
+
+    Most keys a merge asks about are in no given older table, and a filter that
+    was carried but not consulted would leave every one of those costing a seek
+    and a scan.
+    """
+    table = write_table(tmp_path / "older.sst", [(b"here", b"v")])
+    with open(table, "rb") as handle:
+        bloom = read_bloom_filter(handle, read_footer(handle))
+    rejected = next(
+        key
+        for key in (f"absent-{index}".encode() for index in range(1000))
+        if not bloom.might_contain(key)
+    )
+
+    with CountingReader.open(table) as reader:
+        older = OlderTable(reader, bloom)
+
+        assert older.holds_value(rejected) is False
+        assert reader.lookups == []
+        assert older.holds_value(b"here") is True
+        assert reader.lookups == [b"here"]
+
+
+def test_an_older_table_without_a_filter_answers_the_same(tmp_path: Path) -> None:
+    """The filter is an optimisation, so its absence may cost time and nothing else."""
+    table = write_table(tmp_path / "older.sst", [(b"here", b"v")])
+
+    with SSTableReader.open(table) as reader:
+        assert OlderTable(reader, None).holds_value(b"here") is True
+        assert OlderTable(reader, None).holds_value(b"absent") is False
+
+
+def test_a_probe_over_no_tables_keeps_no_tombstone() -> None:
+    """Which is what makes ``older_tables=[]`` mean "nothing older exists"."""
+    probe = OlderTableProbe([])
+
+    assert probe.tables == ()
+    assert probe(b"anything") is False
+
+
+def test_a_probe_answers_yes_if_any_of_its_tables_holds_the_key(tmp_path: Path) -> None:
+    first = write_table(tmp_path / "first.sst", [(b"a", b"v")])
+    second = write_table(tmp_path / "second.sst", [(b"b", b"v")])
+
+    with SSTableReader.open(first) as one, SSTableReader.open(second) as two:
+        probe = OlderTableProbe([OlderTable(one), OlderTable(two)])
+
+        assert len(probe.tables) == 2
+        assert probe(b"a") is True
+        assert probe(b"b") is True
+        assert probe(b"c") is False
+
+
+# ---------------------------------------------------------------------------
+# Which tables count as older than a tier, which is the rule's other half.
+# ---------------------------------------------------------------------------
+
+
+def outside_table(sequence: int) -> StubMergeTable:
+    """A table outside a tier, identified by its age; its size and path are unused here."""
+    return StubMergeTable(sequence=sequence, size_bytes=1, path=Path(f"t-{sequence}.sst"))
+
+
+def tier_of_sequences(sequences: Sequence[int]) -> CompactionTier[StubMergeTable]:
+    """A tier holding tables of those ages, newest first as a tier requires."""
+    return CompactionTier(
+        tables=tuple(outside_table(sequence) for sequence in sorted(sequences, reverse=True)),
+        ready=True,
+    )
+
+
+def test_tables_newer_than_the_tier_are_not_older_than_the_merge() -> None:
+    """A newer table wins a key outright, so no tombstone below it protects anything."""
+    tier = tier_of_sequences([3, 4])
+
+    assert older_outside_tables(tier, [outside_table(5), outside_table(9)]) == ()
+
+
+def test_tables_older_than_the_tier_are_returned_newest_first() -> None:
+    tier = tier_of_sequences([5, 6])
+
+    older = older_outside_tables(tier, [outside_table(1), outside_table(4), outside_table(2)])
+
+    assert [table.sequence for table in older] == [4, 2, 1]
+
+
+def test_the_tier_s_own_tables_are_not_counted_as_outside_it() -> None:
+    """A source counted as outside would keep every tombstone the merge could drop."""
+    tier = tier_of_sequences([2, 3, 4])
+
+    older = older_outside_tables(tier, [*tier.tables, outside_table(1)])
+
+    assert [table.sequence for table in older] == [1]
+
+
+def test_a_table_inside_the_tier_s_range_counts_as_older_than_the_merge() -> None:
+    """Tiers group by size, so they are not always a contiguous run of ages.
+
+    A table between the tier's oldest and newest is older than at least one
+    source, so a tombstone from a newer source can hide its values. Measuring
+    from the tier's oldest table would miss it, and missing one is a resurrected
+    key.
+    """
+    tier = tier_of_sequences([2, 7])
+
+    older = older_outside_tables(tier, [outside_table(5)])
+
+    assert [table.sequence for table in older] == [5]
+
+
+# ---------------------------------------------------------------------------
+# merge_tier, which is where a tier and the tables around it come together.
+# ---------------------------------------------------------------------------
+
+
+def test_merge_tier_keeps_a_tombstone_an_older_table_outside_the_tier_needs(
+    tmp_path: Path,
+) -> None:
+    """The engine's case: the tier is compacted, the tables around it are not."""
+    sources, outside = merge_over_a_deleted_key(tmp_path)
+    tier = tier_of(sources)
+    outside_handle = StubMergeTable(sequence=0, size_bytes=outside.stat().st_size, path=outside)
+
+    layout = merge_tier(tier, tmp_path / "merged.sst", other_tables=[outside_handle])
+
+    assert table_records(layout.path) == [(b"live", b"inside"), (b"shadowed", None)]
+
+
+def test_merge_tier_drops_the_tombstone_when_the_tier_is_all_there_is(tmp_path: Path) -> None:
+    sources, _ = merge_over_a_deleted_key(tmp_path)
+
+    layout = merge_tier(tier_of(sources), tmp_path / "merged.sst", other_tables=[])
+
+    assert table_records(layout.path) == [(b"live", b"inside")]
+
+
+def test_merge_tier_told_nothing_keeps_every_tombstone(tmp_path: Path) -> None:
+    sources, _ = merge_over_a_deleted_key(tmp_path)
+
+    layout = merge_tier(tier_of(sources), tmp_path / "merged.sst")
+
+    assert table_records(layout.path) == [
+        (b"live", b"inside"),
+        (b"shadowed", None),
+        (b"solo", None),
+    ]
+
+
+def test_merge_tier_ignores_a_newer_table_outside_the_tier(tmp_path: Path) -> None:
+    """A newer table is read before the merged one, so it cannot resurrect anything."""
+    sources, _ = merge_over_a_deleted_key(tmp_path)
+    tier = tier_of(sources)
+    newest = write_table(tmp_path / "newest.sst", [(b"shadowed", b"newest")])
+    newer_handle = StubMergeTable(
+        sequence=max(table.sequence for table in tier.tables) + 1,
+        size_bytes=newest.stat().st_size,
+        path=newest,
+    )
+
+    layout = merge_tier(tier, tmp_path / "merged.sst", other_tables=[newer_handle])
+
+    assert table_records(layout.path) == [(b"live", b"inside")]
+
+
+def test_merge_tier_accepts_the_whole_table_list_including_the_tier(tmp_path: Path) -> None:
+    """So a caller can pass everything the engine holds without computing a difference."""
+    sources, outside = merge_over_a_deleted_key(tmp_path)
+    tier = tier_of(sources)
+    outside_handle = StubMergeTable(sequence=0, size_bytes=outside.stat().st_size, path=outside)
+
+    layout = merge_tier(tier, tmp_path / "merged.sst", other_tables=[*tier.tables, outside_handle])
+
+    assert table_records(layout.path) == [(b"live", b"inside"), (b"shadowed", None)]
+
+
+# ---------------------------------------------------------------------------
+# Older tables a merge refuses, and the handles it must not leak reading them.
+# ---------------------------------------------------------------------------
+
+
+def test_a_source_cannot_also_be_listed_as_older_than_the_merge(tmp_path: Path) -> None:
+    newer = write_table(tmp_path / "newer.sst", [(b"k", None)])
+    older = write_table(tmp_path / "older.sst", [(b"k", b"v")])
+
+    with pytest.raises(ValueError, match="cannot also be outside"):
+        merge_sstables([newer, older], tmp_path / "merged.sst", older_tables=[older])
+
+    assert not (tmp_path / "merged.sst").exists()
+
+
+def test_the_destination_cannot_be_listed_as_older_than_the_merge(tmp_path: Path) -> None:
+    newer = write_table(tmp_path / "newer.sst", [(b"k", None)])
+
+    with pytest.raises(ValueError, match="destination of the merge"):
+        merge_sstables([newer], tmp_path / "merged.sst", older_tables=[tmp_path / "merged.sst"])
+
+
+def test_an_older_table_cannot_be_listed_twice(tmp_path: Path) -> None:
+    newer = write_table(tmp_path / "newer.sst", [(b"k", None)])
+    outside = write_table(tmp_path / "outside.sst", [(b"k", b"v")])
+
+    with pytest.raises(ValueError, match="listed twice among the older tables"):
+        merge_sstables([newer], tmp_path / "merged.sst", older_tables=[outside, outside])
+
+
+def test_a_damaged_older_table_stops_the_merge_and_leaves_nothing_behind(
+    tmp_path: Path,
+) -> None:
+    """An older table is validated like a source, since it is parsed like one.
+
+    A tombstone dropped on the word of a table whose footer could not be trusted
+    would be a delete decided by damaged bytes. Truncating the file past its
+    header leaves a file with no readable footer.
+    """
+    newer = write_table(tmp_path / "newer.sst", [(b"k", None)])
+    older = write_table(tmp_path / "older.sst", [(b"k", b"v")])
+    damaged = write_table(tmp_path / "damaged.sst", [(b"k", b"v")])
+    with open(damaged, "r+b") as handle:
+        handle.truncate(FILE_HEADER_SIZE + 1)
+
+    with pytest.raises(SSTableIncompleteError):
+        merge_sstables([newer, older], tmp_path / "merged.sst", older_tables=[damaged])
+
+    assert not (tmp_path / "merged.sst").exists()
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "damaged.sst",
+        "newer.sst",
+        "older.sst",
+    ]
+
+
+def test_an_older_table_in_an_unknown_format_version_is_refused(tmp_path: Path) -> None:
+    newer = write_table(tmp_path / "newer.sst", [(b"k", None)])
+    older = write_table(tmp_path / "older.sst", [(b"k", b"v")])
+    with open(older, "r+b") as handle:
+        handle.seek(older.stat().st_size - FOOTER_SIZE)
+        footer = SSTableFooter.decode(handle.read(FOOTER_SIZE))
+        handle.seek(older.stat().st_size - FOOTER_SIZE)
+        handle.write(
+            SSTableFooter(
+                data_block_offset=footer.data_block_offset,
+                data_block_end=footer.data_block_end,
+                index_offset=footer.index_offset,
+                index_end=footer.index_end,
+                bloom_filter_offset=footer.bloom_filter_offset,
+                bloom_filter_end=footer.bloom_filter_end,
+                record_count=footer.record_count,
+                format_version=SSTABLE_FORMAT_VERSION + 1,
+            ).encode()
+        )
+
+    with pytest.raises(SSTableUnsupportedVersionError):
+        merge_sstables([newer], tmp_path / "merged.sst", older_tables=[older])
+
+
+def test_the_sources_and_the_older_tables_are_left_exactly_as_they_were(
+    tmp_path: Path,
+) -> None:
+    """Consulting an older table must not change it: M8.5 deletes sources, not these."""
+    sources, outside = merge_over_a_deleted_key(tmp_path)
+    before = {path: path.read_bytes() for path in [*sources, outside]}
+
+    merge_sstables(sources, tmp_path / "merged.sst", older_tables=[outside])
+
+    assert {path: path.read_bytes() for path in [*sources, outside]} == before
+
+
+@pytest.mark.skipif(
+    not Path("/proc/self/fd").is_dir(),
+    reason="counting open descriptors needs /proc",
+)
+def test_a_merge_closes_every_older_table_it_opened(tmp_path: Path) -> None:
+    """One descriptor per older table per pass would exhaust the process in a few tiers.
+
+    Counted around a merge that succeeds and one that fails after the older
+    tables were already open, since the failing path is the one where a handle
+    goes unreleased.
+    """
+    sources, outside = merge_over_a_deleted_key(tmp_path)
+    damaged = write_table(tmp_path / "damaged.sst", [(b"a", b"v"), (b"b", b"v")])
+    with open(damaged, "r+b") as handle:
+        footer = read_footer(handle)
+        on_disk = list(
+            iter_records(
+                handle,
+                start_offset=footer.data_block_offset,
+                end_offset=footer.data_block_end,
+            )
+        )
+        handle.seek(on_disk[1].offset)
+        handle.write(struct.pack("<I", 1_000_000))
+
+    def open_descriptors() -> int:
+        return len(os.listdir("/proc/self/fd"))
+
+    before = open_descriptors()
+    merge_sstables(sources, tmp_path / "merged.sst", older_tables=[outside])
+    after_success = open_descriptors()
+    with pytest.raises(SSTableTruncatedRecordError):
+        merge_sstables([damaged], tmp_path / "failed.sst", older_tables=[outside, *sources])
+
+    assert after_success == before
+    assert open_descriptors() == before
+
+
+def test_consulting_an_older_table_does_not_disturb_a_reader_of_it(tmp_path: Path) -> None:
+    """Real threads, because the claim is about file handles and only threads test it.
+
+    The merge now opens tables it is not merging, and the engine may be serving
+    ``get`` from those same files at the same time: an older table outside a
+    compaction is exactly a table reads are still being answered from. The merge
+    opens its own handle for each, so neither side moves the other's cursor. If
+    they shared one, the lookups below would decode records from the wrong offset
+    and the tombstone decision would be made on whatever came back.
+    """
+    pairs: list[Pair] = [(f"key-{index:04d}".encode(), f"v{index}".encode()) for index in range(80)]
+    outside = write_table(tmp_path / "outside.sst", pairs)
+    newer = write_table(tmp_path / "newer.sst", [(key, None) for key, _ in pairs])
+    older = write_table(tmp_path / "older.sst", [(b"zzz", b"kept")])
+    start = threading.Barrier(2)
+    stop = threading.Event()
+    failures: list[BaseException] = []
+
+    def read_until_stopped() -> None:
+        try:
+            with SSTableReader.open(outside) as reader:
+                start.wait(timeout=10)
+                while not stop.is_set():
+                    for key, value in pairs:
+                        record = reader.lookup(key)
+                        assert record is not None and record.value == value
+        except BaseException as error:  # reported to the main thread, never swallowed
+            failures.append(error)
+
+    thread = threading.Thread(target=read_until_stopped)
+    thread.start()
+    try:
+        start.wait(timeout=10)
+        layout = merge_sstables([newer, older], tmp_path / "merged.sst", older_tables=[outside])
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+
+    assert failures == []
+    assert table_records(layout.path) == [*[(key, None) for key, _ in pairs], (b"zzz", b"kept")]
