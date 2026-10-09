@@ -1,13 +1,16 @@
 """Compaction: which SSTables belong together, and merging a group into one.
 
-Scope of this module today (stories M8.1 to M8.3): grouping the tables an engine
-holds into size tiers, saying which of those tiers has accumulated enough tables
-to be worth merging, merging one of those tiers into a single new SSTable under
-newest write wins semantics, and dropping from that merge the tombstones nothing
-older can still be hiding behind. Planning takes a set of tables, each of which
-knows its own age and its own size, and returns a plan: the tiers, and a flag per
-tier saying whether it is ready. Merging takes the tables of one tier and writes
-their records out once, deduplicated, keeping the newest write for each key.
+Scope of this module today (stories M8.1 to M8.3 and M8.5): grouping the tables
+an engine holds into size tiers, saying which of those tiers has accumulated
+enough tables to be worth merging, merging one of those tiers into a single new
+SSTable under newest write wins semantics, dropping from that merge the tombstones
+nothing older can still be hiding behind, and retiring the merged tables once the
+new one is committed. Planning takes a set of tables, each of which knows its own
+age and its own size, and returns a plan: the tiers, and a flag per tier saying
+whether it is ready. Merging takes the tables of one tier and writes their records
+out once, deduplicated, keeping the newest write for each key. Swapping deletes
+those tables, and only after it has read the merged table's footer back off the
+disk.
 
 The tombstone rule (M8.3, ARCHITECTURE.md section 4) is the one part of a merge
 that cannot be decided from the tier alone. A tombstone exists to hide older
@@ -20,10 +23,11 @@ told which tables lie outside it and are older than it, through
 A merge told nothing keeps every tombstone, because that is the only answer that
 is safe when what is outside the merge is unknown.
 
-What is still not here: the expiry rule (M8.4), and nothing in this module deletes
-a source table or tells the engine to start reading the merged one, which is the
-atomic swap of M8.5. A merge today produces a new file and reports where it is,
-and that is all.
+What is still not here: the expiry rule (M8.4), and nothing tells the engine to
+start reading the merged table, since the engine does not yet discover the tables
+on its disk at all (story M9.1). A compaction today is something a caller drives:
+:func:`compact_tier` merges a tier and retires it, and reports which table now
+stands for which, and that is all.
 
 Why the planning is a separate, file-free step: what to compact is a policy
 decision made from metadata alone, and it is the part of compaction with the most
@@ -69,10 +73,11 @@ place, so the destination path only ever names a complete table. A merge that
 raises partway through leaves its sources exactly as they were and nothing at the
 destination, since the temporary file is removed on the way out; a process killed
 mid-merge leaves that temporary file behind, under a name no reader looks for a
-table at. What merging never does is open a source for writing, unlink one, or
-hand the engine the result: choosing when the sources may go is M8.5's decision,
-and it needs the merged table to be on disk and valid first, which is what this
-returns.
+table at, which :func:`discard_partial_tables` is what clears away at the next
+startup. What merging never does is open a source for writing or unlink one:
+choosing when the sources may go belongs to :func:`swap_in_merged_table`, which
+will not make that choice until it has read the merged table's committed footer
+off the disk itself.
 """
 
 from __future__ import annotations
@@ -94,11 +99,15 @@ from ledgerlog.sstable import (
     RECORD_PAYLOAD_HEADER_SIZE,
     SSTABLE_FORMAT_VERSION,
     SSTableFooter,
+    SSTableInspection,
     SSTableLayout,
     SSTableReader,
     SSTableRecord,
     SSTableUnsupportedVersionError,
     SSTableWriter,
+    fsync_directory,
+    inspect_sstable,
+    is_temp_table_path,
     iter_records,
     read_bloom_filter,
     read_file_header,
@@ -950,3 +959,226 @@ def merge_tier(
         index_interval=index_interval,
         bloom_false_positive_rate=bloom_false_positive_rate,
     )
+
+
+class MergeNotCommittedError(RuntimeError):
+    """Raised when a merged table is not one whose sources may be retired yet.
+
+    The swap asks the file on disk whether its footer landed, and this is the
+    answer "no, or not in a form this build can read". It is raised rather than
+    returned because every caller has the same one correct response, which is to
+    leave the sources alone: a merge whose commit point is not there has not
+    happened, however far through it got, and deleting a source on the strength of
+    it would be deleting the only copy of those records.
+
+    Carries the :class:`~ledgerlog.sstable.SSTableInspection` behind the verdict,
+    so an operator is told which check the output failed rather than only that it
+    failed one.
+    """
+
+    def __init__(self, inspection: SSTableInspection) -> None:
+        reason = inspection.reason or "no reason recorded"
+        super().__init__(
+            f"merged table {inspection.path} is {inspection.status.value} ({reason}), so no "
+            "source table was deleted"
+        )
+        self.inspection = inspection
+
+
+@dataclass(frozen=True)
+class CompactionSwap:
+    """What a completed swap did: which table now stands for which retired ones.
+
+    ``footer`` is the footer as it was read back off the merged file, not as the
+    writer said it would be. That is the whole distinction this story turns on,
+    and it is why the swap reports a footer rather than passing through the
+    :class:`~ledgerlog.sstable.SSTableLayout` the merge returned: the layout is
+    the writer's account of what it meant to write, and taking the writer's word
+    for the commit point is the one thing a swap must not do. A caller that wants
+    the merged table's index or bloom filter reads them from the file, through the
+    same path any other reader of that table takes.
+
+    ``retired`` lists the sources in the order they were given, newest first, and
+    not the order they were removed in (see :func:`swap_in_merged_table` for why
+    those differ).
+    """
+
+    merged: Path
+    footer: SSTableFooter
+    retired: tuple[Path, ...]
+
+    @property
+    def retired_count(self) -> int:
+        """How many source tables the swap removed."""
+        return len(self.retired)
+
+
+def swap_in_merged_table(
+    merged: str | os.PathLike[str],
+    sources: Sequence[str | os.PathLike[str]],
+) -> CompactionSwap:
+    """Retire ``sources`` now that ``merged`` holds their records, and not before.
+
+    This is the second half of a compaction and the point ARCHITECTURE.md section
+    6 makes a rule: the merged table's footer must be fully written before any
+    source table is deleted. The footer is the commit point, so a merged file
+    without one is not a table and the records in it are not anywhere, which
+    makes the sources the only copy. So the file is inspected first, by reading
+    its footer back off the disk and measuring every offset in it against the
+    file's real size (:func:`~ledgerlog.sstable.inspect_sstable`), and a verdict
+    short of valid raises :class:`MergeNotCommittedError` with nothing deleted.
+    Trusting the layout the merge returned instead would check that the writer
+    believed it had written a footer, which is true even of a writer whose last
+    bytes never reached the disk.
+
+    ``sources`` is newest table first, the order the merge read them in, and it
+    must not include ``merged``. The sources are then removed oldest first, which
+    is the reverse of that order and is a correctness requirement rather than
+    tidiness. A merge may legitimately drop a tombstone (story M8.3), so the
+    merged table can hold no record at all for a key one of its sources holds a
+    value for. Nothing makes a run of unlinks atomic, so a crash partway through
+    leaves the merged table beside whichever sources are left, and a read then
+    falls through the merged table into them. Removing oldest first makes the
+    survivors the newest sources, and that is the set it is safe to be left with:
+    if the tombstone that shadowed a key is still there, the read stops at it,
+    and if it is gone then so is every source older than it, which is every
+    source that could have held the shadowed value. Removing newest first inverts
+    exactly that and resurrects the key. Each removal is followed by a directory
+    sync so the states a crash can leave really are the prefixes of this
+    sequence, rather than whatever subset of the unlinks happened to reach the
+    disk.
+
+    A failure partway through the removals is left to propagate for the same
+    reason: what it leaves behind is one of those safe prefixes, so there is
+    nothing to undo, and a swap run again over the same arguments finishes the
+    job (a source already gone is not an error here).
+
+    All of that rests on one thing the swap cannot check and the caller has to
+    get right: the merged table must be named so that whatever reads these files
+    treats it as newer than every source it was merged from. Nothing here knows
+    about sequence numbers, only paths, and a merged table a read reached after
+    its sources would hand back values the merge had already superseded. The
+    engine is what allocates table names, so it is where that ordering is
+    decided (ARCHITECTURE.md section 5).
+
+    Losing a removal to a crash costs space and a slower read, never a wrong
+    answer, which is the direction this is built to fail in: a source that comes
+    back is shadowed by the merged table, and it is retired by the next
+    compaction that includes it.
+    """
+    merged_path = Path(merged)
+    source_paths = [Path(source) for source in sources]
+    if not source_paths:
+        raise ValueError("a swap needs at least one source table to retire")
+
+    seen: dict[Path, Path] = {}
+    for source_path in source_paths:
+        resolved = source_path.resolve()
+        if resolved in seen:
+            raise ValueError(
+                f"source table {source_path} is listed twice (also as {seen[resolved]}), and the "
+                "order sources are retired in is what keeps a crash mid-swap safe"
+            )
+        seen[resolved] = source_path
+    if merged_path.resolve() in seen:
+        raise ValueError(
+            f"merged table {merged_path} is also listed as a source of the merge, and retiring "
+            "the sources would delete the merged table itself"
+        )
+
+    inspection = inspect_sstable(merged_path)
+    # The second half of the condition cannot happen, since a valid verdict is
+    # only reached by reading a footer whole, and it is written as part of the
+    # same check rather than as an assertion so that the one path out of here
+    # that deletes files cannot be reached without a footer in hand.
+    if not inspection.is_valid or inspection.footer is None:
+        raise MergeNotCommittedError(inspection)
+
+    for source_path in reversed(source_paths):
+        source_path.unlink(missing_ok=True)
+        fsync_directory(source_path.parent)
+
+    return CompactionSwap(
+        merged=merged_path,
+        footer=inspection.footer,
+        retired=tuple(source_paths),
+    )
+
+
+def compact_tier(
+    tier: CompactionTier[MergeableTableT],
+    destination: str | os.PathLike[str],
+    *,
+    other_tables: Iterable[MergeableTableT] | None = None,
+    index_interval: int = DEFAULT_INDEX_INTERVAL,
+    bloom_false_positive_rate: float = DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
+) -> CompactionSwap:
+    """Merge one tier into ``destination`` and retire the tier's tables.
+
+    A whole compaction: :func:`merge_tier` followed by
+    :func:`swap_in_merged_table`, which is the order those two have to happen in
+    and the only order this offers. The arguments are :func:`merge_tier`'s, and
+    ``other_tables`` carries the same meaning: everything else the engine holds,
+    from which the tables older than the tier are picked out so that tombstones
+    nothing older needs can be dropped.
+
+    The merged table is inspected from disk between the two halves even though
+    the merge just returned a layout describing it, for the reason
+    :func:`swap_in_merged_table` gives. It costs one footer read per compaction,
+    against deleting the only copy of a tier's records on the word of a writer
+    whose bytes may not have landed.
+
+    If the merge raises, nothing is deleted and the sources are untouched, since
+    the merge writes only to a temporary file of its own
+    (:class:`~ledgerlog.sstable.SSTableWriter`). If the process dies instead, the
+    same holds on disk and the temporary file is what
+    :func:`discard_partial_tables` clears away at startup.
+    """
+    layout = merge_tier(
+        tier,
+        destination,
+        other_tables=other_tables,
+        index_interval=index_interval,
+        bloom_false_positive_rate=bloom_false_positive_rate,
+    )
+    return swap_in_merged_table(layout.path, [table.path for table in tier.tables])
+
+
+def discard_partial_tables(directory: str | os.PathLike[str]) -> tuple[Path, ...]:
+    """Remove the half-written tables a killed process left in ``directory``.
+
+    A merge, like a flush, streams into a temporary file and renames it into
+    place, so a process killed mid-merge leaves that temporary file behind: real
+    bytes, under a name nothing reads a table at, describing records that are
+    still in the source tables the swap never got to delete. Returns the paths it
+    removed, sorted by name, so that a caller can log what it threw away.
+
+    Recognising debris by name alone is enough and is deliberately all that
+    happens here. A temporary file is by construction not a table any reader
+    looks for, so what it holds does not matter, and there is no destination
+    worth recovering from it either: the records are all still in the sources,
+    which is the whole promise of doing the merge before the deletions. Inspecting
+    the file first would only invite the mistake of keeping one that looked
+    complete, and a complete temporary file is still a merge whose swap never
+    ran, whose sources are therefore still live, and which the next compaction
+    will do again.
+
+    This belongs to startup and nowhere else, because a temporary file in a
+    running process is one a live writer is holding open. CLAUDE.md puts
+    multi-process use outside this engine's scope, so at startup there is no such
+    writer; calling this with a merge in flight in the same process would pull
+    the file out from under it.
+    """
+    root = Path(directory)
+    removed: list[Path] = []
+    for entry in sorted(root.iterdir()):
+        if not is_temp_table_path(entry) or not entry.is_file():
+            continue
+        entry.unlink(missing_ok=True)
+        removed.append(entry)
+    if removed:
+        # One sync for the batch rather than one each: unlike the retirement in
+        # swap_in_merged_table, these removals are independent, so a crash
+        # leaving some of them undone just means the next startup sweeps again.
+        fsync_directory(root)
+    return tuple(removed)

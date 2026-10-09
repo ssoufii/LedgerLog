@@ -221,6 +221,67 @@ it from a measured read amplification rather than from this reasoning.
 """
 
 
+TEMP_TABLE_SUFFIX = ".tmp"
+"""Suffix on the name a table is written under before it is renamed into place.
+
+Paired with a leading dot by :func:`temp_table_path`. The convention is named
+here, rather than left inline in :class:`SSTableWriter`, because two different
+pieces of code depend on it: the writer, which creates such a file, and the
+startup sweep that clears away the ones a killed process left behind
+(:func:`~ledgerlog.compaction.discard_partial_tables`). A sweep working from its
+own idea of the naming would either miss real debris or delete a file somebody
+meant to keep.
+"""
+
+
+def temp_table_path(path: str | os.PathLike[str]) -> Path:
+    """Return the name :class:`SSTableWriter` streams to on its way to ``path``.
+
+    Derived from the destination name and placed in the destination's own
+    directory, because a rename is only atomic within one filesystem. The leading
+    dot keeps the file out of a plain listing and, more to the point, out of the
+    ``*.sst`` pattern discovery matches, so a table being written is not a table
+    anything will try to read.
+    """
+    final = Path(path)
+    return final.with_name(f".{final.name}{TEMP_TABLE_SUFFIX}")
+
+
+def is_temp_table_path(path: str | os.PathLike[str]) -> bool:
+    """True if ``path`` is named the way :func:`temp_table_path` names a file.
+
+    The inverse of the convention rather than a parse of it: nothing is recovered
+    from the name, since the destination a dead writer was aiming at tells a
+    sweep nothing it needs. A name that is only the prefix and the suffix with no
+    destination between them is not one of ours, which is what keeps a file
+    literally called ``.tmp`` from being mistaken for debris.
+    """
+    name = Path(path).name
+    if not name.startswith(".") or not name.endswith(TEMP_TABLE_SUFFIX):
+        return False
+    return len(name) > len(".") + len(TEMP_TABLE_SUFFIX)
+
+
+def fsync_directory(path: str | os.PathLike[str]) -> None:
+    """Force a change to ``path``'s directory entries (a rename, an unlink) onto the disk.
+
+    Creating, renaming or removing a file is a change to the directory holding
+    it, and on POSIX the directory has to be synced for that change to survive a
+    power loss, even when the file's own bytes are already down. Skipped where
+    directories cannot be opened for this, which is the case on Windows, rather
+    than guarded by catching whatever the platform raises: a real fsync failure
+    on a platform that supports it is something a caller has to hear about, not
+    something to swallow as a portability quirk.
+    """
+    if os.name != "posix":
+        return
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 class SSTableOp(IntEnum):
     """Kind byte at the front of a record payload.
 
@@ -1178,26 +1239,6 @@ class SSTableLayout:
         )
 
 
-def _fsync_directory(path: Path) -> None:
-    """Force a directory entry change (the rename below) onto the disk.
-
-    Renaming a file is a change to the directory, and on POSIX the directory has
-    to be synced for that change to survive a power loss, even when the file's
-    own bytes are already down. Skipped where directories cannot be opened for
-    this, which is the case on Windows, rather than guarded by catching whatever
-    the platform raises: a real fsync failure on a platform that supports it is
-    something a caller has to hear about, not something to swallow as a
-    portability quirk.
-    """
-    if os.name != "posix":
-        return
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
 class SSTableWriter:
     """Streams a sorted run of records into a new SSTable file.
 
@@ -1290,7 +1331,7 @@ class SSTableWriter:
         else:
             self._bloom = BloomFilter.for_target(max(1, self._expected_keys), self._bloom_rate)
         self._path = Path(path)
-        self._temp_path = self._path.with_name(f".{self._path.name}.tmp")
+        self._temp_path = temp_table_path(self._path)
         self._index_entries: list[IndexEntry] = []
         self._record_count = 0
         self._last_key: bytes | None = None
@@ -1464,7 +1505,7 @@ class SSTableWriter:
         # from here on, and a caller told that the sync failed is being told the
         # table exists but its durability is not confirmed, which is a different
         # thing from a flush that did not happen.
-        _fsync_directory(self._path.parent)
+        fsync_directory(self._path.parent)
 
         return SSTableLayout(
             path=self._path,

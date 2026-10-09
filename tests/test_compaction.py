@@ -1,4 +1,4 @@
-"""Tests for size-tier grouping, the tier merge and the tombstone rule: M8.1 to M8.3.
+"""Tier grouping, the tier merge, the tombstone rule and the swap: M8.1 to M8.3 and M8.5.
 
 M8.1's claims are about metadata, so those tests need no files, no engine and no
 threads: a table, to the planner, is an age and a size, and the stand-in below is
@@ -71,6 +71,24 @@ What could pass inspection while being false, and how each is pinned here:
   is what newest-write-wins will mean, and picking the wrong ready tier is a real
   cost in bytes rewritten. Both orders are asserted directly.
 
+What could pass a loose reading of M8.5 while being false, since the story is an
+ordering between two things that both happen anyway:
+
+* "Only deleted after the footer is written" can be satisfied by code that
+  deletes after the merge call returns, which is not the same claim: the merge
+  returning says the writer thinks it wrote a footer. Pinned by truncating,
+  corrupting and version-stamping the merged file between the merge and the swap
+  and asserting that each refusal leaves every source byte-identical.
+* A crash mid-merge is the case the ordering exists for, and nothing short of a
+  real kill exercises it, since an exception in-process still runs the writer's
+  cleanup. So the merge below happens in a child process that is stopped at a
+  known record and sent SIGKILL, and the sources, the destination name and the
+  debris left behind are all asserted afterwards.
+* "Source tables are gone" can be read as "gone in some order", and the order is
+  a correctness rule: a merge may drop a tombstone, so a crash partway through
+  the deletions can resurrect a key if the newest sources go first. Both the
+  order and the counterfactual are asserted directly.
+
 The hypothesis test is the partition check. Grouping is a sweep, and the failures
 a sweep has are dropping a table at a boundary or admitting one to two tiers,
 neither of which a fixed example set reliably lands on.
@@ -81,32 +99,42 @@ from __future__ import annotations
 import math
 import os
 import random
+import select
+import signal
 import struct
+import subprocess
+import sys
 import threading
-from collections.abc import Iterator, Sequence
-from dataclasses import FrozenInstanceError, dataclass
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
 
 import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
+import ledgerlog
 from ledgerlog.compaction import (
     DEFAULT_MIN_TIER_TABLES,
     DEFAULT_SIZE_RATIO,
     CompactionPlan,
     CompactionPolicy,
+    CompactionSwap,
     CompactionTier,
     MergeableTable,
+    MergeNotCommittedError,
     MergeSourceOrderError,
     OlderTable,
     OlderTableProbe,
     SizedTable,
+    compact_tier,
+    discard_partial_tables,
     merge_records,
     merge_sstables,
     merge_tier,
     older_outside_tables,
     plan_compaction,
+    swap_in_merged_table,
 )
 from ledgerlog.sstable import (
     FILE_HEADER_SIZE,
@@ -123,6 +151,7 @@ from ledgerlog.sstable import (
     iter_records,
     read_bloom_filter,
     read_footer,
+    temp_table_path,
     write_sstable,
 )
 
@@ -1977,3 +2006,715 @@ def test_consulting_an_older_table_does_not_disturb_a_reader_of_it(tmp_path: Pat
 
     assert failures == []
     assert table_records(layout.path) == [*[(key, None) for key, _ in pairs], (b"zzz", b"kept")]
+
+
+# ---------------------------------------------------------------------------
+# M8.5: the swap. Nothing is deleted until the merged table's footer is on the
+# disk and reads back valid, and what a crash can leave behind at each point.
+# ---------------------------------------------------------------------------
+
+
+_CHILD_SOURCE = '''\
+"""Runs one compaction in a child process the test can SIGKILL at a chosen moment.
+
+A real process and a real signal, because the claim under test is about what a
+crash leaves on the disk. An exception raised in-process still runs the writer's
+cleanup, which is exactly the code path a crash does not take, so a test that
+raised instead of killing would be asserting that the cleanup works rather than
+that the on-disk ordering is safe without it.
+
+Takes the directory holding the ``source-N.sst`` tables and the moment to stop
+at, and announces on stdout once it is there, so the parent kills it at a known
+point in the compaction rather than a likely one.
+"""
+
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+
+from ledgerlog import compaction
+from ledgerlog.compaction import CompactionTier
+from ledgerlog.sstable import SSTableWriter
+
+STALL_AFTER_RECORDS = 7
+
+
+@dataclass(frozen=True)
+class Table:
+    """The age, size and path a tier needs of its tables, and nothing else."""
+
+    sequence: int
+    size_bytes: int
+    path: Path
+
+
+def announce(message):
+    sys.stdout.write(message + "\\n")
+    sys.stdout.flush()
+
+
+def wait_to_be_killed():
+    """Block until the signal lands. The parent never writes to stdin."""
+    sys.stdin.read()
+    raise SystemExit("parent closed stdin instead of killing the child")
+
+
+class StallingWriter(SSTableWriter):
+    """A writer that stops for good partway through the merged table's data block.
+
+    Interposed on the name the merge looks its writer up under, so everything
+    around it is the real thing: real sources, real records, a real temporary
+    file holding a real partial data block, and no index, filter or footer.
+    Stopping on a record count rather than after a delay is what makes the kill
+    land at a known point instead of a likely one.
+    """
+
+    def add(self, key, value):
+        if self.record_count >= STALL_AFTER_RECORDS:
+            announce("stalled")
+            wait_to_be_killed()
+        return super().add(key, value)
+
+
+def stall_instead_of_swapping(*args, **kwargs):
+    """Stand in for the swap, so the child dies in the window the merge opens."""
+    announce("merged")
+    wait_to_be_killed()
+
+
+def main():
+    directory = Path(sys.argv[1])
+    moment = sys.argv[2]
+    if moment == "mid-merge":
+        compaction.SSTableWriter = StallingWriter
+    elif moment == "after-merge":
+        compaction.swap_in_merged_table = stall_instead_of_swapping
+    else:
+        raise SystemExit(f"unknown moment {moment!r}")
+
+    # Newest first, which is the order a tier lists its tables in and the order
+    # that decides which write of a repeated key wins.
+    paths = sorted(directory.glob("source-*.sst"), reverse=True)
+    tier = CompactionTier(
+        tables=tuple(
+            Table(
+                sequence=int(path.stem.split("-")[1]),
+                size_bytes=path.stat().st_size,
+                path=path,
+            )
+            for path in paths
+        ),
+        ready=True,
+    )
+    compaction.compact_tier(tier, directory / "merged.sst", other_tables=())
+    announce("finished")
+
+
+main()
+'''
+
+
+class _KilledCompaction:
+    """A compaction running in a child process that the test can SIGKILL."""
+
+    def __init__(self, directory: Path, script: Path, moment: str) -> None:
+        script.write_text(_CHILD_SOURCE)
+        source_root = str(Path(ledgerlog.__file__).resolve().parent.parent)
+        environment = dict(os.environ)
+        existing = environment.get("PYTHONPATH")
+        environment["PYTHONPATH"] = (
+            source_root if not existing else os.pathsep.join([source_root, existing])
+        )
+        self._process = subprocess.Popen(
+            [sys.executable, str(script), str(directory), moment],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            env=environment,
+        )
+
+    def wait_for(self, announcement: str, *, timeout: float = 60.0) -> None:
+        """Block until the child says it has reached ``announcement``.
+
+        The wait has a deadline because these tests run unattended: a child that
+        neither answers nor exits should fail the suite rather than hang it, and
+        a blocking read would hang it.
+        """
+        assert self._process.stdout is not None
+        ready, _, _ = select.select([self._process.stdout], [], [], timeout)
+        assert ready, f"child did not reach {announcement!r} within {timeout} seconds"
+        line = self._process.stdout.readline()
+        assert line.strip() == announcement, f"child announced {line!r} instead of {announcement!r}"
+
+    def kill(self) -> None:
+        """Kill the child outright and wait for the operating system to reap it."""
+        os.kill(self._process.pid, signal.SIGKILL)
+        assert self._process.wait(timeout=30) != 0, "the child exited cleanly instead of dying"
+
+    def close(self) -> None:
+        """Make sure the child is gone, whatever the test did or did not do."""
+        if self._process.poll() is None:
+            self._process.kill()
+            self._process.wait(timeout=30)
+        for stream in (self._process.stdin, self._process.stdout):
+            if stream is not None:
+                stream.close()
+
+
+@pytest.fixture
+def killed_compaction(tmp_path: Path) -> Iterator[Callable[[Path, str], _KilledCompaction]]:
+    """Factory for child compactions, each cleaned up when the test finishes."""
+    children: list[_KilledCompaction] = []
+
+    def start(directory: Path, moment: str) -> _KilledCompaction:
+        child = _KilledCompaction(directory, tmp_path / f"child_{len(children)}.py", moment)
+        children.append(child)
+        return child
+
+    try:
+        yield start
+    finally:
+        for child in children:
+            child.close()
+
+
+def data_directory(tmp_path: Path) -> Path:
+    """A directory holding only tables, so a listing of it is an assertion.
+
+    Separate from ``tmp_path`` because the child process's script is written
+    there, and "the directory holds exactly the merged table" is most of what
+    this story claims.
+    """
+    directory = tmp_path / "data"
+    directory.mkdir()
+    return directory
+
+
+def tier_with_a_dropped_tombstone(directory: Path) -> tuple[list[Path], list[Pair], bytes]:
+    """Three real source tables, their newest-wins merge by hand, and the deleted key.
+
+    Thirty keys rather than a handful, so that a merge of these is still
+    streaming records when the child process above is killed partway through it,
+    and so the temporary file that kill leaves behind is unmistakably a partial
+    table rather than an empty one.
+
+    The newest table deletes ``k19``, which both older tables hold values for.
+    With nothing older outside the merge that tombstone is dropped (story M8.3),
+    so the merged table holds no record at all for a key its sources hold values
+    for. That is the case the retirement order has to survive: it is the one key
+    a surviving source could resurrect.
+
+    Returned as (sources newest first, the merged records, the deleted key).
+    """
+    oldest = write_table(
+        directory / "source-0.sst",
+        [(f"k{index:02d}".encode(), f"old-{index:02d}".encode()) for index in range(20)],
+    )
+    middle = write_table(
+        directory / "source-1.sst",
+        [(f"k{index:02d}".encode(), f"mid-{index:02d}".encode()) for index in range(10, 30)],
+    )
+    newest = write_table(
+        directory / "source-2.sst",
+        [
+            *[(f"k{index:02d}".encode(), f"new-{index:02d}".encode()) for index in range(5, 15)],
+            (b"k19", None),
+        ],
+    )
+    expected: list[Pair] = []
+    for index in range(30):
+        key = f"k{index:02d}".encode()
+        if index == 19:
+            continue
+        if 5 <= index <= 14:
+            expected.append((key, f"new-{index:02d}".encode()))
+        elif index <= 9:
+            expected.append((key, f"old-{index:02d}".encode()))
+        else:
+            expected.append((key, f"mid-{index:02d}".encode()))
+    return [newest, middle, oldest], expected, b"k19"
+
+
+def merged_table(sources: Sequence[Path], destination: Path) -> Path:
+    """Merge ``sources`` to ``destination`` the way the swap tests need it merged.
+
+    ``older_tables=[]`` states that the tier is all there is, which is what lets
+    the tombstone be dropped. A swap over a merge that kept every tombstone would
+    be a weaker test: the key a retirement could resurrect would still be in the
+    merged table.
+    """
+    return merge_sstables(sources, destination, older_tables=[]).path
+
+
+# ---------------------------------------------------------------------------
+# Criterion 1: sources go only after the merged footer is written and valid.
+# ---------------------------------------------------------------------------
+
+
+def test_a_merged_table_whose_footer_never_landed_retires_nothing(tmp_path: Path) -> None:
+    """The swap reads the commit point off the disk, not off the merge's return value.
+
+    The file here is a real merge output with its last byte removed, which is
+    what a kill a few microseconds earlier would have left at that name. A swap
+    that trusted the layout the merge handed back would delete all three sources
+    on the strength of a footer that is not there.
+    """
+    sources, _, _ = tier_with_a_dropped_tombstone(tmp_path)
+    before = {path: path.read_bytes() for path in sources}
+    merged = merged_table(sources, tmp_path / "merged.sst")
+    with open(merged, "r+b") as handle:
+        handle.truncate(merged.stat().st_size - 1)
+
+    with pytest.raises(MergeNotCommittedError) as refusal:
+        swap_in_merged_table(merged, sources)
+
+    assert refusal.value.inspection.status is SSTableStatus.INCOMPLETE
+    assert {path: path.read_bytes() for path in sources} == before
+
+
+def test_a_merged_table_with_a_footer_pointing_outside_itself_retires_nothing(
+    tmp_path: Path,
+) -> None:
+    """A whole footer is not enough: it has to describe the file it is in.
+
+    A footer whose sections fall outside the file cannot be the writer's, whatever
+    its checksum says, and following one would seek past the end of the table. The
+    sources are the only other copy of these records, so this is a refusal rather
+    than a repair.
+    """
+    sources, _, _ = tier_with_a_dropped_tombstone(tmp_path)
+    layout = merge_sstables(sources, tmp_path / "merged.sst", older_tables=[])
+    with open(layout.path, "r+b") as handle:
+        handle.seek(layout.footer_offset)
+        handle.write(replace(layout.footer, bloom_filter_end=10**9).encode())
+
+    with pytest.raises(MergeNotCommittedError) as refusal:
+        swap_in_merged_table(layout.path, sources)
+
+    assert refusal.value.inspection.status is SSTableStatus.CORRUPT
+    assert all(inspect_sstable(path).status is SSTableStatus.VALID for path in sources)
+
+
+def test_a_merged_table_in_an_unknown_format_version_retires_nothing(tmp_path: Path) -> None:
+    """A committed table this build cannot read is still no reason to delete the sources.
+
+    Its footer landed, so the records are real, but nothing here can prove that by
+    reading them. Retiring the sources would leave the engine holding one table it
+    refuses to open and no other copy of what is in it.
+    """
+    sources, _, _ = tier_with_a_dropped_tombstone(tmp_path)
+    layout = merge_sstables(sources, tmp_path / "merged.sst", older_tables=[])
+    with open(layout.path, "r+b") as handle:
+        handle.seek(layout.footer_offset)
+        handle.write(replace(layout.footer, format_version=SSTABLE_FORMAT_VERSION + 1).encode())
+
+    with pytest.raises(MergeNotCommittedError) as refusal:
+        swap_in_merged_table(layout.path, sources)
+
+    assert refusal.value.inspection.status is SSTableStatus.UNSUPPORTED_VERSION
+    assert all(path.is_file() for path in sources)
+
+
+def test_a_merged_table_that_is_not_there_retires_nothing(tmp_path: Path) -> None:
+    sources, _, _ = tier_with_a_dropped_tombstone(tmp_path)
+
+    with pytest.raises(FileNotFoundError):
+        swap_in_merged_table(tmp_path / "merged.sst", sources)
+
+    assert all(path.is_file() for path in sources)
+
+
+def test_the_refusal_names_the_table_and_says_what_was_wrong_with_it(tmp_path: Path) -> None:
+    """An operator reading this has to know which file failed which check."""
+    sources, _, _ = tier_with_a_dropped_tombstone(tmp_path)
+    merged = merged_table(sources, tmp_path / "merged.sst")
+    with open(merged, "r+b") as handle:
+        handle.truncate(merged.stat().st_size - 1)
+
+    with pytest.raises(MergeNotCommittedError, match="merged.sst") as refusal:
+        swap_in_merged_table(merged, sources)
+
+    message = str(refusal.value)
+    assert "incomplete" in message
+    assert "no source table was deleted" in message
+
+
+# ---------------------------------------------------------------------------
+# Criterion 3: after a crash-free compaction only the merged table is left, and
+# it answers for everything the retired tables held.
+# ---------------------------------------------------------------------------
+
+
+def test_a_crash_free_compaction_leaves_only_the_merged_table(tmp_path: Path) -> None:
+    directory = data_directory(tmp_path)
+    sources, expected, _ = tier_with_a_dropped_tombstone(directory)
+
+    swap = compact_tier(tier_of(sources), directory / "merged.sst", other_tables=())
+
+    assert [path.name for path in directory.iterdir()] == ["merged.sst"]
+    assert swap.merged == directory / "merged.sst"
+    assert swap.retired == tuple(sources)
+    assert swap.retired_count == len(sources)
+    assert table_records(swap.merged) == expected
+
+
+def test_the_merged_table_answers_for_every_key_the_retired_sources_held(tmp_path: Path) -> None:
+    """ "Covering their key ranges", asserted as reads against the one surviving table.
+
+    Checked by looking every key up rather than by comparing the data block,
+    because what the engine will do with this table is read it, and a table whose
+    records are all present but unreachable through its index would pass a
+    contents comparison.
+    """
+    directory = data_directory(tmp_path)
+    sources, expected, deleted_key = tier_with_a_dropped_tombstone(directory)
+
+    swap = compact_tier(tier_of(sources), directory / "merged.sst", other_tables=())
+
+    assert [(key, read_newest_first([swap.merged], key)) for key, _ in expected] == expected
+    assert read_newest_first([swap.merged], deleted_key) is None
+
+
+def test_the_swap_reports_the_footer_it_read_back_off_the_disk(tmp_path: Path) -> None:
+    directory = data_directory(tmp_path)
+    sources, expected, _ = tier_with_a_dropped_tombstone(directory)
+
+    swap = compact_tier(tier_of(sources), directory / "merged.sst", other_tables=())
+
+    with open(swap.merged, "rb") as handle:
+        assert swap.footer == read_footer(handle)
+    assert swap.footer.record_count == len(expected)
+
+
+def test_a_swap_retires_exactly_the_sources_it_was_given(tmp_path: Path) -> None:
+    """The swap deletes from its argument list, not from the directory it finds itself in."""
+    directory = data_directory(tmp_path)
+    sources, _, _ = tier_with_a_dropped_tombstone(directory)
+    bystander = write_table(directory / "bystander.sst", [(b"k", b"v")])
+    merged = merged_table(sources, directory / "merged.sst")
+
+    swap_in_merged_table(merged, sources)
+
+    assert sorted(path.name for path in directory.iterdir()) == ["bystander.sst", "merged.sst"]
+    assert bystander.is_file()
+
+
+def test_a_completed_swap_cannot_be_changed_afterwards(tmp_path: Path) -> None:
+    directory = data_directory(tmp_path)
+    sources, _, _ = tier_with_a_dropped_tombstone(directory)
+
+    swap = compact_tier(tier_of(sources), directory / "merged.sst", other_tables=())
+
+    assert isinstance(swap, CompactionSwap)
+    with pytest.raises(FrozenInstanceError):
+        swap.retired = ()  # type: ignore[misc]
+
+
+def test_compact_tier_leaves_everything_alone_when_the_merge_fails(tmp_path: Path) -> None:
+    """A merge that raises retires nothing and leaves no debris at either name."""
+    directory = data_directory(tmp_path)
+    sources, _, _ = tier_with_a_dropped_tombstone(directory)
+    with open(sources[0], "r+b") as handle:
+        handle.truncate(sources[0].stat().st_size - FOOTER_SIZE)
+
+    with pytest.raises(SSTableIncompleteError):
+        compact_tier(tier_of(sources), directory / "merged.sst", other_tables=())
+
+    assert sorted(path.name for path in directory.iterdir()) == [
+        "source-0.sst",
+        "source-1.sst",
+        "source-2.sst",
+    ]
+
+
+# ---------------------------------------------------------------------------
+# The retirement order, which is what makes a crash between two unlinks safe.
+# ---------------------------------------------------------------------------
+
+
+def test_the_sources_are_retired_oldest_first(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Asserted as the order of the removals, since the end state cannot show it."""
+    sources, _, _ = tier_with_a_dropped_tombstone(tmp_path)
+    merged = merged_table(sources, tmp_path / "merged.sst")
+    removals: list[Path] = []
+    unlink = Path.unlink
+
+    def recording_unlink(self: Path, missing_ok: bool = False) -> None:
+        removals.append(self)
+        unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", recording_unlink)
+
+    swap_in_merged_table(merged, sources)
+
+    assert removals == list(reversed(sources))
+
+
+def test_a_retirement_stopped_partway_cannot_resurrect_a_deleted_key(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reason the order is a correctness rule and not tidiness.
+
+    The merged table holds no record for ``k19``, because the tombstone that
+    deleted it was dropped as safe to drop. A read now falls through the merged
+    table into whichever sources a crash left behind, so what those are decides
+    whether the key stays deleted. Removing the oldest first leaves the newest,
+    which is where the tombstone is.
+    """
+    sources, _, deleted_key = tier_with_a_dropped_tombstone(tmp_path)
+    merged = merged_table(sources, tmp_path / "merged.sst")
+    removals: list[Path] = []
+    unlink = Path.unlink
+
+    def failing_unlink(self: Path, missing_ok: bool = False) -> None:
+        if removals:
+            raise OSError("the power went out between two unlinks")
+        removals.append(self)
+        unlink(self, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", failing_unlink)
+
+    with pytest.raises(OSError, match="between two unlinks"):
+        swap_in_merged_table(merged, sources)
+
+    monkeypatch.undo()
+    survivors = [path for path in sources if path.is_file()]
+    assert removals == [sources[-1]]
+    assert survivors == sources[:-1]
+    assert read_newest_first([merged, *survivors], deleted_key) is None
+
+
+def test_retiring_the_newest_source_first_would_resurrect_the_deleted_key(tmp_path: Path) -> None:
+    """The counterfactual, by hand: the same partial state in the opposite order.
+
+    Without this the test above would pass for a swap that deleted in any order,
+    since every order leaves the key deleted when nothing goes wrong. This is what
+    makes it an assertion about the order.
+    """
+    sources, _, deleted_key = tier_with_a_dropped_tombstone(tmp_path)
+    merged = merged_table(sources, tmp_path / "merged.sst")
+
+    sources[0].unlink()
+
+    assert read_newest_first([merged, *sources[1:]], deleted_key) == b"mid-19"
+
+
+def test_a_swap_run_again_finishes_an_interrupted_retirement(tmp_path: Path) -> None:
+    """A source already gone is not an error, so a retry is how a swap is finished."""
+    sources, _, _ = tier_with_a_dropped_tombstone(tmp_path)
+    merged = merged_table(sources, tmp_path / "merged.sst")
+    sources[-1].unlink()
+
+    swap = swap_in_merged_table(merged, sources)
+
+    assert swap.retired == tuple(sources)
+    assert not any(path.exists() for path in sources)
+
+
+# ---------------------------------------------------------------------------
+# Criterion 2: a real process killed mid-merge. The sources survive and the
+# partial output is discarded.
+# ---------------------------------------------------------------------------
+
+
+def test_a_process_killed_mid_merge_leaves_every_source_table_intact(
+    tmp_path: Path, killed_compaction: Callable[[Path, str], _KilledCompaction]
+) -> None:
+    directory = data_directory(tmp_path)
+    sources, _, _ = tier_with_a_dropped_tombstone(directory)
+    before = {path: path.read_bytes() for path in sources}
+    child = killed_compaction(directory, "mid-merge")
+    child.wait_for("stalled")
+
+    child.kill()
+
+    assert {path: path.read_bytes() for path in sources} == before
+    assert all(inspect_sstable(path).status is SSTableStatus.VALID for path in sources)
+    assert not (directory / "merged.sst").exists()
+
+
+def test_a_process_killed_mid_merge_leaves_a_partial_table_the_sweep_discards(
+    tmp_path: Path, killed_compaction: Callable[[Path, str], _KilledCompaction]
+) -> None:
+    """What is left at the temporary name is not a table, whatever is in it.
+
+    That the kill landed in the middle of a merge rather than before one started
+    is established by the announcement the test waited for, which the child only
+    makes from inside its eighth record.
+
+    Nothing is asserted about the size, because a killed writer's bytes are
+    whatever its buffer happened to have flushed, which for a merge this small is
+    none of them. An empty file at that name is as much debris as a half-written
+    one, and a sweep that only recognised the second would leave the first
+    behind.
+    """
+    directory = data_directory(tmp_path)
+    sources, _, _ = tier_with_a_dropped_tombstone(directory)
+    debris = temp_table_path(directory / "merged.sst")
+    child = killed_compaction(directory, "mid-merge")
+    child.wait_for("stalled")
+    child.kill()
+    assert debris.is_file()
+    assert inspect_sstable(debris).status is SSTableStatus.INCOMPLETE
+
+    discarded = discard_partial_tables(directory)
+
+    assert discarded == (debris,)
+    assert sorted(path.name for path in directory.iterdir()) == [
+        "source-0.sst",
+        "source-1.sst",
+        "source-2.sst",
+    ]
+
+
+def test_a_compaction_rerun_after_a_crash_mid_merge_loses_nothing(
+    tmp_path: Path, killed_compaction: Callable[[Path, str], _KilledCompaction]
+) -> None:
+    """The whole point of the ordering: the second attempt has everything it needs."""
+    directory = data_directory(tmp_path)
+    sources, expected, _ = tier_with_a_dropped_tombstone(directory)
+    child = killed_compaction(directory, "mid-merge")
+    child.wait_for("stalled")
+    child.kill()
+    discard_partial_tables(directory)
+
+    swap = compact_tier(tier_of(sources), directory / "merged.sst", other_tables=())
+
+    assert table_records(swap.merged) == expected
+    assert [path.name for path in directory.iterdir()] == ["merged.sst"]
+
+
+def test_a_process_killed_between_the_merge_and_the_swap_keeps_both(
+    tmp_path: Path, killed_compaction: Callable[[Path, str], _KilledCompaction]
+) -> None:
+    """The window the ordering deliberately opens, and what it costs: space, not data.
+
+    Killed after the merged table was committed and before a single source was
+    unlinked, the disk holds both. Nothing is lost and nothing is resurrected,
+    since the merged table is newer than every source it was merged from, and the
+    swap can be finished afterwards.
+    """
+    directory = data_directory(tmp_path)
+    sources, expected, _ = tier_with_a_dropped_tombstone(directory)
+    child = killed_compaction(directory, "after-merge")
+    child.wait_for("merged")
+
+    child.kill()
+
+    merged = directory / "merged.sst"
+    assert inspect_sstable(merged).status is SSTableStatus.VALID
+    assert all(path.is_file() for path in sources)
+    assert discard_partial_tables(directory) == ()
+
+    swap = swap_in_merged_table(merged, sources)
+
+    assert swap.retired == tuple(sources)
+    assert [path.name for path in directory.iterdir()] == ["merged.sst"]
+    assert table_records(merged) == expected
+
+
+# ---------------------------------------------------------------------------
+# The startup sweep on its own.
+# ---------------------------------------------------------------------------
+
+
+def test_the_sweep_discards_debris_and_leaves_committed_tables_alone(tmp_path: Path) -> None:
+    directory = data_directory(tmp_path)
+    table = write_table(directory / "table.sst", [(b"k", b"v")])
+    debris = temp_table_path(directory / "merged.sst")
+    debris.write_bytes(b"half a table")
+
+    discarded = discard_partial_tables(directory)
+
+    assert discarded == (debris,)
+    assert [path.name for path in directory.iterdir()] == [table.name]
+    assert inspect_sstable(table).status is SSTableStatus.VALID
+
+
+def test_the_sweep_finds_nothing_to_discard_in_a_clean_directory(tmp_path: Path) -> None:
+    directory = data_directory(tmp_path)
+    write_table(directory / "table.sst", [(b"k", b"v")])
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    assert discard_partial_tables(directory) == ()
+    assert discard_partial_tables(empty) == ()
+
+
+def test_the_sweep_discards_every_partial_table_it_finds(tmp_path: Path) -> None:
+    """A crash leaves one, but a directory can accumulate them across crashes."""
+    directory = data_directory(tmp_path)
+    first = temp_table_path(directory / "merged-1.sst")
+    second = temp_table_path(directory / "merged-2.sst")
+    for debris in (first, second):
+        debris.write_bytes(b"half a table")
+
+    assert discard_partial_tables(directory) == (first, second)
+    assert list(directory.iterdir()) == []
+
+
+def test_the_sweep_leaves_a_directory_named_like_debris_alone(tmp_path: Path) -> None:
+    """Named like debris but not a file, so unlinking it would fail rather than help."""
+    directory = data_directory(tmp_path)
+    lookalike = temp_table_path(directory / "merged.sst")
+    lookalike.mkdir()
+
+    assert discard_partial_tables(directory) == ()
+    assert lookalike.is_dir()
+
+
+def test_a_stale_partial_table_does_not_block_the_next_merge(tmp_path: Path) -> None:
+    """A swept directory is not a precondition for compacting again.
+
+    The writer opens its temporary file for writing, which truncates whatever was
+    there, so debris at that name is overwritten rather than appended to. Worth
+    pinning: the opposite would mean a crash made a destination name unusable
+    until something swept it.
+    """
+    directory = data_directory(tmp_path)
+    sources, expected, _ = tier_with_a_dropped_tombstone(directory)
+    temp_table_path(directory / "merged.sst").write_bytes(b"debris from an earlier crash")
+
+    swap = compact_tier(tier_of(sources), directory / "merged.sst", other_tables=())
+
+    assert table_records(swap.merged) == expected
+    assert [path.name for path in directory.iterdir()] == ["merged.sst"]
+
+
+# ---------------------------------------------------------------------------
+# What a swap refuses to be asked.
+# ---------------------------------------------------------------------------
+
+
+def test_the_merged_table_cannot_be_one_of_the_sources(tmp_path: Path) -> None:
+    """Otherwise the swap would delete the table it had just confirmed."""
+    sources, _, _ = tier_with_a_dropped_tombstone(tmp_path)
+    merged = merged_table(sources, tmp_path / "merged.sst")
+
+    with pytest.raises(ValueError, match="would delete the merged table itself"):
+        swap_in_merged_table(merged, [merged, *sources])
+
+    assert merged.is_file()
+    assert all(path.is_file() for path in sources)
+
+
+def test_a_swap_needs_at_least_one_source_to_retire(tmp_path: Path) -> None:
+    sources, _, _ = tier_with_a_dropped_tombstone(tmp_path)
+    merged = merged_table(sources, tmp_path / "merged.sst")
+
+    with pytest.raises(ValueError, match="at least one source"):
+        swap_in_merged_table(merged, [])
+
+
+def test_the_same_source_cannot_be_listed_twice_in_a_swap(tmp_path: Path) -> None:
+    """The order of the removals is what a crash mid-swap rests on, and a repeat has none."""
+    sources, _, _ = tier_with_a_dropped_tombstone(tmp_path)
+    merged = merged_table(sources, tmp_path / "merged.sst")
+
+    with pytest.raises(ValueError, match="listed twice"):
+        swap_in_merged_table(merged, [*sources, sources[0]])
+
+    assert all(path.is_file() for path in sources)
