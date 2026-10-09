@@ -97,10 +97,12 @@ from ledgerlog.sstable import (
     encode_record,
     inspect_sstable,
     is_complete_sstable,
+    is_temp_table_path,
     iter_records,
     read_bloom_filter,
     read_file_header,
     read_footer,
+    temp_table_path,
     write_sstable,
 )
 
@@ -2251,3 +2253,57 @@ def test_the_default_target_rate_is_what_an_unconfigured_table_carries(tmp_path:
     assert (
         stored_bloom_filter(layout).target_false_positive_rate == DEFAULT_BLOOM_FALSE_POSITIVE_RATE
     )
+
+
+# ---------------------------------------------------------------------------
+# The temporary name a table is written under, which the writer and the startup
+# sweep that clears away a killed writer's debris both have to agree on.
+# ---------------------------------------------------------------------------
+
+
+def test_the_temporary_name_sits_beside_the_destination_and_is_hidden() -> None:
+    """Same directory, because a rename is only atomic within one filesystem."""
+    temporary = temp_table_path(Path("/data/tables/000042.sst"))
+
+    assert temporary.parent == Path("/data/tables")
+    assert temporary.name == ".000042.sst.tmp"
+
+
+def test_the_temporary_name_does_not_match_the_pattern_a_table_is_found_by() -> None:
+    """A table being written must not be a table discovery tries to open."""
+    temporary = temp_table_path(Path("tables/000042.sst"))
+
+    assert temporary.match("*.sst") is False
+    assert is_temp_table_path(temporary) is True
+
+
+def test_the_writer_streams_to_the_name_the_sweep_looks_for(tmp_path: Path) -> None:
+    """The two halves of the convention, asserted against each other.
+
+    A writer using a name the sweep does not recognise would leave debris behind
+    on every crash; a sweep looking for a name the writer does not use would
+    delete nothing and find nothing wrong.
+    """
+    with SSTableWriter(tmp_path / "table.sst") as writer:
+        assert writer.temp_path == temp_table_path(tmp_path / "table.sst")
+        assert is_temp_table_path(writer.temp_path) is True
+        writer.finish()
+
+    assert is_temp_table_path(tmp_path / "table.sst") is False
+
+
+@pytest.mark.parametrize(
+    "name",
+    [".000042.sst.tmp", ".x.tmp", ".sst.tmp"],
+)
+def test_a_name_with_a_destination_between_the_markers_is_debris(name: str) -> None:
+    assert is_temp_table_path(Path("/data") / name) is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["000042.sst", "000042.sst.tmp", ".000042.sst", ".tmp", "", ".tmp.000042.sst"],
+)
+def test_a_name_missing_either_marker_is_not_debris(name: str) -> None:
+    """``.tmp`` alone is the case worth naming: a file someone put there, not ours."""
+    assert is_temp_table_path(Path("/data") / name) is False

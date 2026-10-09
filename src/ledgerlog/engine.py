@@ -277,9 +277,12 @@ What is deliberately not here yet:
 * Running a compaction. Story M8.1 gives the engine a
   :class:`~ledgerlog.compaction.CompactionPlan`, republished whenever a table is
   added, which says which tables are grouped together and which group has enough
-  tables to be worth merging. Nothing acts on it: the merge is story M8.2 and the
-  swap that retires the merged tables is M8.5, so until then the plan is a report
-  about the directory and not a thing the engine does.
+  tables to be worth merging. Nothing acts on it. The merge and the swap that
+  retires its sources both exist now, as
+  :func:`~ledgerlog.compaction.compact_tier`, but the engine calls neither: it
+  cannot yet discover the tables on its own disk (story M9.1), so a compaction
+  here is something a caller drives and the plan is a report about the directory
+  rather than a thing the engine does.
 """
 
 from __future__ import annotations
