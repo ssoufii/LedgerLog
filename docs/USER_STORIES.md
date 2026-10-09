@@ -435,10 +435,10 @@ As the engine/operator, I want records past their retention/TTL cutoff dropped d
 - [ ] Given a record with no expiry or a future expiry, the merge output retains it
 
 **Size**: S
-**Dependencies**: Depends on #24 (M8.2)
+**Dependencies**: Depends on #24 (M8.2), #63 (M8.7), #64 (M8.8)
 
 **Notes**
-ROADMAP's stretch goals list a first-class put(key, value, ttl=...) API as not required for v1. This story's drop logic is a no-op until that API exists to set an expiry; consider deferring it to land alongside the TTL stretch goal, since it currently has nothing to test end-to-end.
+The TTL stretch goal this story used to wait on has been promoted into real stories (M8.6, M8.7, M8.8), so a record can now carry an expiry and this story has something real to drop. Reclaiming the space is all that is left here: M8.8 already hides an expired record from a read the moment it expires, and this story is what stops the bytes being rewritten into the next merged table. Compaction time must come from the same injectable clock M8.8 uses, so the test moves the clock instead of sleeping.
 
 
 ### Atomic swap: footer-complete before source deletion (M8.5)
@@ -456,6 +456,63 @@ As the engine/operator, I want the merged table's footer fully written before an
 **Notes**
 Durability claim per CLAUDE.md: test must actually kill the process/truncate the output mid-merge, not just assert ordering in code.
 
+
+### Per-record expiry in the WAL record format (M8.6)
+
+As the engine/operator, I want every WAL record to carry an absolute expiry timestamp, so that a write made with a TTL keeps the same deadline after a replay instead of having its clock restarted.
+
+**Acceptance criteria**
+- [ ] A WAL record payload is framed as `[1B op][8B expires_at_ms][4B key length][key][value]`, where `expires_at_ms` is an unsigned millisecond Unix timestamp and 0 is the documented no-expiry sentinel
+- [ ] `WAL_FORMAT_VERSION` is bumped to 2 and written in the file header; opening a file whose header carries version 1 raises rather than parsing it as if the expiry field were present
+- [ ] The append API takes an optional absolute expiry (not a relative TTL) and a record written with one replays with the same value
+- [ ] A DELETE record encodes the no-expiry sentinel, so a tombstone does not expire on its own
+- [ ] The record CRC32 covers the expiry field, so a corrupted expiry is rejected rather than trusted
+- [ ] Torn-write test: a record truncated part way through its expiry field is detected as a torn tail, discarded, and every record before it still replays
+
+**Size**: M
+**Dependencies**: Depends on #1 (M1.1), #5 (M1.5)
+
+**Notes**
+Promoted from ROADMAP's stretch goals so that M8.4 has a real expiry to drop. Architecture section 1. Storing an absolute deadline rather than a relative TTL is the whole point of putting it here: the log is replayed at an unknown later time, so a relative TTL would silently extend every record's life by the length of the outage. Turning a caller's TTL into an absolute expiry belongs to M8.8, not here.
+
+
+### Per-record expiry in the SSTable record format (M8.7)
+
+As the engine/operator, I want every SSTable data block record to carry an absolute expiry timestamp, so that a record flushed with a TTL still states its own deadline once it is on disk and a merge can decide whether to keep it.
+
+**Acceptance criteria**
+- [ ] A data block record payload is framed as `[1B kind][8B expires_at_ms][4B key length][key][value]`, with 0 as the documented no-expiry sentinel, matching the WAL's convention
+- [ ] `SSTABLE_FORMAT_VERSION` is bumped to 3 and carried in the footer; a table whose footer reports version 2 is rejected on open rather than parsed with the old record layout
+- [ ] `SSTableRecord` exposes the decoded expiry, and a tombstone record encodes the no-expiry sentinel
+- [ ] Write-then-read round trip: every key written with a mix of no expiry, a past expiry, and a future expiry reads back with exactly the expiry it was written with
+- [ ] A record whose declared key or value length would run past the end of the data block is rejected as a truncated record instead of over-reading the section
+- [ ] The writer takes each record's expiry from its input iterator, so a flush or a merge can pass expiries straight through without a second lookup
+
+**Size**: M
+**Dependencies**: Depends on #12 (M4.1), #13 (M4.2), #14 (M4.3)
+
+**Notes**
+Promoted from ROADMAP's stretch goals so that M8.4 has a real expiry to drop. Architecture section 3. This story only stores and returns the field, nothing filters on it yet: read-time filtering is M8.8 and merge-time dropping is M8.4. Keeping the sentinel identical to the WAL's means a replayed record and a flushed record state "no expiry" the same way.
+
+
+### put(key, value, ttl=...) with read-time expiry (M8.8)
+
+As a caller of the LedgerLog API, I want to write a key with a time to live and have it stop being readable once that time passes, so that short-lived data expires on its own instead of needing an explicit delete.
+
+**Acceptance criteria**
+- [ ] `put(key, value, ttl=...)` accepts a relative TTL in seconds, converts it to an absolute expiry once at write time, and passes that expiry to both the WAL append and the memtable record
+- [ ] `put(key, value)` with no TTL stores the no-expiry sentinel and behaves exactly as it does today
+- [ ] `get(key)` returns `None` for a record whose expiry has passed, without waiting for a compaction to remove it, and returns the value while the expiry is still in the future
+- [ ] A TTL write that is still live when the memtable is flushed keeps its expiry in the resulting SSTable, and reading it back through the engine still honors it
+- [ ] An expired record in an SSTable reads as absent and does not unshadow an older value for the same key in an older table
+- [ ] The engine's clock is injectable, so the tests above assert expiry behavior by moving the clock rather than sleeping
+- [ ] Recovery test: write one record with a short TTL and one with a long TTL, drop the engine without a clean shutdown, reopen past the first record's expiry, and assert the expired key is absent while the other is still readable
+
+**Size**: L
+**Dependencies**: Depends on #62 (M8.6), #63 (M8.7), #22 (M7.2)
+
+**Notes**
+Promoted from ROADMAP's stretch goals so that M8.4 has a real expiry to drop. Expiry is evaluated at read time here and the bytes are reclaimed at merge time in M8.4: the two are separate because a read has to hide an expired record the moment it expires, while reclaiming its space can wait for the next compaction. An expired record must read as absent rather than fall through to an older table's value for the same key, which is the same shadowing rule a tombstone follows (ARCHITECTURE.md section 5).
 
 
 ## M9: Recovery across the full stack

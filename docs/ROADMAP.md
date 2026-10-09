@@ -50,7 +50,10 @@ This milestone is a complete, durable, in-memory-only KV store. It's a good chec
 - [ ] Group SSTables into size tiers, merge a tier once it has enough tables
 - [ ] Drop tombstones once safe (no older table can reference the key), drop TTL-expired records
 - [ ] Atomic swap: merged table's footer must be fully written before source tables are deleted
+- [ ] Per-record expiry in the WAL and SSTable record formats, each with its own format version bump
+- [ ] TTL as a first-class `put(key, value, ttl=...)` parameter, promoted here from the stretch goals below because the expiry drop above has nothing to drop without it
 - [ ] Tests: merge correctness (output matches newest-wins semantics), tombstone gets dropped only when safe, crash mid-compaction leaves source tables intact
+- [ ] Tests: an expiry survives a WAL replay and a flush, an expired record reads as absent before any compaction runs, an expired record is dropped from a merge
 
 ## Milestone 9: recovery across the full stack
 - [ ] Startup sequence: discover SSTables on disk, discard any without a valid footer, replay WAL on top
@@ -62,7 +65,7 @@ This milestone is a complete, durable, in-memory-only KV store. It's a good chec
 - [ ] Tune default sparse index interval, bloom filter false-positive rate, and size-tier thresholds based on bench results
 
 ## Stretch goals (not required for a complete v1)
-- TTL/retention as a first-class `put(key, value, ttl=...)` parameter, not just "compaction drops old stuff"
+- TTL/retention as a first-class `put(key, value, ttl=...)` parameter: promoted into Milestone 8 (stories M8.6 to M8.8), since "compaction drops old stuff" needs a per-record expiry before it can drop anything
 - Leveled compaction as an alternative strategy, benchmarked against size-tiered
 - Range scans (`scan(start_key, end_key)`) across memtable + SSTables
 - Snapshot isolation for reads during compaction
