@@ -31,8 +31,12 @@ import pytest
 from ledgerlog import wal
 from ledgerlog.wal import (
     DEFAULT_FSYNC_INTERVAL_SECONDS,
+    EXPIRY_PAYLOAD_OFFSET,
+    EXPIRY_SIZE,
     FILE_HEADER_SIZE,
+    MAX_EXPIRY_MS,
     MAX_PAYLOAD_SIZE,
+    NO_EXPIRY,
     PAYLOAD_HEADER_SIZE,
     RECORD_HEADER_SIZE,
     WAL_FORMAT_VERSION,
@@ -63,6 +67,7 @@ class DecodedRecord:
     op: int
     key: bytes
     value: bytes
+    expires_at_ms: int
 
     @property
     def total_size(self) -> int:
@@ -91,7 +96,7 @@ def decode_all(raw: bytes) -> list[DecodedRecord]:
         payload = raw[payload_start:payload_end]
         assert zlib.crc32(payload) & 0xFFFFFFFF == checksum, "checksum mismatch"
 
-        op, key_length = struct.unpack_from("<BI", payload, 0)
+        op, expires_at_ms, key_length = struct.unpack_from("<BQI", payload, 0)
         key_start = PAYLOAD_HEADER_SIZE
         key_end = key_start + key_length
         assert key_end <= len(payload), "key length runs past the payload"
@@ -103,6 +108,7 @@ def decode_all(raw: bytes) -> list[DecodedRecord]:
                 op=op,
                 key=payload[key_start:key_end],
                 value=payload[key_end:],
+                expires_at_ms=expires_at_ms,
             )
         )
         offset = payload_end
@@ -123,9 +129,10 @@ def test_put_record_framing(tmp_path: Path) -> None:
     assert payload_length == PAYLOAD_HEADER_SIZE + len(b"alpha") + len(b"one")
     assert checksum == zlib.crc32(payload) & 0xFFFFFFFF
 
-    op, key_length = struct.unpack_from("<BI", payload, 0)
+    op, expires_at_ms, key_length = struct.unpack_from("<BQI", payload, 0)
     assert op == WalOp.PUT
     assert key_length == len(b"alpha")
+    assert expires_at_ms == NO_EXPIRY
     assert payload[PAYLOAD_HEADER_SIZE : PAYLOAD_HEADER_SIZE + key_length] == b"alpha"
     assert payload[PAYLOAD_HEADER_SIZE + key_length :] == b"one"
     assert len(raw) == FILE_HEADER_SIZE + RECORD_HEADER_SIZE + payload_length
@@ -929,7 +936,7 @@ def test_reader_validates_the_header_before_any_record(tmp_path: Path) -> None:
 def test_reader_rejects_a_length_reaching_past_the_end_of_the_file(tmp_path: Path) -> None:
     """The prior records still come back; the record that overruns the file does not."""
     good = [encode_record(WalOp.PUT, b"k1", b"v1"), encode_record(WalOp.DELETE, b"k2", b"")]
-    overrun_payload = struct.pack("<BI", int(WalOp.PUT), 3) + b"key" + b"value"
+    overrun_payload = struct.pack("<BQI", int(WalOp.PUT), NO_EXPIRY, 3) + b"key" + b"value"
     # A header claiming twice the payload that follows it.
     overrun = struct.pack("<II", len(overrun_payload) * 2, 0) + overrun_payload
     path = write_raw_wal(tmp_path / "overrun.wal", *good, overrun)
@@ -996,7 +1003,7 @@ def test_reader_rejects_a_length_above_the_format_limit_without_over_reading(
 
 def test_reader_never_requests_more_bytes_than_the_file_holds() -> None:
     """Every read is bounded by the file, including for a length that merely overruns it."""
-    payload = struct.pack("<BI", int(WalOp.PUT), 3) + b"key"
+    payload = struct.pack("<BQI", int(WalOp.PUT), NO_EXPIRY, 3) + b"key"
     raw = encode_file_header() + struct.pack("<II", 4096, 0) + payload
 
     stream = _ReadSizeRecorder(raw)
@@ -1015,7 +1022,7 @@ def test_reader_rejects_a_payload_length_below_the_minimum(tmp_path: Path) -> No
 
 def test_reader_rejects_a_key_length_reaching_past_its_payload(tmp_path: Path) -> None:
     """The key/value boundary is bounds checked, not clamped to whatever is there."""
-    payload = struct.pack("<BI", int(WalOp.PUT), 99) + b"key" + b"value"
+    payload = struct.pack("<BQI", int(WalOp.PUT), NO_EXPIRY, 99) + b"key" + b"value"
     record = struct.pack("<II", len(payload), zlib.crc32(payload) & 0xFFFFFFFF) + payload
     path = write_raw_wal(tmp_path / "boundary.wal", record)
 
@@ -1025,7 +1032,7 @@ def test_reader_rejects_a_key_length_reaching_past_its_payload(tmp_path: Path) -
 
 
 def test_reader_rejects_an_unknown_op_code(tmp_path: Path) -> None:
-    payload = struct.pack("<BI", 0, 3) + b"key"
+    payload = struct.pack("<BQI", 0, NO_EXPIRY, 3) + b"key"
     record = struct.pack("<II", len(payload), zlib.crc32(payload) & 0xFFFFFFFF) + payload
     path = write_raw_wal(tmp_path / "op.wal", record)
 
@@ -1035,7 +1042,7 @@ def test_reader_rejects_an_unknown_op_code(tmp_path: Path) -> None:
 
 def test_reader_rejects_a_delete_carrying_a_value(tmp_path: Path) -> None:
     """The empty-value convention is a format rule, so the reader enforces it too."""
-    payload = struct.pack("<BI", int(WalOp.DELETE), 3) + b"key" + b"value"
+    payload = struct.pack("<BQI", int(WalOp.DELETE), NO_EXPIRY, 3) + b"key" + b"value"
     record = struct.pack("<II", len(payload), zlib.crc32(payload) & 0xFFFFFFFF) + payload
     path = write_raw_wal(tmp_path / "valued-delete.wal", record)
 
@@ -1045,7 +1052,7 @@ def test_reader_rejects_a_delete_carrying_a_value(tmp_path: Path) -> None:
 
 def test_decode_payload_reports_the_offset_it_was_given() -> None:
     with pytest.raises(WalInvalidRecordError) as excinfo:
-        decode_payload(struct.pack("<BI", int(WalOp.PUT), 10) + b"key", offset=123)
+        decode_payload(struct.pack("<BQI", int(WalOp.PUT), NO_EXPIRY, 10) + b"key", offset=123)
     assert excinfo.value.offset == 123
     assert "123" in str(excinfo.value)
 
@@ -1322,7 +1329,8 @@ def test_replay_of_a_header_only_log_returns_no_records(tmp_path: Path) -> None:
     [
         (2, "mid length field"),
         (RECORD_HEADER_SIZE - 2, "mid checksum"),
-        (RECORD_HEADER_SIZE + 1, "mid op and key length"),
+        (RECORD_HEADER_SIZE + EXPIRY_PAYLOAD_OFFSET + 1, "mid expiry"),
+        (RECORD_HEADER_SIZE + EXPIRY_PAYLOAD_OFFSET + EXPIRY_SIZE + 1, "mid key length"),
         (RECORD_HEADER_SIZE + PAYLOAD_HEADER_SIZE + 1, "mid key"),
         (RECORD_HEADER_SIZE + PAYLOAD_HEADER_SIZE + 3, "mid value"),
     ],
@@ -1354,13 +1362,22 @@ def test_replay_stops_and_truncates_at_a_torn_tail(
     assert path.stat().st_size == good_end, "the torn tail is still on disk"
 
 
-@pytest.mark.parametrize("kept_bytes", list(range(1, 17)))
+TORN_RECORD_SIZE = len(encode_record(WalOp.PUT, b"k2", b"v2"))
+"""Size of the record the exhaustive tail-cut sweep below tears.
+
+Taken from the encoder rather than written out as a number, so that a format
+change which resizes a record keeps the sweep exhaustive instead of quietly
+leaving its new bytes uncut.
+"""
+
+
+@pytest.mark.parametrize("kept_bytes", list(range(1, TORN_RECORD_SIZE)))
 def test_replay_handles_a_tail_cut_at_every_byte_offset(tmp_path: Path, kept_bytes: int) -> None:
     """Exhaustive over where a crash can land inside one record, not just three samples."""
     path = tmp_path / "every-cut.wal"
     encoded = build_log(path, (WalOp.PUT, b"k1", b"v1"))
     torn = encode_record(WalOp.PUT, b"k2", b"v2")
-    assert len(torn) == 17, "the parametrization above tracks this record's length"
+    assert len(torn) == TORN_RECORD_SIZE
     good_end = FILE_HEADER_SIZE + len(encoded[0])
     with open(path, "ab") as handle:
         handle.write(torn[:kept_bytes])
@@ -1589,7 +1606,7 @@ def test_truncation_refuses_to_eat_the_header_or_to_extend_the_file(tmp_path: Pa
 
 def test_reader_reports_a_checksum_mismatch_with_both_values(tmp_path: Path) -> None:
     """The read-only path detects the same damage, and still changes nothing."""
-    payload = struct.pack("<BI", int(WalOp.PUT), 3) + b"key" + b"value"
+    payload = struct.pack("<BQI", int(WalOp.PUT), NO_EXPIRY, 3) + b"key" + b"value"
     stored_checksum = (zlib.crc32(payload) & 0xFFFFFFFF) ^ 0xFFFFFFFF
     record = struct.pack("<II", len(payload), stored_checksum) + payload
     path = write_raw_wal(tmp_path / "mismatch.wal", record)
@@ -1632,3 +1649,249 @@ def test_replay_survives_a_writer_killed_mid_append(tmp_path: Path) -> None:
     assert result.truncated
     assert result.stopped_at == path.stat().st_size
     assert wal.replay(path).is_intact
+
+
+# Per-record expiry (story M8.6). A WAL record carries the absolute time its
+# value stops being valid, so that a replay restores the deadline the writer
+# committed to instead of restarting the clock. Nothing here filters on an
+# expiry: reading one back exactly as it was written is the whole claim, and
+# hiding an expired record is the read path's job (story M8.8).
+
+
+def expiry_field_offset(record_offset: int) -> int:
+    """Absolute file offset of the expiry field of the record starting at ``record_offset``."""
+    return record_offset + RECORD_HEADER_SIZE + EXPIRY_PAYLOAD_OFFSET
+
+
+def test_a_put_carries_its_expiry_in_the_documented_payload_layout(tmp_path: Path) -> None:
+    """The field is where the format says it is, unsigned and little endian."""
+    expires_at_ms = 1_760_000_000_123
+    path = tmp_path / "expiry.wal"
+    with WalWriter(path) as writer:
+        offset = writer.append_put(b"alpha", b"one", expires_at_ms=expires_at_ms)
+
+    raw = path.read_bytes()
+    (stored,) = struct.unpack_from("<Q", raw, expiry_field_offset(offset))
+    assert stored == expires_at_ms
+
+    (record,) = decode_all(raw)
+    assert (record.op, record.key, record.value) == (WalOp.PUT, b"alpha", b"one")
+    assert record.expires_at_ms == expires_at_ms
+    assert record.payload_length == PAYLOAD_HEADER_SIZE + len(b"alpha") + len(b"one")
+
+
+def test_an_expiry_at_the_top_of_the_field_round_trips(tmp_path: Path) -> None:
+    """The field is unsigned, so the largest value it can hold is a usable deadline."""
+    path = tmp_path / "max-expiry.wal"
+    with WalWriter(path) as writer:
+        writer.append_put(b"alpha", b"one", expires_at_ms=MAX_EXPIRY_MS)
+
+    (record,) = read_all(path)
+    assert record.expires_at_ms == MAX_EXPIRY_MS
+
+
+def test_a_put_with_no_ttl_stores_the_no_expiry_sentinel(tmp_path: Path) -> None:
+    """The sentinel is zero, and it is what a caller gets without asking for anything."""
+    assert NO_EXPIRY == 0
+    path = tmp_path / "no-expiry.wal"
+    with WalWriter(path) as writer:
+        writer.append_put(b"alpha", b"one")
+
+    raw = path.read_bytes()
+    (stored,) = struct.unpack_from("<Q", raw, expiry_field_offset(FILE_HEADER_SIZE))
+    assert stored == NO_EXPIRY
+
+    (record,) = read_all(path)
+    assert record.expires_at_ms == NO_EXPIRY
+
+
+def test_the_header_stamps_format_version_two(tmp_path: Path) -> None:
+    assert WAL_FORMAT_VERSION == 2
+    path = tmp_path / "version.wal"
+    with WalWriter(path) as writer:
+        writer.append_put(b"alpha", b"one")
+
+    assert path.read_bytes()[len(WAL_MAGIC)] == 2
+    assert read_file_header_from_path(path) == 2
+
+
+def version_one_wal(path: Path) -> Path:
+    """Write a file in the version 1 layout: a payload with no expiry field.
+
+    Hand-built because this build cannot produce one any more, which is the
+    point: the bytes of a real version 1 log have to stay readable as a test
+    fixture after the writer has moved on.
+    """
+    payload = struct.pack("<BI", int(WalOp.PUT), len(b"alpha")) + b"alpha" + b"one"
+    record = struct.pack("<II", len(payload), zlib.crc32(payload) & 0xFFFFFFFF) + payload
+    path.write_bytes(encode_file_header(version=1) + record)
+    return path
+
+
+def test_a_version_one_file_is_rejected_rather_than_read_with_the_new_layout(
+    tmp_path: Path,
+) -> None:
+    """Every entry point refuses the old layout on the header, before any record.
+
+    A version 1 payload holds no expiry, so parsing one with this layout would
+    read eight bytes of key as a deadline and then split what is left at a
+    boundary the writer never chose. The guard is the header version, so the
+    rejection happens before a single record byte is interpreted.
+    """
+    path = version_one_wal(tmp_path / "v1.wal")
+    before = path.read_bytes()
+
+    for entry_point in (
+        lambda: read_file_header_from_path(path),
+        lambda: WalReader(path),
+        lambda: wal.replay(path),
+        lambda: WalWriter(path),
+    ):
+        with pytest.raises(WalUnsupportedVersionError) as excinfo:
+            entry_point()
+        assert excinfo.value.found_version == 1
+        assert excinfo.value.expected_version == WAL_FORMAT_VERSION
+
+    assert path.read_bytes() == before, "a file this build cannot read is not rewritten"
+
+
+def test_an_expiry_replays_with_the_value_it_was_written_with(tmp_path: Path) -> None:
+    """Recovery restores the deadline, including one that has already passed.
+
+    The already-past record has to come back: replay feeds the memtable, and a
+    record dropped on the way in would stop shadowing an older value for the
+    same key. Deciding it is too late to serve belongs further up.
+    """
+    path = tmp_path / "replay-expiry.wal"
+    written = [
+        (b"none", b"v1", NO_EXPIRY),
+        (b"past", b"v2", 1),
+        (b"future", b"v3", 1_760_000_000_123),
+        (b"top", b"v4", MAX_EXPIRY_MS),
+    ]
+    writer = WalWriter(path, fsync_policy=FsyncPolicy.ALWAYS)
+    for key, value, expires_at_ms in written:
+        writer.append_put(key, value, expires_at_ms=expires_at_ms)
+    # No clean shutdown: the records above are durable under the always policy,
+    # so recovery sees exactly what a crash would have left.
+    writer._file.close()
+
+    result = wal.replay(path)
+
+    assert result.is_intact
+    assert [(r.key, r.value, r.expires_at_ms) for r in result.records] == written
+
+
+def test_a_delete_carries_the_no_expiry_sentinel(tmp_path: Path) -> None:
+    """A tombstone must not expire on its own, enforced at both ends of the format."""
+    path = tmp_path / "delete-expiry.wal"
+    with WalWriter(path) as writer:
+        writer.append_delete(b"alpha")
+
+    (record,) = read_all(path)
+    assert (record.op, record.expires_at_ms) == (WalOp.DELETE, NO_EXPIRY)
+
+    with pytest.raises(WalFormatError, match="no-expiry sentinel"):
+        encode_record(WalOp.DELETE, b"alpha", b"", expires_at_ms=1_760_000_000_123)
+
+
+def test_the_reader_rejects_a_delete_carrying_an_expiry(tmp_path: Path) -> None:
+    """The sentinel rule is a format rule, so a hand-built record breaking it is damage."""
+    payload = struct.pack("<BQI", int(WalOp.DELETE), 1_760_000_000_123, 3) + b"key"
+    record = struct.pack("<II", len(payload), zlib.crc32(payload) & 0xFFFFFFFF) + payload
+    path = write_raw_wal(tmp_path / "expiring-delete.wal", record)
+
+    with pytest.raises(WalInvalidRecordError, match="no-expiry sentinel") as excinfo:
+        read_all(path)
+    assert excinfo.value.offset == FILE_HEADER_SIZE
+
+
+def test_the_checksum_distinguishes_two_records_differing_only_in_expiry() -> None:
+    """If the expiry sat outside the CRC32, these two records would share a checksum."""
+    without = encode_record(WalOp.PUT, b"alpha", b"one")
+    with_expiry = encode_record(WalOp.PUT, b"alpha", b"one", expires_at_ms=1_760_000_000_123)
+
+    assert len(without) == len(with_expiry)
+    stored_without = struct.unpack_from("<II", without, 0)[1]
+    stored_with = struct.unpack_from("<II", with_expiry, 0)[1]
+    assert stored_without != stored_with
+
+
+@pytest.mark.parametrize("byte_in_field", list(range(EXPIRY_SIZE)))
+def test_a_corrupted_expiry_is_rejected_rather_than_trusted(
+    tmp_path: Path, byte_in_field: int
+) -> None:
+    """A flipped bit anywhere in the deadline halts replay, at every byte of the field."""
+    path = tmp_path / "corrupt-expiry.wal"
+    encoded = build_log(path, (WalOp.PUT, b"k1", b"v1"), (WalOp.PUT, b"k2", b"v2"))
+    second_offset = FILE_HEADER_SIZE + len(encoded[0])
+    corrupt_byte(path, expiry_field_offset(second_offset) + byte_in_field)
+
+    with pytest.raises(wal.WalChecksumError) as excinfo:
+        read_all(path)
+    assert excinfo.value.offset == second_offset
+
+    result = wal.replay(path)
+
+    assert [(r.key, r.value) for r in result.records] == [(b"k1", b"v1")]
+    assert isinstance(result.damage, wal.WalChecksumError)
+    assert result.stopped_at == second_offset
+    assert result.truncated and path.stat().st_size == second_offset
+    assert wal.replay(path).is_intact
+
+
+@pytest.mark.parametrize("kept_expiry_bytes", list(range(EXPIRY_SIZE)))
+def test_a_tail_torn_inside_the_expiry_field_is_discarded(
+    tmp_path: Path, kept_expiry_bytes: int
+) -> None:
+    """A crash landing in the new field behaves like any other torn tail.
+
+    The partial record is written through a raw handle, which is the state a real
+    crash leaves: the bytes that reached the disk, and nothing after them.
+    """
+    path = tmp_path / "torn-expiry.wal"
+    encoded = build_log(path, (WalOp.PUT, b"k1", b"v1"), (WalOp.DELETE, b"k0", b""))
+    good_end = FILE_HEADER_SIZE + len(encoded[0]) + len(encoded[1])
+    torn = encode_record(WalOp.PUT, b"k2", b"v2", expires_at_ms=1_760_000_000_123)
+    kept = RECORD_HEADER_SIZE + EXPIRY_PAYLOAD_OFFSET + kept_expiry_bytes
+    with open(path, "ab") as handle:
+        handle.write(torn[:kept])
+        handle.flush()
+        os.fsync(handle.fileno())
+
+    result = wal.replay(path)
+
+    assert [(r.op, r.key, r.value) for r in result.records] == [
+        (WalOp.PUT, b"k1", b"v1"),
+        (WalOp.DELETE, b"k0", b""),
+    ]
+    assert isinstance(result.damage, WalTruncatedRecordError)
+    assert result.stopped_at == good_end
+    assert result.truncated and path.stat().st_size == good_end
+    assert wal.replay(path).is_intact, "the truncated file is a valid log again"
+
+
+@pytest.mark.parametrize("expires_at_ms", [-1, MAX_EXPIRY_MS + 1])
+def test_an_expiry_outside_the_field_is_refused_by_the_format(expires_at_ms: int) -> None:
+    with pytest.raises(WalFormatError, match="millisecond range"):
+        encode_record(WalOp.PUT, b"alpha", b"one", expires_at_ms=expires_at_ms)
+
+
+@pytest.mark.parametrize("expires_at_ms", ["1760000000123", 1.5, None, True])
+def test_a_non_integer_expiry_is_refused(expires_at_ms: object) -> None:
+    """bool is included deliberately: True would otherwise encode as a 1970 deadline."""
+    with pytest.raises(TypeError, match="expires_at_ms"):
+        encode_record(WalOp.PUT, b"alpha", b"one", expires_at_ms=expires_at_ms)  # type: ignore[arg-type]
+
+
+def test_a_rejected_expiry_appends_nothing(tmp_path: Path) -> None:
+    """The record is encoded before it is written, so a bad expiry cannot reach the log."""
+    path = tmp_path / "rejected.wal"
+    with WalWriter(path) as writer:
+        writer.append_put(b"alpha", b"one")
+        size_before = path.stat().st_size
+        with pytest.raises(WalFormatError):
+            writer.append_put(b"beta", b"two", expires_at_ms=MAX_EXPIRY_MS + 1)
+        assert path.stat().st_size == size_before
+
+    assert [(r.key, r.value) for r in read_all(path)] == [(b"alpha", b"one")]
