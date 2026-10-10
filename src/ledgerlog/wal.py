@@ -1,8 +1,9 @@
 """Write-ahead log: file header, record framing, the append-only writer and its
 fsync policy, the sequential reader, and recovery's replay-and-truncate pass.
 
-Scope of this module today (stories M1.1, M1.2, M1.3, M1.4 and M1.5): encoding a
-put or a delete into an on-disk record, stamping every WAL file with a header
+Scope of this module today (stories M1.1, M1.2, M1.3, M1.4, M1.5 and M8.6):
+encoding a put or a delete into an on-disk record along with the absolute time
+that record expires at, stamping every WAL file with a header
 that carries the format version, appending records to a file in call order,
 deciding how often those bytes are forced from the operating system's page cache
 onto the physical disk, reading records back in the order they were written, and
@@ -23,7 +24,7 @@ On-disk record layout::
 
     [ 4B payload length ][ 4B CRC32 ][ payload ]
 
-    payload = [ 1B op ][ 4B key length ][ key ][ value ]
+    payload = [ 1B op ][ 8B expires_at_ms ][ 4B key length ][ key ][ value ]
 
 Why the header carries a magic string as well as the version byte: a lone
 version byte accepts any file whose first byte happens to hold a recognized
@@ -51,6 +52,29 @@ key with a corrupt value. Keeping it inside the payload means any corruption of
 the boundary is caught by the same checksum that covers the op, the key and the
 value.
 
+Why a record carries an absolute expiry rather than the time to live its caller
+asked for: the log is replayed at an unknown later time, so a stored duration
+would start counting again from the replay instead of from the write, and every
+record would outlive its deadline by however long the process was down. An
+absolute millisecond timestamp means a replay restores the same deadline the
+writer committed to. Turning a caller's relative TTL into that timestamp happens
+once, above this module (story M8.8), so the log stores a decision rather than
+re-deriving one.
+
+Why the expiry sits inside the checksummed payload, alongside the op and the key
+length: it is part of what a record means. A flipped bit in an expiry outside the
+CRC32 would be trusted, and recovery would restore a record that dies at the
+wrong time, or (with the sentinel flipped in) one that never dies at all, with
+nothing to report. Covered by the checksum, that corruption is simply a damaged
+record like any other.
+
+Why zero is the no-expiry sentinel rather than a separate flag byte: zero as a
+millisecond Unix timestamp is 1970, long past for every record this engine will
+ever write, so it cannot be mistaken for a live deadline. A flag byte would add a
+second field that can disagree with the first, and a record claiming "no expiry"
+while carrying a deadline would need a tie-break rule that no correct writer
+could ever exercise.
+
 The payload length itself is deliberately not covered by the CRC32, because it
 is the field a reader needs before it can read anything else. A corrupted length
 is still caught, in two stages. First, and independently of the checksum,
@@ -76,12 +100,18 @@ from pathlib import Path
 from types import TracebackType
 from typing import BinaryIO
 
-WAL_FORMAT_VERSION = 1
+WAL_FORMAT_VERSION = 2
 """Version of the file and record layout described in this module's docstring.
 
 Every WAL file stamps this number into its header, and the writer refuses to
 append to a file stamped with anything else, so a layout change is detected
 instead of silently misread.
+
+Version 2 added the per-record expiry field. A version 1 record holds no expiry
+between its op byte and its key length, so reading one with this layout would
+take eight bytes of its key as a deadline and then split the rest at the wrong
+boundary. Rejecting such a file on its header version is what makes that an
+error rather than a silent misread.
 """
 
 WAL_MAGIC = b"LEDGRWAL"
@@ -89,11 +119,39 @@ WAL_MAGIC = b"LEDGRWAL"
 
 _FILE_HEADER_FORMAT = "<8sB"
 _RECORD_HEADER_FORMAT = "<II"
-_PAYLOAD_HEADER_FORMAT = "<BI"
+_PAYLOAD_HEADER_FORMAT = "<BQI"
 
 FILE_HEADER_SIZE = struct.calcsize(_FILE_HEADER_FORMAT)
 RECORD_HEADER_SIZE = struct.calcsize(_RECORD_HEADER_FORMAT)
 PAYLOAD_HEADER_SIZE = struct.calcsize(_PAYLOAD_HEADER_FORMAT)
+
+EXPIRY_PAYLOAD_OFFSET = struct.calcsize("<B")
+"""Byte offset of the expiry field within a record payload: it follows the op byte.
+
+Exported, with :data:`EXPIRY_SIZE`, so that code pointing at the field (a test
+that tears a record part way through its deadline, a tool that dumps one) reads
+the offset off the format rather than restating the layout and drifting from it.
+"""
+
+EXPIRY_SIZE = struct.calcsize("<Q")
+"""Width of the expiry field within a record payload, in bytes."""
+
+NO_EXPIRY = 0
+"""Expiry a record carries when it has no deadline at all.
+
+Part of the format rather than a writer convention, and deliberately the same
+sentinel the SSTable record format uses, so a record recovered from the log and a
+record read back from a flushed table say "never expires" in exactly the same
+way.
+"""
+
+MAX_EXPIRY_MS = 0xFFFFFFFFFFFFFFFF
+"""Largest expiry the 8 byte unsigned field can hold, in milliseconds.
+
+Checked by the writer so that an out of range deadline is reported against the
+format, naming the field, rather than surfacing as a struct.pack error that says
+nothing about which record was at fault.
+"""
 
 MAX_PAYLOAD_SIZE = 64 * 1024 * 1024
 """Largest payload the format allows, in bytes.
@@ -304,13 +362,20 @@ def read_file_header_from_path(path: str | os.PathLike[str]) -> int:
         return read_file_header(stream)
 
 
-def encode_record(op: WalOp, key: bytes, value: bytes) -> bytes:
+def encode_record(op: WalOp, key: bytes, value: bytes, *, expires_at_ms: int = NO_EXPIRY) -> bytes:
     """Return the on-disk bytes for a single WAL record.
 
     The empty-value convention: a DELETE record always carries a zero length
     value. The op byte, not the value, is what marks a key as deleted, so a
     PUT of an empty value and a DELETE of the same key encode differently and
     replay differently.
+
+    ``expires_at_ms`` is an absolute deadline in milliseconds since the Unix
+    epoch, not a duration, for the reason the module docstring gives: the log
+    outlives the process that wrote it. :data:`NO_EXPIRY` means the record has no
+    deadline, and a DELETE is required to use it, because a tombstone that
+    expired on its own would stop shadowing the value it buries and let a key
+    come back from the dead.
     """
     if not isinstance(op, WalOp):
         raise TypeError(f"op must be a WalOp, got {type(op).__name__}")
@@ -318,8 +383,23 @@ def encode_record(op: WalOp, key: bytes, value: bytes) -> bytes:
         raise TypeError(f"key must be bytes, got {type(key).__name__}")
     if not isinstance(value, bytes):
         raise TypeError(f"value must be bytes, got {type(value).__name__}")
+    # bool is an int subclass, and True would silently encode as the 1970 expiry
+    # one millisecond after the no-expiry sentinel.
+    if not isinstance(expires_at_ms, int) or isinstance(expires_at_ms, bool):
+        raise TypeError(f"expires_at_ms must be an int, got {type(expires_at_ms).__name__}")
     if op is WalOp.DELETE and value:
         raise WalFormatError("a DELETE record must carry an empty value")
+    if not NO_EXPIRY <= expires_at_ms <= MAX_EXPIRY_MS:
+        raise WalFormatError(
+            f"expiry {expires_at_ms} is outside the format's {NO_EXPIRY} to "
+            f"{MAX_EXPIRY_MS} millisecond range"
+        )
+    if op is WalOp.DELETE and expires_at_ms != NO_EXPIRY:
+        raise WalFormatError(
+            f"a DELETE record must carry the no-expiry sentinel {NO_EXPIRY}, not "
+            f"expiry {expires_at_ms}: a tombstone that expired on its own would "
+            "unshadow the value it buries"
+        )
 
     payload_size = PAYLOAD_HEADER_SIZE + len(key) + len(value)
     if payload_size > MAX_PAYLOAD_SIZE:
@@ -328,7 +408,7 @@ def encode_record(op: WalOp, key: bytes, value: bytes) -> bytes:
             f"{MAX_PAYLOAD_SIZE} byte format limit"
         )
 
-    payload = struct.pack(_PAYLOAD_HEADER_FORMAT, int(op), len(key)) + key + value
+    payload = struct.pack(_PAYLOAD_HEADER_FORMAT, int(op), expires_at_ms, len(key)) + key + value
     checksum = zlib.crc32(payload) & 0xFFFFFFFF
     return struct.pack(_RECORD_HEADER_FORMAT, len(payload), checksum) + payload
 
@@ -344,17 +424,27 @@ class WalRecord:
     The offsets are part of the record rather than something the caller tracks
     separately: recovery reports where it stopped, and truncates there, so every
     record has to know where it began and ended.
+
+    ``expires_at_ms`` is reported exactly as it was stored, including when that
+    deadline has already passed, rather than being compared against a clock here.
+    Hiding an expired record is the read path's job (story M8.8), and replay in
+    particular needs the expired record back: it still has to shadow an older
+    value for the same key, which it cannot do if recovery drops it on the way in.
     """
 
     op: WalOp
     key: bytes
     value: bytes
+    expires_at_ms: int
     offset: int
     end_offset: int
 
 
-def decode_payload(payload: bytes, *, offset: int = 0) -> tuple[WalOp, bytes, bytes]:
-    """Decode a record payload into its op, key and value.
+def decode_payload(payload: bytes, *, offset: int = 0) -> tuple[WalOp, int, bytes, bytes]:
+    """Decode a record payload into its op, expiry, key and value.
+
+    The fields come back in the order the bytes are laid out, so unpacking the
+    tuple reads the same way as the layout in the module docstring.
 
     ``offset`` is the record's position in the file and is used only to make
     errors point at the right place, so decoding a payload in isolation (a test,
@@ -368,11 +458,13 @@ def decode_payload(payload: bytes, *, offset: int = 0) -> tuple[WalOp, bytes, by
     if len(payload) < PAYLOAD_HEADER_SIZE:
         raise WalInvalidRecordError(
             f"record payload is {len(payload)} bytes, too short to hold the "
-            f"{PAYLOAD_HEADER_SIZE} byte op and key length header",
+            f"{PAYLOAD_HEADER_SIZE} byte op, expiry and key length header",
             offset,
         )
 
-    op_code, key_length = struct.unpack(_PAYLOAD_HEADER_FORMAT, payload[:PAYLOAD_HEADER_SIZE])
+    op_code, expires_at_ms, key_length = struct.unpack(
+        _PAYLOAD_HEADER_FORMAT, payload[:PAYLOAD_HEADER_SIZE]
+    )
     try:
         op = WalOp(op_code)
     except ValueError:
@@ -395,7 +487,13 @@ def decode_payload(payload: bytes, *, offset: int = 0) -> tuple[WalOp, bytes, by
             "empty-value convention requires none",
             offset,
         )
-    return op, key, value
+    if op is WalOp.DELETE and expires_at_ms != NO_EXPIRY:
+        raise WalInvalidRecordError(
+            f"DELETE record carries expiry {expires_at_ms}, but the format requires the "
+            f"no-expiry sentinel {NO_EXPIRY} so that a tombstone does not expire on its own",
+            offset,
+        )
+    return op, expires_at_ms, key, value
 
 
 class WalWriter:
@@ -515,15 +613,24 @@ class WalWriter:
         """Cadence the :attr:`FsyncPolicy.INTERVAL` policy syncs on, in seconds."""
         return self._fsync_interval_seconds
 
-    def append_put(self, key: bytes, value: bytes) -> int:
-        """Append a PUT record and return the byte offset it was written at."""
-        return self._append(encode_record(WalOp.PUT, key, value))
+    def append_put(self, key: bytes, value: bytes, *, expires_at_ms: int = NO_EXPIRY) -> int:
+        """Append a PUT record and return the byte offset it was written at.
+
+        ``expires_at_ms`` is an absolute deadline, not a time to live. Taking the
+        already-resolved timestamp rather than a duration keeps the conversion in
+        one place (the engine, story M8.8) instead of letting every append
+        re-read a clock, which would also make two records written in the same
+        batch disagree about when "now" was.
+        """
+        return self._append(encode_record(WalOp.PUT, key, value, expires_at_ms=expires_at_ms))
 
     def append_delete(self, key: bytes) -> int:
         """Append a DELETE record and return the byte offset it was written at.
 
-        There is no value parameter: the format's empty-value convention is
-        enforced by the API rather than left to the caller to honor.
+        There is no value parameter, and no expiry parameter either: the format's
+        empty-value convention and its rule that a tombstone carries the
+        no-expiry sentinel are both enforced by the API rather than left to the
+        caller to honor.
         """
         return self._append(encode_record(WalOp.DELETE, key, b""))
 
@@ -707,7 +814,7 @@ def _iter_records(stream: BinaryIO, file_size: int) -> Iterator[WalRecord]:
         if payload_length < PAYLOAD_HEADER_SIZE:
             raise WalInvalidRecordError(
                 f"record claims a {payload_length} byte payload, below the "
-                f"{PAYLOAD_HEADER_SIZE} byte minimum for an op and a key length",
+                f"{PAYLOAD_HEADER_SIZE} byte minimum for an op, an expiry and a key length",
                 offset,
             )
         if payload_length > MAX_PAYLOAD_SIZE:
@@ -738,11 +845,12 @@ def _iter_records(stream: BinaryIO, file_size: int) -> Iterator[WalRecord]:
         if found_checksum != checksum:
             raise WalChecksumError(checksum, found_checksum, offset)
 
-        op, key, value = decode_payload(payload, offset=offset)
+        op, expires_at_ms, key, value = decode_payload(payload, offset=offset)
         yield WalRecord(
             op=op,
             key=key,
             value=value,
+            expires_at_ms=expires_at_ms,
             offset=offset,
             end_offset=offset + RECORD_HEADER_SIZE + payload_length,
         )
