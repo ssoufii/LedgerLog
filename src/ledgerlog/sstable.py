@@ -1,12 +1,13 @@
 """SSTable: the immutable, sorted, on-disk form a frozen memtable is flushed into.
 
-Scope of this module today (stories M4.1 through M4.4, plus M5.3): framing a
-record for the data block, streaming a sorted run of records into a file while
-building a sparse index from the offsets that stream produces and a bloom filter
-from the keys, committing the file with a fixed size footer that records the
-format version and where every section starts and ends, reading a key back out
-of a finished table by way of that footer, and judging whether a file found on
-disk is a complete table at all.
+Scope of this module today (stories M4.1 through M4.4, M5.3, plus M8.7): framing
+a record for the data block around the absolute expiry it was written with,
+streaming a sorted run of records into a file while building a sparse index from
+the offsets that stream produces and a bloom filter from the keys, committing the
+file with a fixed size footer that records the format version and where every
+section starts and ends, reading a key back out of a finished table by way of
+that footer, and judging whether a file found on disk is a complete table at
+all.
 
 On-disk layout (little endian, no padding), with the sections this story writes::
 
@@ -29,7 +30,7 @@ On-disk record layout::
 
     [ 4B payload length ][ payload ]
 
-    payload = [ 1B kind ][ 4B key length ][ key ][ value ]
+    payload = [ 1B kind ][ 8B expires_at_ms ][ 4B key length ][ key ][ value ]
 
 On-disk sparse index entry layout::
 
@@ -80,6 +81,28 @@ stored bytes change underneath it. A version 1 table is therefore reported as an
 unsupported version, not as damage, which is the outcome
 :func:`inspect_sstable` already distinguishes: it was committed correctly, and
 this build is the part that no longer matches.
+
+Why the per-record expiry bumped it again, to version 3: it widened the record
+payload header, which is the one part of this format where a length is read
+relative to a field that moved. A version 2 payload holds no expiry between its
+kind byte and its key length, so decoding one with this layout would take eight
+bytes of its key as a deadline and then split what remains at the wrong
+boundary, handing back a truncated key and a value with the rest of the key
+glued to its front. Nothing about those bytes looks wrong on inspection, which
+is precisely the silent misread CLAUDE.md's version byte rule exists to stop, so
+a table whose footer reports version 2 is refused on open rather than parsed.
+
+Why a record stores an absolute deadline rather than the time to live its caller
+asked for, and why zero means no deadline: both match the WAL's record format
+(see ``ledgerlog.wal``) on purpose. A table is read at an unknown later time, so
+a stored duration would restart its clock on every pass and a record would
+outlive its deadline for as long as the data sat on disk. Keeping the same zero
+sentinel means a record replayed from the log and a record read back from a
+flushed table state "never expires" identically, so a flush can copy the field
+across without translating it. This story only stores and returns the field:
+hiding an expired record from a read is story M8.8, and reclaiming its bytes at
+merge time is story M8.4, so every record a table holds is still yielded here
+whatever its deadline says.
 
 Why the bloom filter is stored as one self-contained blob rather than as fields
 spread into the footer: the failure a bloom filter can cause is the one failure
@@ -141,11 +164,16 @@ from typing import BinaryIO
 
 from ledgerlog.bloom import BloomFilter
 
-SSTABLE_FORMAT_VERSION = 2
+SSTABLE_FORMAT_VERSION = 3
 """Version of the layout described in this module's docstring.
 
-Stamped into every SSTable's file header. A build that reads a different number
-reports it rather than parsing bytes whose meaning it is guessing at.
+Stamped into every SSTable's file header and into its footer. A build that reads
+a different number reports it rather than parsing bytes whose meaning it is
+guessing at.
+
+Version 3 added the per-record expiry field to the data block record payload,
+for the reason the module docstring gives: a version 2 record would be misread
+field by field under this layout rather than failing outright.
 """
 
 SSTABLE_MAGIC = b"LEDGRSST"
@@ -161,7 +189,7 @@ the file a flush that died early leaves behind.
 
 _FILE_HEADER_FORMAT = "<8sB"
 _RECORD_LENGTH_FORMAT = "<I"
-_RECORD_PAYLOAD_HEADER_FORMAT = "<BI"
+_RECORD_PAYLOAD_HEADER_FORMAT = "<BQI"
 _INDEX_COUNT_FORMAT = "<I"
 _INDEX_ENTRY_HEADER_FORMAT = "<I"
 _INDEX_ENTRY_OFFSET_FORMAT = "<Q"
@@ -184,6 +212,34 @@ FOOTER_SIZE = FOOTER_FIELDS_SIZE + FOOTER_CHECKSUM_SIZE + FOOTER_MAGIC_SIZE
 Fixed, and part of the format rather than a detail of this implementation: a
 reader finds the footer by seeking this far back from the end of the file, so
 the number has to be knowable without having read anything.
+"""
+
+EXPIRY_PAYLOAD_OFFSET = struct.calcsize("<B")
+"""Byte offset of the expiry field within a record payload: it follows the kind byte.
+
+Exported, with :data:`EXPIRY_SIZE`, so that code pointing at the field (a test
+that cuts a data block part way through a deadline, a tool that dumps one) reads
+the offset off the format rather than restating the layout and drifting from it.
+"""
+
+EXPIRY_SIZE = struct.calcsize("<Q")
+"""Width of the expiry field within a record payload, in bytes."""
+
+NO_EXPIRY = 0
+"""Expiry a record carries when it has no deadline at all.
+
+Part of the format rather than a writer convention, and deliberately the same
+sentinel :data:`ledgerlog.wal.NO_EXPIRY` uses, so a record recovered from the log
+and a record read back from a flushed table say "never expires" in exactly the
+same way and a flush can copy the field across untouched.
+"""
+
+MAX_EXPIRY_MS = 0xFFFFFFFFFFFFFFFF
+"""Largest expiry the 8 byte unsigned field can hold, in milliseconds.
+
+Checked by the writer so that an out of range deadline is reported against the
+format, naming the field, rather than surfacing as a struct.pack error that says
+nothing about which record was at fault.
 """
 
 MAX_RECORD_PAYLOAD_SIZE = 64 * 1024 * 1024
@@ -438,31 +494,72 @@ class SSTableRecord:
     Frozen because a record is a decoded view of bytes that are immutable on
     disk, and a mutation on the way to a caller would make what they hold
     disagree with what the table says.
+
+    ``expires_at_ms`` is reported exactly as it was stored, including when that
+    deadline has already passed. Deciding what to do about an expired record is
+    the read path's (story M8.8) and a merge's (story M8.4), not a decoder's: an
+    expired record still has to shadow an older table's value for its key, which
+    it cannot do if it never reaches the caller. It comes last, with the
+    no-expiry default, so that the field could be added without changing what
+    the four positional fields in front of it mean.
     """
 
     key: bytes
     value: bytes | None
     offset: int
     end_offset: int
+    expires_at_ms: int = NO_EXPIRY
 
     @property
     def is_tombstone(self) -> bool:
         """True if this record marks the key deleted rather than holding a value."""
         return self.value is None
 
+    @property
+    def has_expiry(self) -> bool:
+        """True if this record carries a deadline rather than the no-expiry sentinel.
 
-def encode_record(key: bytes, value: bytes | None) -> bytes:
+        Says only whether a deadline was stored, never whether it has passed:
+        that comparison needs a clock, and which clock is the engine's to choose
+        (story M8.8), so a record decoded from bytes does not make it.
+        """
+        return self.expires_at_ms != NO_EXPIRY
+
+
+def encode_record(key: bytes, value: bytes | None, *, expires_at_ms: int = NO_EXPIRY) -> bytes:
     """Return the on-disk bytes for one data block record.
 
     A ``value`` of ``None`` encodes a tombstone, which always carries a zero
     length value: the kind byte, not the value, is what marks a key deleted, so a
     put of an empty value and a delete of the same key encode differently and
     read back differently.
+
+    ``expires_at_ms`` is an absolute deadline in milliseconds since the Unix
+    epoch, not a duration, for the reason the module docstring gives: a table is
+    read at an unknown later time, and a stored duration would restart its clock
+    on every pass. :data:`NO_EXPIRY` means the record has no deadline, and a
+    tombstone is required to use it, because a tombstone that expired on its own
+    would stop shadowing the value it buries and let a deleted key come back.
     """
     if not isinstance(key, bytes):
         raise TypeError(f"key must be bytes, got {type(key).__name__}")
     if value is not None and not isinstance(value, bytes):
         raise TypeError(f"value must be bytes or None, got {type(value).__name__}")
+    # bool is an int subclass, and True would silently encode as the 1970 expiry
+    # one millisecond after the no-expiry sentinel.
+    if not isinstance(expires_at_ms, int) or isinstance(expires_at_ms, bool):
+        raise TypeError(f"expires_at_ms must be an int, got {type(expires_at_ms).__name__}")
+    if not NO_EXPIRY <= expires_at_ms <= MAX_EXPIRY_MS:
+        raise SSTableFormatError(
+            f"expiry {expires_at_ms} is outside the format's {NO_EXPIRY} to "
+            f"{MAX_EXPIRY_MS} millisecond range"
+        )
+    if value is None and expires_at_ms != NO_EXPIRY:
+        raise SSTableFormatError(
+            f"a tombstone record must carry the no-expiry sentinel {NO_EXPIRY}, not "
+            f"expiry {expires_at_ms}: a tombstone that expired on its own would "
+            "unshadow the value it buries"
+        )
 
     kind = SSTableOp.DELETE if value is None else SSTableOp.PUT
     body = b"" if value is None else value
@@ -473,12 +570,21 @@ def encode_record(key: bytes, value: bytes | None) -> bytes:
             f"{MAX_RECORD_PAYLOAD_SIZE} byte format limit"
         )
 
-    payload = struct.pack(_RECORD_PAYLOAD_HEADER_FORMAT, int(kind), len(key)) + key + body
+    payload = (
+        struct.pack(_RECORD_PAYLOAD_HEADER_FORMAT, int(kind), expires_at_ms, len(key)) + key + body
+    )
     return struct.pack(_RECORD_LENGTH_FORMAT, len(payload)) + payload
 
 
-def decode_record_payload(payload: bytes, *, offset: int = 0) -> tuple[bytes, bytes | None]:
-    """Decode a record payload into its key and its value or tombstone marker.
+def decode_record_payload(payload: bytes, *, offset: int = 0) -> tuple[bytes, bytes | None, int]:
+    """Decode a record payload into its key, its value or tombstone marker, and its expiry.
+
+    The expiry comes back exactly as it was stored, including when that deadline
+    has already passed, rather than being compared against a clock here. Hiding
+    an expired record is the read path's job (story M8.8) and reclaiming its
+    bytes is a merge's (story M8.4); a decoder that dropped it would take both
+    decisions away from the layers that own them, and would also stop an expired
+    record shadowing an older table's value for the same key.
 
     ``offset`` is the record's position in the file and is used only to point
     errors at the right place, so decoding a payload in isolation does not have
@@ -492,11 +598,11 @@ def decode_record_payload(payload: bytes, *, offset: int = 0) -> tuple[bytes, by
     if len(payload) < RECORD_PAYLOAD_HEADER_SIZE:
         raise SSTableInvalidRecordError(
             f"record payload is {len(payload)} bytes, too short to hold the "
-            f"{RECORD_PAYLOAD_HEADER_SIZE} byte kind and key length header",
+            f"{RECORD_PAYLOAD_HEADER_SIZE} byte kind, expiry and key length header",
             offset,
         )
 
-    kind_code, key_length = struct.unpack(
+    kind_code, expires_at_ms, key_length = struct.unpack(
         _RECORD_PAYLOAD_HEADER_FORMAT, payload[:RECORD_PAYLOAD_HEADER_SIZE]
     )
     try:
@@ -524,8 +630,15 @@ def decode_record_payload(payload: bytes, *, offset: int = 0) -> tuple[bytes, by
                 "empty-value convention requires none",
                 offset,
             )
-        return key, None
-    return key, body
+        if expires_at_ms != NO_EXPIRY:
+            raise SSTableInvalidRecordError(
+                f"tombstone record carries expiry {expires_at_ms}, but the format requires "
+                f"the no-expiry sentinel {NO_EXPIRY} so that a tombstone does not expire "
+                "on its own",
+                offset,
+            )
+        return key, None, expires_at_ms
+    return key, body, expires_at_ms
 
 
 def iter_records(
@@ -593,7 +706,8 @@ def _iter_records(stream: BinaryIO, start_offset: int, end_offset: int) -> Itera
         if payload_length < RECORD_PAYLOAD_HEADER_SIZE:
             raise SSTableInvalidRecordError(
                 f"record claims a {payload_length} byte payload, below the "
-                f"{RECORD_PAYLOAD_HEADER_SIZE} byte minimum for a kind and a key length",
+                f"{RECORD_PAYLOAD_HEADER_SIZE} byte minimum for a kind, an expiry and a "
+                "key length",
                 offset,
             )
         if payload_length > MAX_RECORD_PAYLOAD_SIZE:
@@ -616,12 +730,13 @@ def _iter_records(stream: BinaryIO, start_offset: int, end_offset: int) -> Itera
                 f"read {len(payload)} of {payload_length} payload bytes", offset
             )
 
-        key, value = decode_record_payload(payload, offset=offset)
+        key, value, expires_at_ms = decode_record_payload(payload, offset=offset)
         yield SSTableRecord(
             key=key,
             value=value,
             offset=offset,
             end_offset=offset + RECORD_LENGTH_SIZE + payload_length,
+            expires_at_ms=expires_at_ms,
         )
 
 
@@ -1380,13 +1495,21 @@ class SSTableWriter:
         """True once the writer has finished or discarded its temporary file."""
         return self._closed
 
-    def add(self, key: bytes, value: bytes | None) -> int:
+    def add(self, key: bytes, value: bytes | None, *, expires_at_ms: int = NO_EXPIRY) -> int:
         """Append one record and return the byte offset it starts at.
 
         ``value`` of ``None`` writes a tombstone. Tombstones are written like any
         other record, because an SSTable is immutable and a delete is a fact
         about a key at a point in time, not the absence of one: dropping it here
         would let an older table's value for that key resurface on a read.
+
+        ``expires_at_ms`` is the record's absolute deadline, taken from the
+        caller and written as given. A record already past its deadline is still
+        written: the writer's input is a sorted run that a flush or a merge
+        produced, and deciding what to leave out of that run belongs to the merge
+        that built it (story M8.4), not to the file format. Defaulting to
+        :data:`NO_EXPIRY` keeps a caller with no deadlines to pass writing
+        exactly what it wrote before.
         """
         # Finished is checked before closed because finishing also closes: a
         # caller who added a record after finishing wants to hear that, not the
@@ -1403,7 +1526,11 @@ class SSTableWriter:
                 f"{key!r} does not follow {self._last_key!r}"
             )
 
-        record = encode_record(key, value)
+        # Encoded before anything is written or counted, so a record the format
+        # refuses (an out of range expiry, an expiring tombstone) leaves the
+        # writer's index, bloom filter and record count untouched rather than
+        # half advanced through a record that never reached the file.
+        record = encode_record(key, value, expires_at_ms=expires_at_ms)
         # Every key reaches the filter, one way or the other: hashed straight in
         # when the size was known up front, held for finish to size from when it
         # was not.
@@ -1423,17 +1550,19 @@ class SSTableWriter:
         self._last_key = key
         return offset
 
-    def add_put(self, key: bytes, value: bytes) -> int:
-        """Append a record holding ``value`` for ``key``."""
+    def add_put(self, key: bytes, value: bytes, *, expires_at_ms: int = NO_EXPIRY) -> int:
+        """Append a record holding ``value`` for ``key``, with an optional deadline."""
         if not isinstance(value, bytes):
             raise TypeError(f"value must be bytes, got {type(value).__name__}")
-        return self.add(key, value)
+        return self.add(key, value, expires_at_ms=expires_at_ms)
 
     def add_delete(self, key: bytes) -> int:
         """Append a tombstone for ``key``.
 
-        There is no value parameter: the format's empty-value convention is
-        enforced by the API rather than left to the caller to honor.
+        There is no value parameter, and no expiry parameter either: the format's
+        empty-value convention and its rule that a tombstone carries the
+        no-expiry sentinel are both enforced by the API rather than left to the
+        caller to honor.
         """
         return self.add(key, None)
 
@@ -1625,9 +1754,40 @@ def _validate_false_positive_rate(rate: float) -> float:
     return float(rate)
 
 
+InputRecord = tuple[bytes, bytes | None] | tuple[bytes, bytes | None, int]
+"""One record on its way into a table: a key, a value or tombstone, and an expiry.
+
+The expiry is the optional third element rather than a required one so that the
+field can be passed straight through by a caller that has deadlines (a flush of
+a memtable holding TTL writes, a merge copying records forward) without forcing
+one on a caller that has none. A pair means :data:`NO_EXPIRY`, which is the same
+thing the pair meant before the field existed, so no existing caller has to
+restate "this record never expires" to keep writing what it already wrote.
+"""
+
+
+def _unpack_input_record(record: InputRecord, *, index: int) -> tuple[bytes, bytes | None, int]:
+    """Split one input record into its key, value and expiry.
+
+    The length is checked rather than unpacked optimistically so that a caller
+    handing over the wrong shape (a three element row where the third is a
+    sequence number, say) is told which record was wrong, instead of having a
+    ValueError from tuple unpacking surface with no position in it.
+    """
+    if len(record) == 2:
+        key, value = record
+        return key, value, NO_EXPIRY
+    if len(record) == 3:
+        return record
+    raise TypeError(
+        f"record at index {index} has {len(record)} elements, but a record is a "
+        "(key, value) pair or a (key, value, expires_at_ms) triple"
+    )
+
+
 def write_sstable(
     path: str | os.PathLike[str],
-    records: Iterable[tuple[bytes, bytes | None]],
+    records: Iterable[InputRecord],
     *,
     index_interval: int = DEFAULT_INDEX_INTERVAL,
     expected_keys: int | None = None,
@@ -1635,11 +1795,13 @@ def write_sstable(
 ) -> SSTableLayout:
     """Write ``records`` to a new SSTable at ``path`` and return its layout.
 
-    ``records`` is an iterable of ``(key, value)`` pairs in ascending key order,
-    where a value of ``None`` is a tombstone. Plain tuples rather than a memtable
-    type, so that CLAUDE.md's rule about independently testable components holds:
-    the SSTable format does not need to import the memtable to be written, and a
-    caller flushing one adapts its entries in a generator expression.
+    ``records`` is an iterable of :data:`InputRecord` rows in ascending key
+    order: ``(key, value)`` pairs, or ``(key, value, expires_at_ms)`` triples
+    when the caller has absolute deadlines to carry across. A value of ``None``
+    is a tombstone. Plain tuples rather than a memtable type, so that CLAUDE.md's
+    rule about independently testable components holds: the SSTable format does
+    not need to import the memtable to be written, and a caller flushing one
+    adapts its entries in a generator expression.
 
     ``expected_keys`` and ``bloom_false_positive_rate`` are passed through to
     :class:`SSTableWriter`. They are not defaulted from ``len(records)`` here,
@@ -1652,8 +1814,9 @@ def write_sstable(
         expected_keys=expected_keys,
         bloom_false_positive_rate=bloom_false_positive_rate,
     ) as writer:
-        for key, value in records:
-            writer.add(key, value)
+        for index, record in enumerate(records):
+            key, value, expires_at_ms = _unpack_input_record(record, index=index)
+            writer.add(key, value, expires_at_ms=expires_at_ms)
         return writer.finish()
 
 
