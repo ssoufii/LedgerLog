@@ -2,8 +2,8 @@
 
 Covers story M4.1 (SSTable writer: data block plus sparse index), story M4.2
 (footer with format version and section offsets), story M4.3 (reader: footer
-parse, index binary search, key scan) and story M4.4 (corrupt footer detection
-on read).
+parse, index binary search, key scan), story M4.4 (corrupt footer detection
+on read) and story M8.7 (per-record expiry in the record format).
 
 The M4.4 tests are about which answer a damaged file gets, not only that it is
 refused, so they assert on the verdict and the error type rather than on a bare
@@ -49,7 +49,7 @@ from typing import BinaryIO
 
 import pytest
 
-from ledgerlog import sstable
+from ledgerlog import sstable, wal
 from ledgerlog.bloom import (
     BLOOM_CHECKSUM_SIZE,
     BLOOM_HEADER_SIZE,
@@ -62,6 +62,8 @@ from ledgerlog.bloom import (
 from ledgerlog.sstable import (
     DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
     DEFAULT_INDEX_INTERVAL,
+    EXPIRY_PAYLOAD_OFFSET,
+    EXPIRY_SIZE,
     FILE_HEADER_SIZE,
     FOOTER_CHECKSUM_SIZE,
     FOOTER_FIELDS_SIZE,
@@ -70,7 +72,9 @@ from ledgerlog.sstable import (
     INDEX_COUNT_SIZE,
     INDEX_ENTRY_HEADER_SIZE,
     INDEX_ENTRY_OFFSET_SIZE,
+    MAX_EXPIRY_MS,
     MAX_RECORD_PAYLOAD_SIZE,
+    NO_EXPIRY,
     RECORD_LENGTH_SIZE,
     RECORD_PAYLOAD_HEADER_SIZE,
     SSTABLE_FOOTER_MAGIC,
@@ -93,6 +97,7 @@ from ledgerlog.sstable import (
     SSTableTruncatedRecordError,
     SSTableUnsupportedVersionError,
     SSTableWriter,
+    decode_record_payload,
     encode_file_header,
     encode_record,
     inspect_sstable,
@@ -196,7 +201,7 @@ def test_records_are_contiguous_with_no_gaps_or_overlaps(tmp_path: Path) -> None
 def test_record_bytes_match_the_documented_layout(tmp_path: Path) -> None:
     path = tmp_path / "layout.sst"
     with SSTableWriter(path) as writer:
-        writer.add_put(b"kk", b"vvv")
+        writer.add_put(b"kk", b"vvv", expires_at_ms=1_700_000_000_123)
         layout = writer.finish()
 
     raw = path.read_bytes()
@@ -207,11 +212,14 @@ def test_record_bytes_match_the_documented_layout(tmp_path: Path) -> None:
     cursor = layout.data_block_offset
     (payload_length,) = struct.unpack("<I", raw[cursor : cursor + RECORD_LENGTH_SIZE])
     cursor += RECORD_LENGTH_SIZE
-    kind, key_length = struct.unpack("<BI", raw[cursor : cursor + RECORD_PAYLOAD_HEADER_SIZE])
+    kind, expires_at_ms, key_length = struct.unpack(
+        "<BQI", raw[cursor : cursor + RECORD_PAYLOAD_HEADER_SIZE]
+    )
     cursor += RECORD_PAYLOAD_HEADER_SIZE
 
     assert payload_length == RECORD_PAYLOAD_HEADER_SIZE + len(b"kk") + len(b"vvv")
     assert kind == SSTableOp.PUT
+    assert expires_at_ms == 1_700_000_000_123
     assert key_length == len(b"kk")
     assert raw[cursor : cursor + key_length] == b"kk"
     assert raw[cursor + key_length : cursor + key_length + 3] == b"vvv"
@@ -499,7 +507,7 @@ def test_record_length_below_the_payload_header_is_rejected(tmp_path: Path) -> N
 
 
 def test_key_length_reaching_past_its_own_payload_is_rejected(tmp_path: Path) -> None:
-    payload = struct.pack("<BI", int(SSTableOp.PUT), 4096) + b"k"
+    payload = struct.pack("<BQI", int(SSTableOp.PUT), sstable.NO_EXPIRY, 4096) + b"k"
     raw = sstable.encode_file_header() + struct.pack("<I", len(payload)) + payload
     path = tmp_path / "keylen.sst"
     path.write_bytes(raw)
@@ -512,7 +520,7 @@ def test_key_length_reaching_past_its_own_payload_is_rejected(tmp_path: Path) ->
 
 
 def test_unknown_record_kind_is_rejected(tmp_path: Path) -> None:
-    payload = struct.pack("<BI", 9, 1) + b"k"
+    payload = struct.pack("<BQI", 9, sstable.NO_EXPIRY, 1) + b"k"
     raw = sstable.encode_file_header() + struct.pack("<I", len(payload)) + payload
     path = tmp_path / "kind.sst"
     path.write_bytes(raw)
@@ -522,7 +530,7 @@ def test_unknown_record_kind_is_rejected(tmp_path: Path) -> None:
 
 
 def test_tombstone_carrying_a_value_is_rejected(tmp_path: Path) -> None:
-    payload = struct.pack("<BI", int(SSTableOp.DELETE), 1) + b"k" + b"value"
+    payload = struct.pack("<BQI", int(SSTableOp.DELETE), sstable.NO_EXPIRY, 1) + b"k" + b"value"
     raw = sstable.encode_file_header() + struct.pack("<I", len(payload)) + payload
     path = tmp_path / "fat_tombstone.sst"
     path.write_bytes(raw)
@@ -2307,3 +2315,482 @@ def test_a_name_with_a_destination_between_the_markers_is_debris(name: str) -> N
 def test_a_name_missing_either_marker_is_not_debris(name: str) -> None:
     """``.tmp`` alone is the case worth naming: a file someone put there, not ours."""
     assert is_temp_table_path(Path("/data") / name) is False
+
+
+# Story M8.7: every data block record carries an absolute expiry.
+#
+# The round-trip tests below assert the expiry a record reads back with, not
+# whether it has passed. Nothing in this story filters on a deadline: read-time
+# hiding is M8.8 and merge-time dropping is M8.4, so a table that quietly
+# dropped an expired record here would pass a test that only asked for the live
+# ones back and would still have lost the record that has to shadow an older
+# table's value for its key. That is why a past expiry is written and then
+# expected back, rather than written and expected gone.
+#
+# The layout tests decode the new field with plain ``struct`` calls for the same
+# reason the older ones do: what is being checked is that the bytes on disk
+# match the documented format, and a decoder sharing code with the encoder can
+# agree with it and still have both wrong.
+
+
+def read_records_with_expiry(layout: SSTableLayout) -> list[tuple[bytes, bytes | None, int]]:
+    """Read the whole data block back as (key, value, expiry) rows."""
+    with open(layout.path, "rb") as handle:
+        return [
+            (record.key, record.value, record.expires_at_ms)
+            for record in iter_records(
+                handle,
+                start_offset=layout.data_block_offset,
+                end_offset=layout.data_block_end,
+            )
+        ]
+
+
+# Acceptance criterion: a record payload is framed as [1B kind][8B expires_at_ms]
+# [4B key length][key][value], with 0 as the no-expiry sentinel.
+
+
+def test_the_expiry_sits_between_the_kind_byte_and_the_key_length(tmp_path: Path) -> None:
+    deadline = 1_900_000_000_456
+    path = tmp_path / "framed.sst"
+    with SSTableWriter(path) as writer:
+        writer.add_put(b"kk", b"vvv", expires_at_ms=deadline)
+        layout = writer.finish()
+
+    raw = path.read_bytes()
+    cursor = layout.data_block_offset + RECORD_LENGTH_SIZE
+    kind, expires_at_ms, key_length = struct.unpack(
+        "<BQI", raw[cursor : cursor + RECORD_PAYLOAD_HEADER_SIZE]
+    )
+
+    assert kind == SSTableOp.PUT
+    assert expires_at_ms == deadline
+    assert key_length == len(b"kk")
+    # The field's documented position, read off the format rather than restated.
+    assert EXPIRY_PAYLOAD_OFFSET == struct.calcsize("<B")
+    assert EXPIRY_SIZE == 8
+    assert RECORD_PAYLOAD_HEADER_SIZE == struct.calcsize("<BQI")
+    body = cursor + RECORD_PAYLOAD_HEADER_SIZE
+    assert raw[body : body + key_length] == b"kk"
+    assert raw[body + key_length : body + key_length + 3] == b"vvv"
+
+
+def test_a_record_written_without_a_deadline_stores_the_zero_sentinel(tmp_path: Path) -> None:
+    layout = write_sstable(tmp_path / "sentinel.sst", [(b"plain", b"value")])
+
+    raw = layout.path.read_bytes()
+    cursor = layout.data_block_offset + RECORD_LENGTH_SIZE
+    _, expires_at_ms, _ = struct.unpack("<BQI", raw[cursor : cursor + RECORD_PAYLOAD_HEADER_SIZE])
+
+    assert NO_EXPIRY == 0
+    assert expires_at_ms == NO_EXPIRY
+    assert read_records_with_expiry(layout) == [(b"plain", b"value", NO_EXPIRY)]
+
+
+def test_the_sentinel_matches_the_wal_s_so_a_flush_can_copy_the_field_across() -> None:
+    """The two formats have to agree, or a flushed record would say something else.
+
+    Asserted rather than assumed because the constant is declared in each module
+    (CLAUDE.md keeps the formats independently describable), and two independent
+    declarations are two things that can drift.
+    """
+    assert sstable.NO_EXPIRY == wal.NO_EXPIRY
+    assert sstable.MAX_EXPIRY_MS == wal.MAX_EXPIRY_MS
+    assert sstable.EXPIRY_SIZE == wal.EXPIRY_SIZE
+
+
+def test_an_expiry_outside_the_eight_byte_field_is_refused() -> None:
+    with pytest.raises(SSTableFormatError, match="millisecond range"):
+        encode_record(b"k", b"v", expires_at_ms=MAX_EXPIRY_MS + 1)
+    with pytest.raises(SSTableFormatError, match="millisecond range"):
+        encode_record(b"k", b"v", expires_at_ms=-1)
+
+
+def test_the_largest_expiry_the_field_can_hold_round_trips(tmp_path: Path) -> None:
+    layout = write_sstable(tmp_path / "max.sst", [(b"k", b"v", MAX_EXPIRY_MS)])
+
+    assert read_records_with_expiry(layout) == [(b"k", b"v", MAX_EXPIRY_MS)]
+
+
+def test_a_bool_expiry_is_refused_rather_than_encoded_as_one_millisecond() -> None:
+    """``True`` is an int, and would store the 1970 deadline next to the sentinel."""
+    with pytest.raises(TypeError, match="expires_at_ms must be an int"):
+        encode_record(b"k", b"v", expires_at_ms=True)
+
+
+# Acceptance criterion: SSTABLE_FORMAT_VERSION is bumped to 3 and carried in the
+# footer; a table whose footer reports version 2 is rejected on open rather than
+# parsed with the old record layout.
+
+
+def test_the_format_version_is_three_in_both_the_header_and_the_footer(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "v3.sst", 12, interval=4)
+
+    assert SSTABLE_FORMAT_VERSION == 3
+    _, header_version = struct.unpack("<8sB", layout.path.read_bytes()[:FILE_HEADER_SIZE])
+    assert header_version == 3
+    with open(layout.path, "rb") as handle:
+        assert read_footer(handle).format_version == 3
+
+
+def test_a_table_whose_footer_reports_version_two_is_rejected_on_open(tmp_path: Path) -> None:
+    layout = build_table(tmp_path / "v2.sst", 20, interval=8)
+    older = tmp_path / "v2_copy.sst"
+    older.write_bytes(stamped_with_version(layout, 2))
+
+    with pytest.raises(SSTableUnsupportedVersionError) as caught:
+        SSTableReader.open(older)
+    assert caught.value.found_version == 2
+    assert caught.value.expected_version == 3
+
+
+def test_a_version_two_footer_alone_is_enough_to_refuse_the_table(tmp_path: Path) -> None:
+    """The criterion names the footer, so the footer is checked on its own.
+
+    A file whose header still says 3 and whose footer says 2 must not be read as
+    a version 3 table: the footer is the commit point, and it is the stamp a
+    discovery pass has in hand once the file is closed.
+    """
+    layout = build_table(tmp_path / "mixed.sst", 20, interval=8)
+    mixed = tmp_path / "mixed_copy.sst"
+    mixed.write_bytes(replaced_footer(layout, format_version=2))
+
+    with pytest.raises(SSTableUnsupportedVersionError) as caught:
+        SSTableReader.open(mixed)
+    assert caught.value.found_version == 2
+
+
+def test_a_version_two_table_is_unsupported_rather_than_corrupt(tmp_path: Path) -> None:
+    """The M4.4 distinction, applied to this build's immediate predecessor.
+
+    A version 2 table was committed correctly and its data is real; this build is
+    the part that cannot frame its records. Reporting it as damage is how an
+    engine deletes a good table on the way past.
+    """
+    layout = build_table(tmp_path / "v2verdict.sst", 20, interval=8)
+    older = tmp_path / "v2verdict_copy.sst"
+    older.write_bytes(stamped_with_version(layout, 2))
+
+    verdict = inspect_sstable(older)
+    assert verdict.status is SSTableStatus.UNSUPPORTED_VERSION
+    assert verdict.is_valid is False
+    assert verdict.is_complete is True
+    assert is_complete_sstable(older) is True
+
+
+def test_a_version_two_payload_does_not_decode_as_a_version_three_one() -> None:
+    """Why the version gate is not belt and braces: the two layouts overlap.
+
+    A version 2 payload put its key length where version 3 puts the middle of
+    the expiry, so reading one with this layout takes bytes of the key as a
+    deadline and then splits what is left at the wrong boundary. Nothing in the
+    bytes themselves says which layout they are in, which is what makes the
+    stored version the only thing standing between a version 2 table and a
+    silently wrong read.
+    """
+    key = b"user:0001"
+    version_two_payload = struct.pack("<BI", int(SSTableOp.PUT), len(key)) + key + b"payload-value"
+
+    with pytest.raises(SSTableInvalidRecordError):
+        decode_record_payload(version_two_payload)
+
+
+# Acceptance criterion: SSTableRecord exposes the decoded expiry, and a
+# tombstone record encodes the no-expiry sentinel.
+
+
+def test_a_record_read_back_exposes_the_expiry_it_was_written_with(tmp_path: Path) -> None:
+    deadline = 2_000_000_000_000
+    layout = write_sstable(tmp_path / "exposed.sst", [(b"k", b"v", deadline)])
+
+    with open(layout.path, "rb") as handle:
+        (record,) = iter_records(
+            handle,
+            start_offset=layout.data_block_offset,
+            end_offset=layout.data_block_end,
+        )
+
+    assert record.expires_at_ms == deadline
+    assert record.has_expiry is True
+    assert record.is_tombstone is False
+
+
+def test_a_record_without_a_deadline_reports_no_expiry(tmp_path: Path) -> None:
+    layout = write_sstable(tmp_path / "noexp.sst", [(b"k", b"v")])
+
+    with open(layout.path, "rb") as handle:
+        (record,) = iter_records(
+            handle,
+            start_offset=layout.data_block_offset,
+            end_offset=layout.data_block_end,
+        )
+
+    assert record.expires_at_ms == NO_EXPIRY
+    assert record.has_expiry is False
+
+
+def test_the_reader_s_lookup_returns_the_stored_expiry(tmp_path: Path) -> None:
+    """The expiry has to reach the read path, not only the record iterator."""
+    records: list[tuple[bytes, bytes | None, int]] = [
+        (keyed(index), b"v", index * 1000 + 1) for index in range(40)
+    ]
+    layout = write_sstable(tmp_path / "lookup.sst", records, index_interval=8)
+
+    with SSTableReader.open(layout.path) as reader:
+        for key, _, deadline in records:
+            found = reader.lookup(key)
+            assert found is not None
+            assert found.expires_at_ms == deadline
+
+
+def test_a_tombstone_encodes_the_no_expiry_sentinel(tmp_path: Path) -> None:
+    layout = write_sstable(tmp_path / "tombstone_expiry.sst", [(b"gone", None)])
+
+    raw = layout.path.read_bytes()
+    cursor = layout.data_block_offset + RECORD_LENGTH_SIZE
+    kind, expires_at_ms, _ = struct.unpack(
+        "<BQI", raw[cursor : cursor + RECORD_PAYLOAD_HEADER_SIZE]
+    )
+
+    assert kind == SSTableOp.DELETE
+    assert expires_at_ms == NO_EXPIRY
+    assert read_records_with_expiry(layout) == [(b"gone", None, NO_EXPIRY)]
+
+
+def test_a_tombstone_given_a_deadline_is_refused_by_the_encoder() -> None:
+    """A tombstone that expired on its own would unshadow the value it buries."""
+    with pytest.raises(SSTableFormatError, match="no-expiry sentinel"):
+        encode_record(b"gone", None, expires_at_ms=1_700_000_000_000)
+
+
+def test_a_tombstone_given_a_deadline_is_refused_by_the_writer(tmp_path: Path) -> None:
+    with SSTableWriter(tmp_path / "refused.sst") as writer:
+        with pytest.raises(SSTableFormatError, match="no-expiry sentinel"):
+            writer.add(b"gone", None, expires_at_ms=1)
+        # The refused record left nothing behind: it never reached the file, the
+        # index or the count, so the next key is still free to be the first.
+        assert writer.record_count == 0
+        writer.add_put(b"gone", b"still writable")
+        layout = writer.finish()
+
+    assert read_records_with_expiry(layout) == [(b"gone", b"still writable", NO_EXPIRY)]
+
+
+def test_a_stored_tombstone_carrying_a_deadline_is_rejected_on_read(tmp_path: Path) -> None:
+    """The decoder enforces the rule too, since a damaged disk does not call the writer."""
+    payload = struct.pack("<BQI", int(SSTableOp.DELETE), 42, 1) + b"k"
+    raw = sstable.encode_file_header() + struct.pack("<I", len(payload)) + payload
+    path = tmp_path / "expiring_tombstone.sst"
+    path.write_bytes(raw)
+
+    with (
+        open(path, "rb") as handle,
+        pytest.raises(SSTableInvalidRecordError, match="no-expiry sentinel"),
+    ):
+        list(iter_records(handle, start_offset=FILE_HEADER_SIZE, end_offset=len(raw)))
+
+
+# Acceptance criterion: a write-then-read round trip over a mix of no expiry, a
+# past expiry and a future expiry returns exactly the expiry each key was
+# written with.
+
+
+def test_a_mix_of_no_past_and_future_expiries_round_trips_exactly(tmp_path: Path) -> None:
+    now_ms = 1_700_000_000_000
+    records: list[tuple[bytes, bytes | None, int]] = [
+        (b"a_none", b"one", NO_EXPIRY),
+        (b"b_past", b"two", now_ms - 60_000),
+        (b"c_future", b"three", now_ms + 60_000),
+        (b"d_long_past", b"four", 1),
+        (b"e_far_future", b"five", MAX_EXPIRY_MS),
+    ]
+    layout = write_sstable(tmp_path / "mixed_expiry.sst", records)
+
+    # Read back twice, by both routes a caller has: the data block scan and the
+    # reader's indexed lookup.
+    assert read_records_with_expiry(layout) == records
+    with SSTableReader.open(layout.path) as reader:
+        for key, value, deadline in records:
+            found = reader.lookup(key)
+            assert found is not None
+            assert (found.key, found.value, found.expires_at_ms) == (key, value, deadline)
+
+
+def test_a_past_expiry_is_returned_rather_than_filtered_out(tmp_path: Path) -> None:
+    """This story stores the field and nothing more.
+
+    Hiding an expired record belongs to M8.8 and reclaiming its bytes to M8.4. A
+    table that dropped it here would also drop the shadowing an expired record
+    still has to do over an older table's value for the same key.
+    """
+    layout = write_sstable(tmp_path / "past.sst", [(b"stale", b"value", 1)])
+
+    assert read_records_with_expiry(layout) == [(b"stale", b"value", 1)]
+    with SSTableReader.open(layout.path) as reader:
+        found = reader.lookup(b"stale")
+    assert found is not None
+    assert found.value == b"value"
+    assert found.expires_at_ms == 1
+
+
+def test_expiries_survive_a_table_large_enough_to_need_its_index(tmp_path: Path) -> None:
+    """Every record, not a handful: an index interval is where an offset bug hides."""
+    records: list[tuple[bytes, bytes | None, int]] = [
+        (
+            keyed(index),
+            None if index % 7 == 0 else valued(index),
+            # A tombstone has to carry the sentinel, so only the puts get a deadline.
+            NO_EXPIRY if index % 7 == 0 else index + 1,
+        )
+        for index in range(300)
+    ]
+    layout = write_sstable(tmp_path / "big_expiry.sst", records, index_interval=16)
+
+    assert read_records_with_expiry(layout) == records
+
+
+# Acceptance criterion: a record whose declared key or value length would run
+# past the end of the data block is rejected as a truncated record instead of
+# over-reading the section.
+
+
+def test_a_key_length_reaching_past_the_data_block_is_rejected(tmp_path: Path) -> None:
+    key = b"short"
+    payload = struct.pack("<BQI", int(SSTableOp.PUT), NO_EXPIRY, 1 << 20) + key
+    raw = sstable.encode_file_header() + struct.pack("<I", len(payload)) + payload
+    path = tmp_path / "keylen_block.sst"
+    path.write_bytes(raw)
+
+    with (
+        open(path, "rb") as handle,
+        pytest.raises(SSTableInvalidRecordError, match="payload bytes follow"),
+    ):
+        list(iter_records(handle, start_offset=FILE_HEADER_SIZE, end_offset=len(raw)))
+
+
+def test_a_value_running_past_the_data_block_end_is_truncated_not_over_read(
+    tmp_path: Path,
+) -> None:
+    """The block's end, not the file's: the index follows it, and must not be read as a value."""
+    layout = write_sstable(
+        tmp_path / "value_past_block.sst",
+        [(b"k", b"a value long enough to be cut in half", 1_700_000_000_000)],
+    )
+    # Stop the block part way through the one record's value.
+    short_end = layout.data_block_end - 8
+
+    with open(layout.path, "rb") as handle:
+        stream = RecordingStream(handle)
+        with pytest.raises(SSTableTruncatedRecordError):
+            list(
+                iter_records(
+                    stream,
+                    start_offset=layout.data_block_offset,
+                    end_offset=short_end,
+                )
+            )
+        # Nothing was read beyond the extent the caller gave, so a length off a
+        # damaged disk could not pull the index in as record bytes.
+        for position, length in stream.reads:
+            assert position + length <= short_end
+
+
+def test_a_record_cut_part_way_through_its_expiry_is_a_torn_tail(tmp_path: Path) -> None:
+    """Every cut inside the new field, not a chosen one.
+
+    The expiry widened the payload header, so it is the field a block can now
+    stop in the middle of. Each cut has to be reported against the record that
+    was caught, with every record in front of it still decoding.
+    """
+    records: list[tuple[bytes, bytes | None, int]] = [
+        (keyed(index), valued(index), index + 1) for index in range(4)
+    ]
+    layout = write_sstable(tmp_path / "torn_expiry.sst", records)
+    offsets = read_record_offsets(layout)
+    last_start = offsets[-1]
+    field_start = last_start + RECORD_LENGTH_SIZE + EXPIRY_PAYLOAD_OFFSET
+
+    for cut in range(field_start, field_start + EXPIRY_SIZE):
+        with open(layout.path, "rb") as handle:
+            survivors = []
+            with pytest.raises(SSTableTruncatedRecordError):
+                for record in iter_records(
+                    handle,
+                    start_offset=layout.data_block_offset,
+                    end_offset=cut,
+                ):
+                    survivors.append((record.key, record.value, record.expires_at_ms))
+        assert survivors == records[:-1], f"records before the cut at {cut} did not all replay"
+
+
+def test_a_payload_too_short_to_hold_the_expiry_is_rejected(tmp_path: Path) -> None:
+    """A version 2 sized payload header is now below the format's minimum."""
+    payload = struct.pack("<BI", int(SSTableOp.PUT), 1) + b"k"
+    raw = sstable.encode_file_header() + struct.pack("<I", len(payload)) + payload
+    path = tmp_path / "short_header.sst"
+    path.write_bytes(raw)
+
+    with (
+        open(path, "rb") as handle,
+        pytest.raises(SSTableInvalidRecordError, match="an expiry"),
+    ):
+        list(iter_records(handle, start_offset=FILE_HEADER_SIZE, end_offset=len(raw)))
+
+
+# Acceptance criterion: the writer takes each record's expiry from its input
+# iterator, so a flush or a merge can pass expiries straight through without a
+# second lookup.
+
+
+def test_the_writer_takes_expiries_from_a_single_pass_iterator(tmp_path: Path) -> None:
+    """A generator, consumed once.
+
+    "Without a second lookup" is what this asserts: a writer that needed to go
+    back for an expiry could not be fed by a generator, which is exactly what a
+    flush of a frozen memtable and a streaming merge both hand it.
+    """
+    expected: list[tuple[bytes, bytes | None, int]] = [
+        (keyed(index), valued(index), index + 1) for index in range(50)
+    ]
+    rows = (row for row in expected)
+    layout = write_sstable(tmp_path / "streamed.sst", rows, expected_keys=len(expected))
+
+    assert read_records_with_expiry(layout) == expected
+    # The generator is spent, so nothing re-read it.
+    assert list(rows) == []
+
+
+def test_pairs_and_triples_can_be_mixed_in_one_input(tmp_path: Path) -> None:
+    """A pair means no expiry, which is what it meant before the field existed."""
+    layout = write_sstable(
+        tmp_path / "mixed_shapes.sst",
+        [(b"a", b"one"), (b"b", b"two", 42), (b"c", None)],
+    )
+
+    assert read_records_with_expiry(layout) == [
+        (b"a", b"one", NO_EXPIRY),
+        (b"b", b"two", 42),
+        (b"c", None, NO_EXPIRY),
+    ]
+
+
+def test_an_input_row_of_the_wrong_shape_names_the_record_that_was_wrong(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="index 1"):
+        write_sstable(tmp_path / "bad_shape.sst", [(b"a", b"one"), (b"b", b"two", 42, 7)])
+
+
+def test_a_writer_told_an_expiry_per_record_writes_each_one_as_given(tmp_path: Path) -> None:
+    """The per-record path, straight through SSTableWriter rather than the helper."""
+    with SSTableWriter(tmp_path / "per_record.sst") as writer:
+        writer.add(b"a", b"one", expires_at_ms=11)
+        writer.add_put(b"b", b"two", expires_at_ms=22)
+        writer.add(b"c", b"three")
+        writer.add_delete(b"d")
+        layout = writer.finish()
+
+    assert read_records_with_expiry(layout) == [
+        (b"a", b"one", 11),
+        (b"b", b"two", 22),
+        (b"c", b"three", NO_EXPIRY),
+        (b"d", None, NO_EXPIRY),
+    ]
