@@ -1,11 +1,13 @@
 """Memtable: the in-memory sorted structure that holds recent writes.
 
-Scope of this module today (stories M2.1, M2.2, M2.4 and M6.1): the skip list
+Scope of this module today (stories M2.1, M2.2, M2.4, M6.1 and M8.8): the skip list
 itself, as a plain sorted container with insert, search, delete and in-order
 iteration, the key-value layer above it that turns a delete into a tombstone,
-the locking that lets many readers run against one writer, and the size
-accounting and one-way freeze that let the engine decide a table is full and
-stop writing to it. Keys are compared as bytes, so iteration order is the
+the locking that lets many readers run against one writer, the size accounting
+and one-way freeze that let the engine decide a table is full and stop writing to
+it, and the absolute expiry a put record carries so a TTL write states its own
+deadline from the moment it lands here. Keys are compared as bytes, so iteration
+order is the
 byte-lexicographic order that SSTables are written in later, and a flush can
 walk this structure front to back without re-sorting anything.
 
@@ -19,8 +21,11 @@ compaction's job, once no older SSTable can still answer for the key, so nothing
 below compaction is allowed to make a key simply disappear.
 
 How a tombstone is represented: :class:`Memtable` stores every value in the skip
-list behind a one byte tag, ``\\x01`` for a put and ``\\x02`` for a delete, and a
-tombstone is that tag byte on its own. The tag is what makes the distinction
+list behind a one byte tag, ``\\x01`` for a put and ``\\x02`` for a delete. A put
+is that tag, then an eight byte absolute expiry, then the value; a tombstone is
+the tag byte on its own, which is also how it says it has no expiry, since a
+tombstone that expired would stop shadowing the value it buries and let a deleted
+key come back. The tag is what makes the distinction
 unambiguous, and the alternatives are worse rather than merely different. A
 reserved sentinel value cannot work, because a put of ``b""`` is a real write
 that has to stay distinguishable from a delete of the same key, exactly as it is
@@ -29,19 +34,21 @@ identity of a bytes object rather than on anything written down. A parallel set
 of deleted keys would keep two structures that have to agree, and a flush walking
 one of them would be trusting that the other did not drift.
 
-What the tag costs, stated plainly: a put concatenates the tag onto the value,
-and a read slices it back off, so a value is copied once on the way in and once
-on the way out. That is the price of keeping the skip list a ``bytes`` to
-``bytes`` container. Avoiding it means letting the skip list hold some other
-value type, which would move the tombstone concept down into the container that
-ARCHITECTURE.md section 3 wants kept clear of it. Correctness of the layering
-is worth more here than the copy, and if the copy ever shows up in the M10
-benchmarks it can be removed without changing what any caller sees.
+What the framing costs, stated plainly: a put concatenates the tag and the
+packed expiry onto the value, and a read slices them back off, so a value is
+copied once on the way in and once on the way out. That is the price of keeping
+the skip list a ``bytes`` to ``bytes`` container. Avoiding it means letting the
+skip list hold some other value type, which would move the tombstone concept
+down into the container that ARCHITECTURE.md section 3 wants kept clear of it.
+Correctness of the layering is worth more here than the copy, and if the copy
+ever shows up in the M10 benchmarks it can be removed without changing what any
+caller sees.
 
-Why the tag carries no format version, unlike every on-disk structure in this
-engine: it is never written to disk. A flush re-encodes these records into the
-SSTable format, which carries its own version byte, so the tag lives and dies
-inside one process and there is no future reader to keep compatible with it.
+Why this framing carries no format version, unlike every on-disk structure in
+this engine: it is never written to disk. A flush re-encodes these records into
+the SSTable format, which carries its own version byte, so the tag and the expiry
+beside it live and die inside one process and there is no future reader to keep
+compatible with them.
 
 What is deliberately not here yet:
 
@@ -239,6 +246,7 @@ from __future__ import annotations
 
 import contextlib
 import random
+import struct
 import sys
 import threading
 from collections.abc import Callable, Iterator
@@ -669,18 +677,96 @@ shared enum would make each module's tests depend on the other's format.
 """
 
 
-def _record_nbytes(key: bytes, stored: bytes) -> int:
-    """Payload size of one record: its key plus its value, the tag excluded.
+_EXPIRY_FORMAT = "<Q"
+"""Byte layout of the expiry a put record carries behind its tag.
 
-    The tag is one byte on every record, put and tombstone alike, so subtracting
-    it leaves the key plus the value for a put and the key alone for a tombstone,
-    which is the measure this module's docstring defines :attr:`Memtable.nbytes`
-    as. The tag itself is not counted because it does not exist outside this
-    process: the SSTable a flush writes encodes the same distinction its own way,
-    so counting an in-memory implementation detail would make the number say less
-    about the file that comes out.
+An explicit :mod:`struct` layout rather than a Python ``int`` alongside the
+value, for the same reason the tag is a byte: the skip list beneath holds
+``bytes`` and nothing else. Little-endian unsigned 64 bit, matching the field
+the WAL and the SSTable formats write, so a record replayed off the log or
+flushed to a table is carrying the same number in the same width at every layer
+and nothing has to be range-checked twice on the way through.
+"""
+
+_EXPIRY_SIZE = struct.calcsize(_EXPIRY_FORMAT)
+
+_PUT_HEADER_SIZE = len(_TAG_PUT) + _EXPIRY_SIZE
+"""Bytes a put record spends before its value: the tag plus the expiry."""
+
+NO_EXPIRY = 0
+"""Expiry value meaning "this record has no deadline and never expires".
+
+Zero, which is the same sentinel :data:`ledgerlog.wal.NO_EXPIRY` and
+:data:`ledgerlog.sstable.NO_EXPIRY` use, so a record states "no expiry" the same
+way in memory, in the log and on disk, and a replay or a flush can pass the
+field straight through without translating it. Zero is safe to spend on the
+sentinel because it is a 1970 deadline: any real deadline a caller could mean is
+decades past it.
+
+Declared here rather than imported from either of those modules because CLAUDE.md
+asks that the WAL, the memtable and the SSTable stay independently testable, and
+an import would make this module's tests fail on a change to a format it does not
+write.
+"""
+
+MAX_EXPIRY_MS = 0xFFFFFFFFFFFFFFFF
+"""Largest expiry a record can hold, which is what :data:`_EXPIRY_FORMAT` fits.
+
+Checked on the way in rather than left to :func:`struct.pack` so that an
+out-of-range deadline is reported as a bad argument, naming the range, instead of
+as a struct error from inside the write path.
+"""
+
+
+def _record_nbytes(key: bytes, stored: bytes) -> int:
+    """Payload size of one record: its key plus its value, the framing excluded.
+
+    What is subtracted differs by record kind because the framing does: a put
+    spends a tag byte and an expiry before its value, while a tombstone is the
+    tag byte alone and has no value to frame. Taking those off leaves the key
+    plus the value for a put and the key alone for a tombstone, which is the
+    measure this module's docstring defines :attr:`Memtable.nbytes` as.
+
+    Neither the tag nor the expiry is counted, and the reason is the same for
+    both: this is a measure of the records held, not of the bytes this process
+    happens to hold them in. The tag does not exist outside the process at all.
+    The expiry does exist in the SSTable a flush writes, so excluding it makes
+    the number understate that file by eight bytes per record, which is accepted
+    deliberately: a threshold set in this measure went on meaning exactly what it
+    meant before records could carry deadlines, rather than silently tightening
+    the moment a caller started passing TTLs.
     """
-    return len(key) + len(stored) - len(_TAG_PUT)
+    if stored[:1] == _TAG_DELETE:
+        return len(key) + len(stored) - len(_TAG_DELETE)
+    return len(key) + len(stored) - _PUT_HEADER_SIZE
+
+
+def _encode_put(value: bytes, expires_at_ms: int) -> bytes:
+    """Return the stored bytes for a put: its tag, its expiry, then its value.
+
+    The expiry goes in front of the value rather than behind it so that decoding
+    is one slice at a fixed offset. Behind the value it would need the value's
+    length, which the skip list does not store separately, so every read would
+    have to measure from the end of a ``bytes`` object instead.
+    """
+    return _TAG_PUT + struct.pack(_EXPIRY_FORMAT, expires_at_ms) + value
+
+
+def _check_expiry(expires_at_ms: int) -> None:
+    """Reject an expiry that is not an in-range integer timestamp.
+
+    ``bool`` is excluded explicitly although it is an ``int`` subclass: ``True``
+    would otherwise encode as a deadline one millisecond after the no-expiry
+    sentinel, which is a 1970 timestamp, so a caller who passed a flag by mistake
+    would get a record that reads as already expired rather than an error.
+    """
+    if not isinstance(expires_at_ms, int) or isinstance(expires_at_ms, bool):
+        raise TypeError(f"expires_at_ms must be an int, got {type(expires_at_ms).__name__}")
+    if not NO_EXPIRY <= expires_at_ms <= MAX_EXPIRY_MS:
+        raise ValueError(
+            f"expires_at_ms {expires_at_ms} is outside the {NO_EXPIRY} to "
+            f"{MAX_EXPIRY_MS} millisecond range a record can hold"
+        )
 
 
 class MemtableFrozenError(RuntimeError):
@@ -713,15 +799,34 @@ class MemtableEntry:
     owns. Handing out something mutable would let a caller edit what looks like
     their own copy and find they had changed the memtable's idea of the record,
     or the reverse.
+
+    ``expires_at_ms`` is reported exactly as it was stored, including when that
+    deadline has already passed. Whether an expired record is still readable is
+    the engine's question and not this layer's: an expired record has to keep
+    shadowing an older SSTable's value for the same key (ARCHITECTURE.md section
+    5), which it cannot do if the memtable hides it from the read path on the way
+    out. It comes last, with the no-expiry default, so adding the field left what
+    ``MemtableEntry(key, value)`` means unchanged.
     """
 
     key: bytes
     value: bytes | None
+    expires_at_ms: int = NO_EXPIRY
 
     @property
     def is_tombstone(self) -> bool:
         """True if this record marks the key deleted rather than holding a value."""
         return self.value is None
+
+    @property
+    def has_expiry(self) -> bool:
+        """True if this record carries a deadline rather than the no-expiry sentinel.
+
+        Says only whether a deadline was stored, never whether it has passed:
+        that comparison needs a clock, and the clock belongs to the engine, which
+        is the layer that owns what "now" means for a read.
+        """
+        return self.expires_at_ms != NO_EXPIRY
 
 
 def _decode_stored(key: bytes, stored: bytes) -> MemtableEntry:
@@ -734,17 +839,31 @@ def _decode_stored(key: bytes, stored: bytes) -> MemtableEntry:
     produce is a silently wrong answer: an unrecognized tag treated as a put
     would hand back a value with a stray byte on the front, and a tombstone with
     a payload would mean a delete and a put had been conflated somewhere above.
+    The length check in front of the expiry is there for the same reason, and it
+    is the one that would otherwise be a crash rather than a wrong answer: an
+    unpack past the end of the record raises from inside :mod:`struct` with
+    nothing in it to say which key was wrong.
     """
     tag = stored[:1]
     if tag == _TAG_PUT:
-        return MemtableEntry(key=key, value=stored[1:])
+        if len(stored) < _PUT_HEADER_SIZE:
+            raise ValueError(
+                f"put record for key {key!r} is {len(stored)} bytes, too short to hold "
+                f"the {_PUT_HEADER_SIZE} byte tag and expiry a put is framed with"
+            )
+        (expires_at_ms,) = struct.unpack_from(_EXPIRY_FORMAT, stored, len(_TAG_PUT))
+        return MemtableEntry(
+            key=key,
+            value=stored[_PUT_HEADER_SIZE:],
+            expires_at_ms=expires_at_ms,
+        )
     if tag == _TAG_DELETE:
         if len(stored) != len(_TAG_DELETE):
             raise ValueError(
                 f"tombstone record for key {key!r} carries "
                 f"{len(stored) - len(_TAG_DELETE)} bytes of value, which a tombstone never has"
             )
-        return MemtableEntry(key=key, value=None)
+        return MemtableEntry(key=key, value=None, expires_at_ms=NO_EXPIRY)
     raise ValueError(f"record for key {key!r} carries an unknown memtable tag {tag!r}")
 
 
@@ -891,7 +1010,7 @@ class Memtable:
             "any record"
         )
 
-    def put(self, key: bytes, value: bytes) -> None:
+    def put(self, key: bytes, value: bytes, *, expires_at_ms: int = NO_EXPIRY) -> None:
         """Store ``value`` under ``key``, replacing whatever record was there.
 
         A put over a tombstone is an ordinary overwrite: the key is live again,
@@ -899,12 +1018,27 @@ class Memtable:
         because the tombstone existed only to shadow older layers, and this
         newer value now shadows them itself.
 
+        ``expires_at_ms`` is an absolute deadline in milliseconds since the Unix
+        epoch, not a time to live, and :data:`NO_EXPIRY` means the record has no
+        deadline at all. An absolute deadline rather than a duration for the same
+        reason the WAL takes one: a record outlives the call that wrote it, and a
+        duration stored here would have to be measured from a moment nobody
+        recorded. Turning a caller's TTL into a deadline happens once, in the
+        engine, so that a write lands in the log and in this table carrying the
+        same number.
+
+        Nothing here compares that deadline against a clock. A read still returns
+        an expired record, because an expired record has to keep shadowing an
+        older layer's value for its key, and because this table has no clock to
+        compare against: see :class:`MemtableEntry`.
+
         Raises :class:`MemtableFrozenError` if this memtable has been frozen,
         without applying anything.
         """
         _check_key(key)
         _check_value(value)
-        record = _TAG_PUT + value
+        _check_expiry(expires_at_ms)
+        record = _encode_put(value, expires_at_ms)
         with self._mutation_lock:
             self._check_writable()
             previous = self._skiplist.insert(key, record)
@@ -918,6 +1052,11 @@ class Memtable:
         value in an SSTable that only this tombstone can shadow. Deleting an
         already tombstoned key rewrites the same tombstone, so repeated deletes
         are idempotent and none of them is an error.
+
+        A tombstone carries no expiry and there is no parameter to give it one,
+        which matches the WAL's rule for a DELETE record: a tombstone that
+        expired on its own would stop shadowing the value it buries, so the key
+        it deleted would reappear out of an older layer.
 
         Returns nothing, deliberately, where :meth:`SkipList.delete` returns
         whether the key was there. At this layer that boolean would be actively
