@@ -65,7 +65,7 @@ from ledgerlog import engine as engine_module
 from ledgerlog import memtable as memtable_module
 from ledgerlog import sstable as sstable_module
 from ledgerlog import wal as wal_module
-from ledgerlog.compaction import CompactionPolicy
+from ledgerlog.compaction import CompactionPolicy, merge_sstables
 from ledgerlog.engine import (
     WAL_FILENAME,
     SSTableHandle,
@@ -4089,3 +4089,57 @@ def test_the_three_layers_agree_about_the_expiry_sentinel_and_its_range() -> Non
     assert wal_module.NO_EXPIRY == memtable_module.NO_EXPIRY == sstable_module.NO_EXPIRY
     assert wal_module.MAX_EXPIRY_MS == memtable_module.MAX_EXPIRY_MS
     assert wal_module.MAX_EXPIRY_MS == sstable_module.MAX_EXPIRY_MS
+
+
+# ---------------------------------------------------------------------------
+# Story M8.4, from this side of the boundary: the deadline an engine resolved
+# from a caller's TTL is the one a merge reclaims the space of.
+#
+# The merge's own rules are tested in test_compaction.py against records built by
+# hand. What only this file can show is that the two ends agree: the engine turns
+# a TTL into a deadline, flushes it into a real table, and a merge handed the
+# engine's own clock drops exactly the record the engine had already stopped
+# answering for. The merged table is written beside the engine's tables rather
+# than swapped in, because the engine does not discover tables on its disk yet
+# (story M9.1), so adopting one is not this story's to do.
+# ---------------------------------------------------------------------------
+
+
+def test_a_merge_on_the_engines_clock_drops_the_record_the_engine_has_expired(
+    tmp_path: Path,
+) -> None:
+    clock = _FakeClock()
+    written_at_ms = clock.now_ms
+    with flushing_ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"brief", b"value", ttl=60)
+        engine.put(b"lasting", b"value", ttl=3_600)
+        engine.put(b"forever", b"value")
+        engine.flush_pending()
+        tables = [table.path for table in engine.sstables]
+        assert len(tables) == 3, "one table per write, so each key's deadline is its own"
+
+        clock.advance(120)
+        assert engine.get(b"brief") is None
+        assert engine.get(b"lasting") == b"value"
+
+        merged = merge_sstables(
+            tables,
+            tmp_path / "merged.sst",
+            older_tables=[],
+            clock=engine.clock,
+        )
+
+    with open(merged.path, "rb") as handle:
+        footer = read_footer(handle)
+        rows = {
+            record.key: record.expires_at_ms
+            for record in iter_records(
+                handle,
+                start_offset=footer.data_block_offset,
+                end_offset=footer.data_block_end,
+            )
+        }
+
+    assert b"brief" not in rows
+    assert rows[b"lasting"] == written_at_ms + 3_600_000
+    assert rows[b"forever"] == NO_EXPIRY

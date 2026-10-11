@@ -1,16 +1,16 @@
 """Compaction: which SSTables belong together, and merging a group into one.
 
-Scope of this module today (stories M8.1 to M8.3 and M8.5): grouping the tables
-an engine holds into size tiers, saying which of those tiers has accumulated
-enough tables to be worth merging, merging one of those tiers into a single new
-SSTable under newest write wins semantics, dropping from that merge the tombstones
-nothing older can still be hiding behind, and retiring the merged tables once the
-new one is committed. Planning takes a set of tables, each of which knows its own
-age and its own size, and returns a plan: the tiers, and a flag per tier saying
-whether it is ready. Merging takes the tables of one tier and writes their records
-out once, deduplicated, keeping the newest write for each key. Swapping deletes
-those tables, and only after it has read the merged table's footer back off the
-disk.
+Scope of this module today (stories M8.1 to M8.5): grouping the tables an engine
+holds into size tiers, saying which of those tiers has accumulated enough tables
+to be worth merging, merging one of those tiers into a single new SSTable under
+newest write wins semantics, dropping from that merge the tombstones nothing
+older can still be hiding behind and the records whose deadline has passed, and
+retiring the merged tables once the new one is committed. Planning takes a set of
+tables, each of which knows its own age and its own size, and returns a plan: the
+tiers, and a flag per tier saying whether it is ready. Merging takes the tables of
+one tier and writes their records out once, deduplicated, keeping the newest write
+for each key. Swapping deletes those tables, and only after it has read the merged
+table's footer back off the disk.
 
 The tombstone rule (M8.3, ARCHITECTURE.md section 4) is the one part of a merge
 that cannot be decided from the tier alone. A tombstone exists to hide older
@@ -23,9 +23,23 @@ told which tables lie outside it and are older than it, through
 A merge told nothing keeps every tombstone, because that is the only answer that
 is safe when what is outside the merge is unknown.
 
-What is still not here: the expiry rule (M8.4), and nothing tells the engine to
-start reading the merged table, since the engine does not yet discover the tables
-on its disk at all (story M9.1). A compaction today is something a caller drives:
+The expiry rule (M8.4) is the tombstone rule again, over a different kind of dead
+record. A record whose ``expires_at_ms`` the clock has passed answers no read
+(``engine.py`` hides it from :meth:`~ledgerlog.engine.LedgerLog.get` the moment
+its deadline arrives), so copying its bytes into the merged table buys nothing,
+and a merge is where that space is reclaimed. What the two rules share is the
+hazard: an expired record still shadows older writes of its key, exactly as a
+tombstone does, so dropping one while some older table outside the merge holds a
+value for that key would let that value surface again. So a merge drops an expired
+record under the same condition it drops a tombstone, through the same
+``older_tables`` answer, and a merge told nothing keeps both. The time the
+deadlines are measured against comes from a clock the caller passes, so that a
+merge is told what "now" is rather than reading it from a global, and a merge told
+no clock drops nothing for having expired.
+
+What is still not here: nothing tells the engine to start reading the merged
+table, since the engine does not yet discover the tables on its disk at all
+(story M9.1). A compaction today is something a caller drives:
 :func:`compact_tier` merges a tier and retires it, and reports which table now
 stands for which, and that is all.
 
@@ -85,6 +99,7 @@ from __future__ import annotations
 import heapq
 import math
 import os
+import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -95,6 +110,7 @@ from ledgerlog.bloom import BloomFilter
 from ledgerlog.sstable import (
     DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
     DEFAULT_INDEX_INTERVAL,
+    NO_EXPIRY,
     RECORD_LENGTH_SIZE,
     RECORD_PAYLOAD_HEADER_SIZE,
     SSTABLE_FORMAT_VERSION,
@@ -144,6 +160,50 @@ A tier of one table has nothing to merge with: compacting it would rewrite every
 record to produce a file holding the same records, so a threshold of one would
 mean compacting forever and changing nothing.
 """
+
+Clock = Callable[[], float]
+"""Where a merge reads "now" from, in seconds since the Unix epoch.
+
+The same shape as the clock an engine is built with
+(:data:`ledgerlog.engine.DEFAULT_CLOCK`), because a deadline resolved against one
+clock and tested against another is a record expiring at a time nobody asked for:
+when the engine drives a compaction it hands over the clock it resolved those
+deadlines with. Stated here as well rather than imported from ``engine.py``
+because the dependency runs the other way, ``engine.py`` imports this module, and
+a clock is a few lines of contract while a cycle between the two is a permanent
+problem.
+"""
+
+DEFAULT_CLOCK: Clock = time.time
+"""Wall clock a merge measures deadlines against when it is given no other.
+
+:func:`time.time` and not :func:`time.monotonic`, for the reason
+``engine.py`` gives: an expiry is an absolute deadline written into files that
+outlive the process, and a monotonic clock's zero moves every boot, so the two
+would not be comparable.
+"""
+
+
+def read_clock_ms(clock: Clock = DEFAULT_CLOCK) -> int:
+    """Read ``clock`` and return Unix milliseconds, rejecting a nonsense reading.
+
+    Truncated rather than rounded, and the checks are the ones
+    :meth:`ledgerlog.engine.LedgerLog._has_expired` applies to its own clock, so
+    that a record's fate does not depend on which side of the engine asked. A
+    reading that is not a finite, non-negative number of seconds is reported here
+    rather than carried into a comparison: a NaN compares false against every
+    deadline, which would be a merge silently keeping every expired record while
+    claiming to drop them.
+    """
+    reading = clock()
+    if not isinstance(reading, int | float) or isinstance(reading, bool):
+        raise TypeError(f"clock must return a real number of seconds, got {type(reading).__name__}")
+    if not math.isfinite(reading) or reading < 0:
+        raise ValueError(
+            f"clock returned {reading!r}, which is not a finite non-negative number of "
+            "seconds since the Unix epoch"
+        )
+    return int(reading * 1000)
 
 
 @runtime_checkable
@@ -476,13 +536,19 @@ class MergeSourceOrderError(ValueError):
 
 
 OlderValueProbe = Callable[[bytes], bool]
-"""Asked, for the key of a tombstone a merge is about to emit, whether to keep it.
+"""Asked, for the key of a dead record a merge is about to emit, whether to keep it.
 
 Returns true when some SSTable outside the merge, and older than it, still holds
 a live value for that key. That single answer is the whole of the tombstone rule
 in ARCHITECTURE.md section 4: a tombstone is only ever hiding older writes of its
 key, so it is dead weight once nothing older can surface, and dropping it while
 something older can surface would let a deleted key come back.
+
+The same answer settles the expiry rule (M8.4), because an expired record is dead
+in exactly the same way: no read returns it, and no read looks past it either, so
+dropping it while something older holds its key would resurface that older value.
+One probe for both, so that the two kinds of dead record cannot end up with two
+different ideas of what lies outside the merge.
 
 A callable rather than a list of tables, so that :func:`merge_records` stays a
 rule over sorted streams with no notion of a file, testable against hand-written
@@ -526,6 +592,14 @@ class OlderTable:
         because every merge applies this same rule to whatever is older than it:
         the tombstone relied on here can only be dropped once nothing older holds
         a value for the key either.
+
+        A record here whose own deadline has passed still counts as a value, even
+        though no read would return it. Not an oversight: the drop it would permit
+        is permanent, while "expired" is a verdict about a clock that can be
+        stepped backwards, so a deadline read here could un-expire a value whose
+        shadow had already been thrown away. Counting it costs one more merge of
+        space for a record that the merge covering this table will itself drop,
+        and the alternative risks a key coming back from the dead.
         """
         if self.bloom_filter is not None and not self.bloom_filter.might_contain(key):
             return False
@@ -603,7 +677,8 @@ def merge_records(
     *,
     source_names: Sequence[str] | None = None,
     has_older_value: OlderValueProbe | None = None,
-) -> Iterator[tuple[bytes, bytes | None]]:
+    merge_time_ms: int | None = None,
+) -> Iterator[tuple[bytes, bytes | None, int]]:
     """Merge sorted record streams, newest first, into one sorted run of records.
 
     ``streams`` holds one stream per source table, newest table first, each
@@ -611,12 +686,18 @@ def merge_records(
     :attr:`CompactionTier.tables` is in exactly that order, which is why a tier
     can be merged by reading its tables in the order it lists them.
 
-    Yields ``(key, value)`` pairs in ascending key order, one pair per distinct
-    key, taking the value from the earliest stream that holds that key. That is
-    what newest write wins means once a tier is being merged: a key appears in
-    several tables because it was written several times, and only the newest of
-    those writes is live. Every older copy is dropped here, and dropping them is
-    the space compaction reclaims.
+    Yields ``(key, value, expires_at_ms)`` triples in ascending key order, one
+    triple per distinct key, taking the value and the deadline from the earliest
+    stream that holds that key. That is what newest write wins means once a tier
+    is being merged: a key appears in several tables because it was written
+    several times, and only the newest of those writes is live. Every older copy
+    is dropped here, and dropping them is the space compaction reclaims.
+
+    A record's deadline travels with its value and is never recomputed, because
+    it is an absolute instant rather than a remaining lifetime: re-deriving it at
+    merge time from anything would hand the record a longer life for having been
+    compacted, which is the mistake story M8.6 put an absolute timestamp in the
+    formats to rule out.
 
     A tombstone (a value of ``None``) wins its key like any other record. Whether
     it is then yielded or dropped is ``has_older_value``'s to say, and dropping it
@@ -633,9 +714,29 @@ def merge_records(
     otherwise would resurrect deleted keys. Callers that know pass a probe, and
     :func:`merge_sstables` builds one from the tables it is told about.
 
-    Pairs rather than :class:`~ledgerlog.sstable.SSTableRecord` objects, because
+    ``merge_time_ms`` is when this merge is happening, in Unix milliseconds, and
+    it is what lets an expired record be dropped (story M8.4). A record whose
+    deadline is at or before it has expired, the same "at or after" comparison
+    :meth:`ledgerlog.engine.LedgerLog.get` hides a record by, so a record a read
+    has started refusing is a record a merge has started reclaiming, with no
+    window where the two disagree. An expired winner is then dropped on exactly
+    the condition a tombstone is, ``has_older_value`` saying no, because the two
+    are the same hazard: an expired record is both unreadable and opaque, so
+    removing it while an older table outside the merge holds a value for its key
+    would expose that value to the next read. An expired record that has to stay
+    is yielded as it is, deadline included, rather than being rewritten as a
+    tombstone: it is already a record every read treats as absent, and the next
+    merge that covers whatever is older than it will be the one able to drop it.
+
+    Left as ``None``, no record is dropped for having expired, which is the same
+    reading of silence ``has_older_value`` gets: a caller that has not said when
+    the merge is happening has not authorised a judgement about deadlines, and
+    guessing with a wall clock here would make a pure function's output depend on
+    the hour it ran.
+
+    Triples rather than :class:`~ledgerlog.sstable.SSTableRecord` objects, because
     the offsets a record carries describe the file it was read from and mean
-    nothing in the merged table, and because pairs are what
+    nothing in the merged table, and because triples are what
     :func:`~ledgerlog.sstable.write_sstable` and
     :meth:`~ledgerlog.sstable.SSTableWriter.add` take.
 
@@ -654,10 +755,23 @@ def merge_records(
             f"got {len(source_names)} source names for {len(streams)} streams, so a name "
             "cannot be matched to the stream it describes"
         )
+    if merge_time_ms is not None:
+        if not isinstance(merge_time_ms, int) or isinstance(merge_time_ms, bool):
+            raise TypeError(
+                f"merge_time_ms must be an int of Unix milliseconds, got "
+                f"{type(merge_time_ms).__name__}"
+            )
+        if merge_time_ms < 0:
+            raise ValueError(
+                f"merge_time_ms must not be negative, got {merge_time_ms}: a merge happening "
+                "before the Unix epoch would expire nothing and is a clock to fix, not a time "
+                "to compact at"
+            )
     return _merge_records(
         tuple(streams),
         tuple(source_names) if source_names is not None else None,
         has_older_value,
+        merge_time_ms,
     )
 
 
@@ -665,7 +779,8 @@ def _merge_records(
     streams: tuple[Iterable[SSTableRecord], ...],
     source_names: tuple[str, ...] | None,
     has_older_value: OlderValueProbe | None,
-) -> Iterator[tuple[bytes, bytes | None]]:
+    merge_time_ms: int | None,
+) -> Iterator[tuple[bytes, bytes | None, int]]:
     """Generator half of :func:`merge_records`, kept separate so its checks run eagerly."""
     cursors = [iter(stream) for stream in streams]
     # A heap of (key, rank), where rank is the stream's index and therefore its
@@ -712,14 +827,23 @@ def _merge_records(
             _, shadowed_rank = heapq.heappop(heap)
             pending.pop(shadowed_rank)
             advance(shadowed_rank)
-        if winner.is_tombstone and has_older_value is not None and not has_older_value(key):
-            # A tombstone with nothing older left to hide. Dropped after the
-            # shadowed streams above were stepped past, not instead of stepping
-            # past them: the older copies of this key in this merge go either
-            # way, and skipping that would leave them to be emitted as if they
-            # were live.
+        # The sentinel is checked before the time so that a merge of records
+        # nobody gave a deadline never compares one, and so that a merge given no
+        # time drops nothing for having expired.
+        expired = (
+            winner.expires_at_ms != NO_EXPIRY
+            and merge_time_ms is not None
+            and merge_time_ms >= winner.expires_at_ms
+        )
+        dead = winner.is_tombstone or expired
+        if dead and has_older_value is not None and not has_older_value(key):
+            # A dead record with nothing older left to hide: a tombstone, or a
+            # record whose deadline has passed. Dropped after the shadowed
+            # streams above were stepped past, not instead of stepping past them:
+            # the older copies of this key in this merge go either way, and
+            # skipping that would leave them to be emitted as if they were live.
             continue
-        yield winner.key, winner.value
+        yield winner.key, winner.value, winner.expires_at_ms
 
 
 def merge_sstables(
@@ -727,6 +851,7 @@ def merge_sstables(
     destination: str | os.PathLike[str],
     *,
     older_tables: Sequence[str | os.PathLike[str]] | None = None,
+    clock: Clock | None = None,
     index_interval: int = DEFAULT_INDEX_INTERVAL,
     bloom_false_positive_rate: float = DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
 ) -> SSTableLayout:
@@ -779,6 +904,21 @@ def merge_sstables(
     destination, because a table inside the merge is not outside it, and asking
     one would hold back every tombstone the merge could have dropped.
 
+    ``clock`` is where the merge reads "now" from, in seconds since the Unix
+    epoch, and it is what lets records past their deadline be dropped (story
+    M8.4). It is read once, before the first record, so that every record in one
+    merge is judged against one instant: reading it per record would let a merge
+    long enough to cross a deadline keep a record at the start of a key range and
+    drop its neighbour, for no reason a caller could predict. Left as ``None``,
+    nothing is dropped for having expired, the same way omitting ``older_tables``
+    keeps every tombstone. An engine driving a compaction passes the clock it
+    resolved those deadlines against, which is the one its reads check them
+    against too.
+
+    Expiries are carried through the merge untouched, whether or not a clock is
+    given, so a record that outlives this compaction arrives in the merged table
+    with the deadline it was written with rather than with none.
+
     ``destination`` must not exist and must not be one of the sources. The write
     ends in a rename over that path, which would replace an existing table rather
     than fail, and a merge that replaced a live table would destroy the very data
@@ -798,6 +938,8 @@ def merge_sstables(
     """
     if not sources:
         raise ValueError("a merge needs at least one source table")
+    if clock is not None and not callable(clock):
+        raise TypeError(f"clock must be callable, got {type(clock).__name__}")
 
     source_paths = [Path(source) for source in sources]
     destination_path = Path(destination)
@@ -883,6 +1025,7 @@ def merge_sstables(
             streams,
             source_names=[str(path) for path in source_paths],
             has_older_value=probe,
+            merge_time_ms=read_clock_ms(clock) if clock is not None else None,
         )
         with SSTableWriter(
             destination_path,
@@ -890,8 +1033,8 @@ def merge_sstables(
             expected_keys=expected_keys,
             bloom_false_positive_rate=bloom_false_positive_rate,
         ) as writer:
-            for key, value in merged:
-                writer.add(key, value)
+            for key, value, expires_at_ms in merged:
+                writer.add(key, value, expires_at_ms=expires_at_ms)
             return writer.finish()
 
 
@@ -924,6 +1067,7 @@ def merge_tier(
     destination: str | os.PathLike[str],
     *,
     other_tables: Iterable[MergeableTableT] | None = None,
+    clock: Clock | None = None,
     index_interval: int = DEFAULT_INDEX_INTERVAL,
     bloom_false_positive_rate: float = DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
 ) -> SSTableLayout:
@@ -942,6 +1086,10 @@ def merge_tier(
     :func:`merge_sstables`, and passing an empty sequence says the tier is all
     there is, so nothing older can resurrect and every tombstone may go.
 
+    ``clock`` is :func:`merge_sstables`' and carries the same meaning: given one,
+    the merge drops the records whose deadline it has passed, under the same
+    condition on ``other_tables`` that tombstones are dropped under (story M8.4).
+
     Nothing checks that the tier is :attr:`~CompactionTier.ready`. Readiness says
     that merging the tier is worth the bytes it costs, which is a question for
     whoever decides to compact, and a merge of a tier below the threshold is
@@ -956,6 +1104,7 @@ def merge_tier(
         [table.path for table in tier.tables],
         destination,
         older_tables=older_paths,
+        clock=clock,
         index_interval=index_interval,
         bloom_false_positive_rate=bloom_false_positive_rate,
     )
@@ -1110,6 +1259,7 @@ def compact_tier(
     destination: str | os.PathLike[str],
     *,
     other_tables: Iterable[MergeableTableT] | None = None,
+    clock: Clock | None = None,
     index_interval: int = DEFAULT_INDEX_INTERVAL,
     bloom_false_positive_rate: float = DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
 ) -> CompactionSwap:
@@ -1120,7 +1270,8 @@ def compact_tier(
     and the only order this offers. The arguments are :func:`merge_tier`'s, and
     ``other_tables`` carries the same meaning: everything else the engine holds,
     from which the tables older than the tier are picked out so that tombstones
-    nothing older needs can be dropped.
+    nothing older needs can be dropped, and, given a ``clock``, the records whose
+    deadline has passed with them.
 
     The merged table is inspected from disk between the two halves even though
     the merge just returned a layout describing it, for the reason
@@ -1138,6 +1289,7 @@ def compact_tier(
         tier,
         destination,
         other_tables=other_tables,
+        clock=clock,
         index_interval=index_interval,
         bloom_false_positive_rate=bloom_false_positive_rate,
     )
