@@ -1,11 +1,13 @@
 """Engine: the write-ahead log and the memtable wired into one key-value store.
 
-Scope of this module today (stories M3.1, M3.2, M6.1, M6.2, M7.1, M7.2 and M8.1):
+Scope of this module today (stories M3.1, M3.2, M6.1, M6.2, M7.1, M7.2, M8.1 and
+M8.8):
 the write path, startup recovery, the freeze-and-swap that retires a memtable once
 it has grown past a configured size, the background flush that writes a retired
 memtable out as an SSTable and releases it from memory, the read path that walks
 all of those layers, and the size-tier plan the engine keeps over the tables it
-has flushed. A put or a delete is appended to the WAL first and
+has flushed, and the per-record time to live that lets a write stop being
+readable on its own. A put or a delete is appended to the WAL first and
 applied to the memtable second, a get answers from the active memtable, then from
 any frozen memtables behind it, then from the SSTables on disk newest first, and
 opening an engine over an existing log replays that log into a fresh memtable
@@ -38,6 +40,40 @@ the memtable is never touched. Checking the same things again in this module
 would add a second place for the two layers' ideas of a valid write to drift
 apart, and would make a type error fail in a different step than a size error
 for no reason a caller benefits from.
+
+Time to live and read-time expiry (story M8.8)
+---------------------------------------------
+
+``put(key, value, ttl=seconds)`` resolves the caller's duration against this
+engine's clock once, at write time, and stores the resulting absolute deadline in
+the WAL record and in the memtable record together. Everything below this module
+already carries that field: the log writes it so a replay cannot restart the
+countdown, and the SSTable writes it so a flush cannot lose it (stories M8.6 and
+M8.7). This module is where the field acquires a meaning, and the meaning is one
+rule: :meth:`LedgerLog.get` answers ``None`` for a record whose deadline this
+engine's clock has reached.
+
+Why expiry is checked on the read rather than enforced by something that deletes
+the record when its time comes: a timer would need a thread, an ordering against
+the flush, and an answer for what a crash between the deadline and the deletion
+means, and it would buy nothing a caller can observe, since a caller only ever
+learns a record's state by reading it. Checking on the read is immediate by
+construction and costs a comparison against zero for every record that has no
+deadline, which is every record a caller never passed a TTL for.
+
+What expiry deliberately does not do is unshadow. An expired record is still the
+newest record for its key, so the read path stops at it exactly as it stops at a
+tombstone, and ``get`` answers ``None`` rather than falling through to an older
+SSTable's value. ARCHITECTURE.md section 5 draws that rule for tombstones and the
+reason carries over unchanged: a layer that let the search continue would resurrect
+a value the caller has already replaced. Reclaiming the bytes an expired record
+occupies is a merge's job and happens later (story M8.4), so the space and the
+visibility are two separate questions with two separate answers.
+
+The clock is a constructor argument, which is what makes any of this testable
+without sleeping: a test moves its own clock forward and asserts what a read sees
+on either side of a deadline. It also keeps the comparison honest, since the same
+clock resolves the TTL and checks the deadline.
 
 Startup recovery
 ----------------
@@ -287,9 +323,11 @@ What is deliberately not here yet:
 
 from __future__ import annotations
 
+import math
 import os
 import threading
-from collections.abc import Iterator
+import time
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -308,6 +346,8 @@ from ledgerlog.sstable import (
 from ledgerlog.wal import (
     DEFAULT_FSYNC_INTERVAL_SECONDS,
     FILE_HEADER_SIZE,
+    MAX_EXPIRY_MS,
+    NO_EXPIRY,
     FsyncPolicy,
     WalFormatError,
     WalOp,
@@ -323,6 +363,22 @@ engine owns, and from milestone 4 on it holds SSTables that have to be
 discovered by name alongside this file. Letting the log live anywhere would mean
 a data directory that is only complete if the caller remembers to point at the
 matching log.
+"""
+
+DEFAULT_CLOCK: Callable[[], float] = time.time
+"""Clock an engine reads "now" from when it resolves a TTL or checks an expiry.
+
+:func:`time.time` rather than :func:`time.monotonic`, which is the opposite of
+what a duration measurement would want and is deliberate: an expiry is an
+absolute wall-clock deadline written into the log and into every SSTable, so it
+has to be comparable across the restarts those files outlive, and a monotonic
+clock's zero moves every boot. The cost of the choice is that a deadline follows
+the system clock, so stepping that clock backwards keeps an expired record
+readable for a while; the alternative costs correctness after a restart, which is
+the case the engine exists to handle.
+
+Replaceable through ``LedgerLog(clock=...)`` so that a test can assert expiry by
+moving a clock it owns rather than by sleeping, which is what story M8.8 asks for.
 """
 
 DEFAULT_MEMTABLE_THRESHOLD_BYTES = 4 * 1024 * 1024
@@ -610,6 +666,7 @@ class LedgerLog:
         memtable_threshold_bytes: int = DEFAULT_MEMTABLE_THRESHOLD_BYTES,
         flush_in_background: bool = True,
         compaction_policy: CompactionPolicy | None = None,
+        clock: Callable[[], float] = DEFAULT_CLOCK,
     ) -> None:
         """Open, or create, the engine whose data lives in ``directory``.
 
@@ -650,6 +707,18 @@ class LedgerLog:
         nothing the engine does today, since no compaction runs yet (story M8.2):
         it decides what :attr:`compaction_plan` reports.
 
+        ``clock`` is where "now" comes from when a :meth:`put` turns a TTL into an
+        absolute deadline and when a :meth:`get` decides a deadline has passed. It
+        returns seconds since the Unix epoch, like :data:`DEFAULT_CLOCK`, and it
+        is a constructor argument rather than a module global so that a test can
+        move time instead of sleeping and two engines in one process can disagree
+        about what time it is without interfering.
+
+        One clock for both ends, not one for writes and one for reads, because
+        the two are compared against each other: a TTL resolved against one clock
+        and checked against another would expire early or late by however far the
+        two had drifted, which is a bug no test of either half would catch.
+
         The thread is started last, after the log is open, so it cannot find a
         half-built engine: replay may already have frozen a table, and a flusher
         running before :attr:`_wal` exists would be a flush racing the
@@ -660,6 +729,10 @@ class LedgerLog:
                 f"memtable_threshold_bytes must be at least 1, got {memtable_threshold_bytes}"
             )
 
+        if not callable(clock):
+            raise TypeError(f"clock must be callable, got {type(clock).__name__}")
+
+        self._clock = clock
         self._directory = Path(directory)
         self._directory.mkdir(parents=True, exist_ok=True)
 
@@ -727,6 +800,16 @@ class LedgerLog:
     def wal_path(self) -> Path:
         """Path of the write-ahead log this engine appends to."""
         return self._wal.path
+
+    @property
+    def clock(self) -> Callable[[], float]:
+        """The clock this engine resolves TTLs and checks expiries against.
+
+        Exposed so that a caller who passed one in can confirm which engine got
+        it, and so a test asserting on expiry can read the same "now" the engine
+        will.
+        """
+        return self._clock
 
     @property
     def fsync_policy(self) -> FsyncPolicy:
@@ -854,7 +937,7 @@ class LedgerLog:
         """True once :meth:`close` has run."""
         return self._closed
 
-    def put(self, key: bytes, value: bytes) -> None:
+    def put(self, key: bytes, value: bytes, *, ttl: float | None = None) -> None:
         """Store ``value`` under ``key``, logging it before it becomes visible.
 
         The log append happens first and the memtable update second, so a
@@ -864,6 +947,36 @@ class LedgerLog:
         left exactly as it was and the exception reaches the caller unchanged:
         the write did not happen, at either layer.
 
+        ``ttl`` is a time to live in seconds, counted from now, after which the
+        record stops being readable. ``None``, the default, means the record has
+        no deadline and the write behaves exactly as it did before TTLs existed:
+        the no-expiry sentinel goes into the log record and into the memtable
+        record alike, which is the same thing those two layers stored for every
+        write made before this parameter was added.
+
+        The TTL is converted to an absolute deadline once, here, and that one
+        number is what both layers are given. Resolving it per layer would read
+        the clock twice and let the log and the memtable disagree about when the
+        record dies; keeping the relative duration instead and resolving it later
+        would be worse still, since a replay happens at an unknown later time and
+        would silently restart the countdown (see :func:`ledgerlog.wal.encode_record`).
+
+        Expiry is checked when the record is read, not by a timer here. Nothing
+        removes the record at the moment it expires: :meth:`get` stops returning
+        it immediately, and the bytes are reclaimed by the next merge that
+        rewrites them (story M8.4). That split is deliberate, and it is the only
+        one that is both correct and cheap: hiding the record has to be immediate,
+        while reclaiming its space can wait for work that was going to rewrite the
+        table anyway.
+
+        Raises :class:`TypeError` for a ``ttl`` that is not a real number and
+        :class:`ValueError` for one that is not positive and finite, before
+        anything is logged. A non-positive TTL is refused rather than treated as
+        "expire immediately" because a caller who computed one by subtracting two
+        timestamps meant a deadline and got arithmetic, and a write that vanished
+        on arrival is the hardest version of that mistake to find. A caller who
+        really wants the key gone has :meth:`delete`.
+
         Once the write is applied, this call also freezes the memtable and swaps
         in a fresh one if the threshold has been reached. That happens before the
         put returns, and under the same lock, so the caller's next write is
@@ -871,8 +984,13 @@ class LedgerLog:
         """
         with self._write_lock:
             self._check_open()
-            self._wal.append_put(key, value)
-            self._memtable.put(key, value)
+            # Resolved inside the lock, so that the clock reading a record's
+            # deadline comes from sits in the same critical section as the append
+            # that records it. Resolved outside, two concurrent puts could be
+            # logged in one order and carry deadlines in the other.
+            expires_at_ms = NO_EXPIRY if ttl is None else self._expiry_from_ttl(ttl)
+            self._wal.append_put(key, value, expires_at_ms=expires_at_ms)
+            self._memtable.put(key, value, expires_at_ms=expires_at_ms)
             self._freeze_if_full()
 
     def delete(self, key: bytes) -> None:
@@ -917,6 +1035,13 @@ class LedgerLog:
         carried all the way down into the log's record format, and it survives
         here.
 
+        A record written with a ``ttl`` reads as ``None`` from the moment its
+        deadline passes, whichever layer it was found in, and without waiting for
+        a compaction to remove it. Like a tombstone, it stops the search where it
+        was found rather than letting it fall through: an expired record is still
+        the newest record for its key, so an older table's value for that key
+        must stay buried. See this module's docstring.
+
         Takes no lock, and reads each layer in the reverse of the order a freeze
         or a flush publishes to it: the active table before the frozen ones, and
         the frozen ones before the table list. See this module's docstring for
@@ -935,7 +1060,80 @@ class LedgerLog:
         entry = self._lookup(key)
         if entry is None or entry.is_tombstone:
             return None
+        if self._has_expired(entry):
+            return None
         return entry.value
+
+    def _has_expired(self, record: MemtableEntry | SSTableRecord) -> bool:
+        """True if ``record`` carries a deadline that this engine's clock has passed.
+
+        The sentinel is checked before the clock so that a store nobody writes
+        TTLs to never reads one: a record with no deadline is the common case and
+        it costs a comparison against zero.
+
+        The comparison is "at or after", so a record is gone the moment its
+        deadline arrives rather than one millisecond later. Either rule is
+        defensible for a deadline stated to the millisecond, and this one is
+        chosen because it is the one a caller can state without arithmetic: a
+        record written with a one second TTL is unreadable one second later.
+        """
+        if record.expires_at_ms == NO_EXPIRY:
+            return False
+        return self._now_ms() >= record.expires_at_ms
+
+    def _now_ms(self) -> int:
+        """Read the clock and return Unix milliseconds, rejecting a nonsense reading.
+
+        Truncated rather than rounded, so the millisecond a reading falls inside
+        is the one reported, and a clock moved to exactly a record's deadline
+        reads as that deadline rather than as the millisecond after it.
+
+        A clock that hands back something non-finite or negative is reported here
+        instead of being carried into a comparison. Left alone, a NaN would make
+        every expiry check answer "not expired", which is an expired record
+        quietly readable forever, and a negative reading would make a deadline
+        resolved from it fall outside the range the record formats can store.
+        """
+        now = self._clock()
+        if not isinstance(now, int | float) or isinstance(now, bool):
+            raise TypeError(f"clock must return a real number of seconds, got {type(now).__name__}")
+        if not math.isfinite(now) or now < 0:
+            raise ValueError(
+                f"clock returned {now!r}, which is not a finite non-negative number of "
+                "seconds since the Unix epoch"
+            )
+        return int(now * 1000)
+
+    def _expiry_from_ttl(self, ttl: float) -> int:
+        """Turn a time to live in seconds into an absolute deadline in Unix milliseconds.
+
+        Rounded up to the next whole millisecond, not down, so that a TTL shorter
+        than the format's resolution still buys the record some life instead of a
+        deadline equal to the moment it was written, which :meth:`_has_expired`
+        would read as already expired. Rounding up can only ever make a record
+        outlive its TTL by under a millisecond, which no caller passing seconds
+        has asked about.
+
+        Call holding the write lock, like :meth:`put` does: the clock reading and
+        the append that stores its result belong in one critical section.
+        """
+        if isinstance(ttl, bool) or not isinstance(ttl, int | float):
+            raise TypeError(f"ttl must be a number of seconds, got {type(ttl).__name__}")
+        if not math.isfinite(ttl):
+            raise ValueError(f"ttl must be a finite number of seconds, got {ttl!r}")
+        if ttl <= 0:
+            raise ValueError(
+                f"ttl must be greater than zero seconds, got {ttl!r}: a record that "
+                "expired on arrival is a delete, not a write"
+            )
+
+        expires_at_ms = self._now_ms() + math.ceil(ttl * 1000)
+        if expires_at_ms > MAX_EXPIRY_MS:
+            raise ValueError(
+                f"ttl of {ttl!r} seconds puts the deadline at {expires_at_ms} "
+                f"milliseconds, past the {MAX_EXPIRY_MS} the record formats can hold"
+            )
+        return expires_at_ms
 
     def _lookup(self, key: bytes) -> MemtableEntry | SSTableRecord | None:
         """Return the newest record held for ``key``, or ``None`` if there is none.
@@ -1152,6 +1350,16 @@ class LedgerLog:
         that ARCHITECTURE.md section 3 depends on once there are older layers
         below.
 
+        A record's expiry is replayed with it, unchanged, which is the whole
+        reason the log stores an absolute deadline rather than the TTL the caller
+        passed: the record comes back with the deadline it was written with, so a
+        TTL does not restart at every startup and one that ran out during the
+        outage is already expired when the engine opens. Expired records are
+        replayed rather than skipped, and then hidden by :meth:`get` like any
+        other expired record, because recovery cannot drop one safely: it would
+        have to shadow an older SSTable's value for the same key, and dropping it
+        on the way in would let that value resurface.
+
         A missing log is not an error and not a special case worth much: a first
         run has nothing to recover, and the writer will create the file a moment
         later.
@@ -1168,7 +1376,7 @@ class LedgerLog:
         result = replay(path)
         for record in result.records:
             if record.op is WalOp.PUT:
-                self._memtable.put(record.key, record.value)
+                self._memtable.put(record.key, record.value, expires_at_ms=record.expires_at_ms)
             elif record.op is WalOp.DELETE:
                 self._memtable.delete(record.key)
             else:
@@ -1396,6 +1604,13 @@ class LedgerLog:
         the order the data block needs, and materializing them would double the
         memory the flush exists to release.
 
+        Each record's expiry goes out with it, as the third element of the row the
+        writer takes, so a TTL write that was still live when the table froze
+        keeps the same deadline on disk. Dropping the expired ones here instead
+        would be the wrong layer and the wrong moment: a flush has no clock, and
+        an expired record still has to shadow an older table's value for its key
+        until a merge can establish that no older table holds one (story M8.4).
+
         ``expected_keys`` is the memtable's record count, which lets the writer
         size the bloom filter up front and hash each key as it passes instead of
         holding every key until the end. A frozen memtable is one of the few
@@ -1407,7 +1622,7 @@ class LedgerLog:
         """
         return write_sstable(
             path,
-            ((entry.key, entry.value) for entry in memtable.entries()),
+            ((entry.key, entry.value, entry.expires_at_ms) for entry in memtable.entries()),
             expected_keys=len(memtable),
         )
 

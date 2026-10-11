@@ -62,6 +62,7 @@ import ledgerlog
 from ledgerlog import LedgerLog
 from ledgerlog import bloom as bloom_module
 from ledgerlog import engine as engine_module
+from ledgerlog import memtable as memtable_module
 from ledgerlog import sstable as sstable_module
 from ledgerlog import wal as wal_module
 from ledgerlog.compaction import CompactionPolicy
@@ -85,6 +86,8 @@ from ledgerlog.sstable import (
 )
 from ledgerlog.wal import (
     FILE_HEADER_SIZE,
+    MAX_EXPIRY_MS,
+    NO_EXPIRY,
     RECORD_HEADER_SIZE,
     WAL_FORMAT_VERSION,
     FsyncPolicy,
@@ -121,6 +124,11 @@ class _AppendSpy:
     The point of the indirection is to observe the engine mid-write. ``observe``
     is called with the arguments the engine passed to the append, at the moment
     the append would run, and before the real one is invoked.
+
+    Keyword arguments are forwarded as well as positional ones, so that the spy
+    keeps matching the real append's signature as that signature grows (the
+    engine passes ``expires_at_ms`` by keyword). A spy that swallowed them would
+    quietly drop a field from every write it stood in for.
     """
 
     def __init__(self, real: Callable[..., int], observe: Callable[..., None]) -> None:
@@ -128,10 +136,10 @@ class _AppendSpy:
         self._observe = observe
         self.calls = 0
 
-    def __call__(self, *args: bytes) -> int:
+    def __call__(self, *args: object, **kwargs: object) -> int:
         self.calls += 1
-        self._observe(*args)
-        return self._real(*args)
+        self._observe(*args, **kwargs)
+        return self._real(*args, **kwargs)
 
 
 class _FailingAppend:
@@ -148,7 +156,7 @@ class _FailingAppend:
         self.message = message
         self.calls = 0
 
-    def __call__(self, *args: bytes) -> int:
+    def __call__(self, *args: object, **kwargs: object) -> int:
         self.calls += 1
         raise OSError(self.message)
 
@@ -184,7 +192,9 @@ def test_delete_appends_a_delete_record_with_an_empty_value(engine: LedgerLog) -
 def test_put_reaches_the_log_before_a_reader_can_see_the_value(engine: LedgerLog) -> None:
     """Inside the append, the engine must still be answering with the old state."""
     seen: list[bytes | None] = []
-    spy = _AppendSpy(engine._wal.append_put, lambda key, _value: seen.append(engine.get(key)))
+    spy = _AppendSpy(
+        engine._wal.append_put, lambda key, _value, **_kwargs: seen.append(engine.get(key))
+    )
     engine._wal.append_put = spy
 
     engine.put(b"alpha", b"one")
@@ -199,7 +209,9 @@ def test_overwriting_reaches_the_log_before_the_new_value_is_visible(engine: Led
     engine.put(b"alpha", b"one")
 
     seen: list[bytes | None] = []
-    spy = _AppendSpy(engine._wal.append_put, lambda key, _value: seen.append(engine.get(key)))
+    spy = _AppendSpy(
+        engine._wal.append_put, lambda key, _value, **_kwargs: seen.append(engine.get(key))
+    )
     engine._wal.append_put = spy
 
     engine.put(b"alpha", b"two")
@@ -1203,6 +1215,10 @@ for line in sys.stdin:
     if kind == "put":
         key, _, value = argument.partition("=")
         engine.put(key.encode(), value.encode())
+    elif kind == "putttl":
+        ttl, _, rest = argument.partition(" ")
+        key, _, value = rest.partition("=")
+        engine.put(key.encode(), value.encode(), ttl=float(ttl))
     elif kind == "delete":
         engine.delete(argument.encode())
     else:
@@ -1220,6 +1236,11 @@ been acknowledged. That is what lets the kill tests assert the recovered state
 The policy is ``always`` for the same reason: with an fsync behind every append,
 an acknowledgement is a statement that the record is on the disk, which is the
 promise the restart is being asked to keep.
+
+``putttl <seconds> key=value`` is the TTL form, and the child resolves it against
+its own real clock rather than one the parent could inject, which is the point:
+the deadline the parent later reads back was written by a process that is gone,
+so nothing about it can have been arranged by the test after the fact.
 """
 
 
@@ -3443,3 +3464,628 @@ def test_the_plan_is_never_seen_half_built_while_flushes_re_tier_it(tmp_path: Pa
         assert engine.flush_count > 1, "the run never exercised a repeated flush"
         assert snapshots[0] > 100, "the watcher barely looked at the plan"
         assert engine.compaction_plan.table_count == len(engine.sstables)
+
+
+# ---------------------------------------------------------------------------
+# Story M8.8: put(key, value, ttl=...) and read-time expiry.
+#
+# The layers below already carry an absolute deadline per record (stories M8.6
+# and M8.7), so what is new here is a meaning for it: a TTL becomes a deadline
+# once, at write time, and a read hides a record whose deadline has passed. Both
+# halves have a way of passing inspection while being false, and the tests are
+# arranged around those.
+#
+# "Converts it once" is the first. An engine that resolved the caller's duration
+# separately for the log and for the memtable would store two deadlines that
+# agree on any clock that does not move between the two calls, so the test for it
+# uses a clock that moves on every reading and asserts the two layers still agree.
+#
+# "Absolute, not relative" is the second, and a clean reopen cannot show it: a
+# relative TTL stored as a duration and restarted at every replay would still
+# look correct to a test that reopens and reads immediately. The test moves the
+# clock past the deadline across the reopen instead.
+#
+# "Does not unshadow" is the third and the one with teeth, because an expired
+# record read as simply absent would let the read path fall through to an older
+# table's value for the same key, which is a resurrection rather than an expiry.
+# That test builds two real tables and asserts the older value stays buried,
+# having first checked that it really is on disk to be found.
+#
+# Nothing here sleeps. The clock is a constructor argument, so a deadline is
+# crossed by moving time rather than by waiting for it, which is what keeps these
+# tests fast and keeps them from being flaky on a loaded machine.
+# ---------------------------------------------------------------------------
+
+
+class _FakeClock:
+    """A clock a test owns and moves by hand.
+
+    Callable, so it goes straight in as ``LedgerLog(clock=...)``, and it counts
+    its readings so a test can assert the engine really consulted it rather than
+    reaching for the wall clock behind its back.
+    """
+
+    def __init__(self, now: float = 1_700_000_000.0) -> None:
+        self.now = now
+        self.readings = 0
+
+    def __call__(self) -> float:
+        self.readings += 1
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+    @property
+    def now_ms(self) -> int:
+        return int(self.now * 1000)
+
+
+class _DriftingClock:
+    """A clock that moves forward on every reading.
+
+    Exists for one test: an engine that resolved a TTL once hands the same
+    deadline to both layers whatever this clock does, while an engine that
+    resolved it per layer hands them readings a step apart. A clock that stood
+    still could not tell those two apart.
+    """
+
+    def __init__(self, now: float = 1_700_000_000.0, step: float = 5.0) -> None:
+        self.now = now
+        self.step = step
+
+    def __call__(self) -> float:
+        current = self.now
+        self.now += self.step
+        return current
+
+
+def ttl_engine(directory: Path, clock: Callable[[], float]) -> LedgerLog:
+    """An engine on ``clock`` that keeps everything in memory until told otherwise.
+
+    Background flushing is off so that a test which has not asked for a flush is
+    reading the memtable, and one that has asked is reading a table it wrote
+    itself, rather than racing a thread for which of the two it got.
+    """
+    return LedgerLog(
+        directory,
+        fsync_policy=FsyncPolicy.NEVER,
+        flush_in_background=False,
+        clock=clock,
+    )
+
+
+def flushing_ttl_engine(directory: Path, clock: Callable[[], float]) -> LedgerLog:
+    """A TTL engine that freezes after every single write.
+
+    A threshold of one byte is met by any record at all, so each put produces its
+    own frozen table and, after ``flush_pending``, its own SSTable. That is what
+    lets a test put one key per table and know exactly which table holds what,
+    without writing thousands of filler records to cross a realistic threshold.
+    """
+    return LedgerLog(
+        directory,
+        fsync_policy=FsyncPolicy.NEVER,
+        memtable_threshold_bytes=1,
+        flush_in_background=False,
+        clock=clock,
+    )
+
+
+# Criterion 1: a TTL becomes one absolute deadline, in both layers.
+
+
+def test_a_ttl_put_logs_and_stores_the_same_absolute_deadline(tmp_path: Path) -> None:
+    clock = _FakeClock()
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"value", ttl=5)
+
+        expected = clock.now_ms + 5_000
+        logged_record = wal_records(engine)[0]
+        assert logged_record.op is WalOp.PUT
+        assert logged_record.expires_at_ms == expected
+
+        # Reaching into the memtable because the criterion is about what the
+        # memtable record carries, which a get deliberately does not reveal.
+        assert engine._memtable.lookup(b"key").expires_at_ms == expected
+
+
+def test_the_deadline_is_resolved_once_not_once_per_layer(tmp_path: Path) -> None:
+    """A clock that moves on every reading: the two layers still agree.
+
+    This is the test that distinguishes one conversion from two. With a clock
+    that stood still, an engine resolving the TTL separately for the log and for
+    the memtable would pass just as happily.
+    """
+    clock = _DriftingClock(step=5.0)
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"value", ttl=10)
+
+        logged_deadline = wal_records(engine)[0].expires_at_ms
+        stored_deadline = engine._memtable.lookup(b"key").expires_at_ms
+        assert logged_deadline == stored_deadline
+
+
+def test_a_fractional_ttl_rounds_up_to_the_next_whole_millisecond(tmp_path: Path) -> None:
+    """A sub-millisecond TTL still buys the record some life.
+
+    Rounded down, a TTL shorter than the format's resolution would produce a
+    deadline equal to the moment of the write, which reads as already expired.
+    """
+    clock = _FakeClock()
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"value", ttl=0.0001)
+
+        assert wal_records(engine)[0].expires_at_ms == clock.now_ms + 1
+        assert engine.get(b"key") == b"value"
+
+
+# Criterion 2: no TTL means the no-expiry sentinel and no change in behavior.
+
+
+def test_a_put_without_a_ttl_stores_the_no_expiry_sentinel(tmp_path: Path) -> None:
+    clock = _FakeClock()
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"value")
+
+        assert wal_records(engine)[0].expires_at_ms == NO_EXPIRY
+        assert engine._memtable.lookup(b"key").expires_at_ms == NO_EXPIRY
+
+        # Still readable an age later, which is what the sentinel means.
+        clock.advance(10_000_000)
+        assert engine.get(b"key") == b"value"
+
+
+def test_a_delete_carries_the_no_expiry_sentinel(tmp_path: Path) -> None:
+    """A tombstone that expired would unshadow the value it buries."""
+    clock = _FakeClock()
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"value", ttl=5)
+        engine.delete(b"key")
+
+        assert wal_records(engine)[1].expires_at_ms == NO_EXPIRY
+        assert engine._memtable.lookup(b"key").expires_at_ms == NO_EXPIRY
+
+        clock.advance(10_000)
+        assert engine.get(b"key") is None
+
+
+def test_a_put_without_a_ttl_never_reads_the_clock(tmp_path: Path) -> None:
+    """A store nobody writes TTLs to pays nothing for the feature."""
+    clock = _FakeClock()
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"value")
+        engine.delete(b"other")
+        assert engine.get(b"key") == b"value"
+        assert engine.get(b"missing") is None
+
+        assert clock.readings == 0
+
+
+# Criterion 3: a read hides an expired record, with no compaction involved.
+
+
+def test_a_ttl_record_reads_until_its_deadline_and_not_after(tmp_path: Path) -> None:
+    clock = _FakeClock()
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"value", ttl=10)
+
+        assert engine.get(b"key") == b"value"
+
+        # One millisecond before the deadline: still there.
+        clock.advance(9.999)
+        assert engine.get(b"key") == b"value"
+
+        # Exactly on the deadline: gone. A record is unreadable once its TTL has
+        # elapsed, not a millisecond afterwards.
+        clock.advance(0.001)
+        assert engine.get(b"key") is None
+
+        clock.advance(1_000)
+        assert engine.get(b"key") is None
+
+
+def test_an_expired_record_reads_as_absent_with_no_compaction_having_run(
+    tmp_path: Path,
+) -> None:
+    """Criterion 3's "without waiting for a compaction", asserted rather than assumed."""
+    clock = _FakeClock()
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"value", ttl=1)
+        clock.advance(2)
+
+        assert engine.get(b"key") is None
+        # Nothing was flushed, merged or removed: the record is still in the
+        # memtable and still in the log, and only the read is hiding it.
+        assert engine.sstables == ()
+        assert engine.flush_count == 0
+        assert engine._memtable.lookup(b"key").value == b"value"
+        assert wal_records(engine)[0].value == b"value"
+
+
+def test_a_live_record_written_over_an_expired_one_is_readable_again(tmp_path: Path) -> None:
+    """Expiry is a property of the record, not a mark against the key."""
+    clock = _FakeClock()
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"first", ttl=1)
+        clock.advance(2)
+        assert engine.get(b"key") is None
+
+        engine.put(b"key", b"second")
+
+        assert engine.get(b"key") == b"second"
+
+
+def test_an_expired_record_in_a_frozen_memtable_also_reads_as_absent(tmp_path: Path) -> None:
+    """The rule is the read path's, so it has to hold for every layer the walk visits."""
+    clock = _FakeClock()
+    with flushing_ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"value", ttl=10)
+        assert engine.frozen_memtables, "the write did not freeze the memtable"
+
+        assert engine.get(b"key") == b"value"
+        clock.advance(11)
+        assert engine.get(b"key") is None
+        # Found in the frozen table rather than the active one, which is the
+        # layer this test is about.
+        assert engine._memtable.lookup(b"key") is None
+
+
+# Criterion 4: a flush keeps the deadline, and a read off disk honors it.
+
+
+def test_a_live_ttl_write_keeps_its_deadline_through_a_flush(tmp_path: Path) -> None:
+    clock = _FakeClock()
+    with flushing_ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"value", ttl=10)
+        expected = clock.now_ms + 10_000
+
+        engine.flush_pending()
+
+        # The deadline is in the file, read back with no engine involved.
+        (handle,) = engine.sstables
+        with SSTableReader.open(handle.path) as reader:
+            record = reader.lookup(b"key")
+        assert record.value == b"value"
+        assert record.expires_at_ms == expected
+
+        # And the engine, now answering from that table rather than from memory,
+        # still honors it.
+        assert engine.frozen_memtables == ()
+        assert engine.get(b"key") == b"value"
+        clock.advance(10)
+        assert engine.get(b"key") is None
+
+
+def test_a_flush_keeps_an_expired_record_rather_than_dropping_it(tmp_path: Path) -> None:
+    """A flush has no clock, and an expired record still has to shadow older tables.
+
+    Dropping it here would be story M8.4's job done in the wrong place and at the
+    wrong moment: reclaiming the bytes is safe only once no older table can
+    answer for the key.
+    """
+    clock = _FakeClock()
+    with flushing_ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"value", ttl=1)
+        clock.advance(5)
+
+        engine.flush_pending()
+
+        (handle,) = engine.sstables
+        assert sstable_records(handle.path) == [(b"key", b"value")]
+        assert engine.get(b"key") is None
+
+
+# Criterion 5: an expired record on disk does not unshadow an older table.
+
+
+def test_an_expired_sstable_record_does_not_unshadow_an_older_table(tmp_path: Path) -> None:
+    """The criterion with teeth: expiry must bury the old value, not reveal it.
+
+    An engine that treated an expired record as "no record here" would walk on to
+    the older table and hand back a value the caller replaced, which is a
+    resurrection dressed up as an expiry. The old value is checked to be really
+    on disk first, so a pass cannot come from there being nothing to find.
+    """
+    clock = _FakeClock()
+    with flushing_ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"old")
+        engine.put(b"key", b"new", ttl=10)
+        engine.flush_pending()
+
+        newest, oldest = engine.sstables
+        assert sstable_records(oldest.path) == [(b"key", b"old")]
+        assert sstable_records(newest.path) == [(b"key", b"new")]
+        assert engine.get(b"key") == b"new"
+
+        clock.advance(10)
+
+        assert engine.get(b"key") is None, "an expired record unshadowed an older table"
+
+
+def test_an_expired_record_in_memory_does_not_unshadow_a_table_on_disk(
+    tmp_path: Path,
+) -> None:
+    """The same rule where the expired record is the newest in-memory one."""
+    clock = _FakeClock()
+    with flushing_ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"old")
+        engine.flush_pending()
+        assert len(engine.sstables) == 1
+
+        engine.put(b"key", b"new", ttl=10)
+        clock.advance(11)
+
+        assert engine.get(b"key") is None
+        # The older table is still there and still holds the value that must
+        # stay buried.
+        assert sstable_records(engine.sstables[-1].path) == [(b"key", b"old")]
+
+
+def test_an_expired_record_does_not_hide_another_key(tmp_path: Path) -> None:
+    """Expiry is per record, so the keys around it are untouched."""
+    clock = _FakeClock()
+    with flushing_ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"short", b"a", ttl=10)
+        engine.put(b"long", b"b", ttl=10_000)
+        engine.put(b"forever", b"c")
+        engine.flush_pending()
+
+        clock.advance(11)
+
+        assert engine.get(b"short") is None
+        assert engine.get(b"long") == b"b"
+        assert engine.get(b"forever") == b"c"
+
+
+# Criterion 6: the clock is injectable.
+
+
+def test_an_engine_given_no_clock_uses_the_wall_clock(tmp_path: Path) -> None:
+    with LedgerLog(tmp_path / "data") as engine:
+        assert engine.clock is engine_module.DEFAULT_CLOCK
+        assert engine.clock is time.time
+
+
+def test_an_engine_reports_and_uses_the_clock_it_was_given(tmp_path: Path) -> None:
+    clock = _FakeClock()
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        assert engine.clock is clock
+
+        engine.put(b"key", b"value", ttl=5)
+        assert clock.readings == 1, "the TTL was resolved against some other clock"
+
+        engine.get(b"key")
+        assert clock.readings == 2, "the expiry check read some other clock"
+
+
+def test_two_engines_can_disagree_about_what_time_it_is(tmp_path: Path) -> None:
+    """The clock is per engine, not a module global, so tests cannot interfere."""
+    early = _FakeClock(now=1_700_000_000.0)
+    late = _FakeClock(now=1_700_000_000.0)
+    with (
+        ttl_engine(tmp_path / "early", early) as first,
+        ttl_engine(tmp_path / "late", late) as second,
+    ):
+        first.put(b"key", b"value", ttl=10)
+        second.put(b"key", b"value", ttl=10)
+
+        late.advance(11)
+
+        assert first.get(b"key") == b"value"
+        assert second.get(b"key") is None
+
+
+def test_a_clock_that_is_not_callable_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="clock must be callable"):
+        LedgerLog(tmp_path / "data", clock=1_700_000_000.0)
+
+
+def test_a_clock_returning_something_impossible_is_reported(tmp_path: Path) -> None:
+    """A NaN left alone would make every expiry check answer "not expired"."""
+    readings: list[Any] = [float("nan")]
+    with ttl_engine(tmp_path / "data", lambda: readings[0]) as engine:
+        with pytest.raises(ValueError, match="not a finite non-negative"):
+            engine.put(b"key", b"value", ttl=5)
+
+        readings[0] = -1.0
+        with pytest.raises(ValueError, match="not a finite non-negative"):
+            engine.put(b"key", b"value", ttl=5)
+
+        readings[0] = "now"
+        with pytest.raises(TypeError, match="clock must return a real number"):
+            engine.put(b"key", b"value", ttl=5)
+
+        # Nothing was logged or stored by any of the three refused writes.
+        assert wal_records(engine) == []
+        assert engine._memtable.lookup(b"key") is None
+
+
+# A rejected TTL is a write that did not happen, at either layer.
+
+
+@pytest.mark.parametrize("ttl", [0, -1, -0.5])
+def test_a_non_positive_ttl_is_refused(tmp_path: Path, ttl: float) -> None:
+    """A TTL computed by subtracting two timestamps is the mistake this catches."""
+    clock = _FakeClock()
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        with pytest.raises(ValueError, match="greater than zero seconds"):
+            engine.put(b"key", b"value", ttl=ttl)
+
+        assert wal_records(engine) == []
+        assert engine._memtable.lookup(b"key") is None
+
+
+@pytest.mark.parametrize("ttl", [float("nan"), float("inf"), float("-inf")])
+def test_a_non_finite_ttl_is_refused(tmp_path: Path, ttl: float) -> None:
+    clock = _FakeClock()
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        with pytest.raises(ValueError):
+            engine.put(b"key", b"value", ttl=ttl)
+
+        assert wal_records(engine) == []
+
+
+@pytest.mark.parametrize("ttl", ["5", b"5", object(), True])
+def test_a_ttl_that_is_not_a_number_is_refused(tmp_path: Path, ttl: object) -> None:
+    """``True`` among them: a flag passed by mistake would otherwise mean one millisecond."""
+    clock = _FakeClock()
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        with pytest.raises(TypeError, match="ttl must be a number of seconds"):
+            engine.put(b"key", b"value", ttl=ttl)
+
+        assert wal_records(engine) == []
+
+
+def test_a_ttl_past_what_the_record_formats_hold_is_refused(tmp_path: Path) -> None:
+    clock = _FakeClock()
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        with pytest.raises(ValueError, match="past the"):
+            engine.put(b"key", b"value", ttl=float(MAX_EXPIRY_MS))
+
+        assert wal_records(engine) == []
+        assert engine._memtable.lookup(b"key") is None
+
+
+def test_a_refused_ttl_leaves_an_existing_value_alone(tmp_path: Path) -> None:
+    clock = _FakeClock()
+    with ttl_engine(tmp_path / "data", clock) as engine:
+        engine.put(b"key", b"value")
+
+        with pytest.raises(ValueError):
+            engine.put(b"key", b"replacement", ttl=-1)
+
+        assert engine.get(b"key") == b"value"
+        assert len(wal_records(engine)) == 1
+
+
+# Criterion 7: the deadline is absolute, and it survives a restart.
+
+
+def test_a_reopen_does_not_restart_the_countdown(tmp_path: Path) -> None:
+    """The reason the log stores a deadline and not the caller's duration.
+
+    A relative TTL replayed at startup would start counting again from the
+    reopen, so this reopens past the deadline and asserts the record is already
+    gone. A clean reopen that read the key immediately would pass either way.
+    """
+    directory = tmp_path / "data"
+    clock = _FakeClock()
+    with ttl_engine(directory, clock) as engine:
+        engine.put(b"short", b"gone", ttl=10)
+        engine.put(b"long", b"kept", ttl=10_000)
+
+    moved_on = _FakeClock(now=clock.now + 20)
+    with ttl_engine(directory, moved_on) as reopened:
+        assert reopened.recovery.records_replayed == 2
+        # Replayed rather than dropped: the expired record has to stay in the
+        # memtable so it can shadow an older layer's value for its key.
+        assert reopened._memtable.lookup(b"short").value == b"gone"
+
+        assert reopened.get(b"short") is None
+        assert reopened.get(b"long") == b"kept"
+
+
+def test_a_reopen_before_the_deadline_still_reads_the_record(tmp_path: Path) -> None:
+    """The other side of the same claim: a replay does not expire a live record either."""
+    directory = tmp_path / "data"
+    clock = _FakeClock()
+    with ttl_engine(directory, clock) as engine:
+        engine.put(b"key", b"value", ttl=100)
+
+    moved_on = _FakeClock(now=clock.now + 50)
+    with ttl_engine(directory, moved_on) as reopened:
+        assert reopened.get(b"key") == b"value"
+
+
+def test_a_killed_engine_recovers_a_live_ttl_and_not_an_expired_one(
+    tmp_path: Path, killable_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """Criterion 7, against a process that really died.
+
+    The child writes both records against its own wall clock and is then SIGKILLed,
+    so no clean shutdown ran and no deadline here was arranged after the fact. The
+    reopen uses a clock set past the short TTL and well short of the long one, which
+    is how the assertion is made without sleeping for a deadline to arrive.
+    """
+    directory = tmp_path / "data"
+    child = killable_engine(directory)
+    child.run("putttl 2 short=gone")
+    child.run("putttl 3600 long=kept")
+    child.kill()
+
+    reopened_at = _FakeClock(now=time.time() + 60)
+    with ttl_engine(directory, reopened_at) as restarted:
+        assert restarted.recovery.records_replayed == 2
+        assert restarted.recovery.is_intact, restarted.recovery.reason
+
+        assert restarted.get(b"short") is None
+        assert restarted.get(b"long") == b"kept"
+
+
+def test_a_ttl_write_survives_a_kill_and_then_a_flush(
+    tmp_path: Path, killable_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The deadline crosses a kill and then a flush, and is still honored off disk.
+
+    The two paths it has to survive in one test: recovered from the log of a
+    process that died, then written out to a table by the engine that recovered
+    it. A deadline lost at either handover would leave a record that never
+    expires.
+    """
+    directory = tmp_path / "data"
+    child = killable_engine(directory)
+    child.run("putttl 3600 key=kept")
+    child.kill()
+
+    clock = _FakeClock(now=time.time())
+    with flushing_ttl_engine(directory, clock) as restarted:
+        restarted.flush_pending()
+
+        (handle,) = restarted.sstables
+        with SSTableReader.open(handle.path) as reader:
+            record = reader.lookup(b"key")
+        assert record.value == b"kept"
+        assert record.has_expiry, "the deadline was lost between the log and the table"
+
+        # Answering from the table now, the frozen memtable having been dropped.
+        assert restarted.frozen_memtables == ()
+        assert restarted.get(b"key") == b"kept"
+
+        clock.advance(7_200)
+        assert restarted.get(b"key") is None
+
+
+def test_a_ttl_can_never_resolve_to_the_no_expiry_sentinel(tmp_path: Path) -> None:
+    """The one arithmetic result that would turn a TTL into "never expires".
+
+    The sentinel is zero, and the deadline is a clock reading plus a rounded-up
+    duration, so the only way to reach zero is a clock at the epoch and a
+    duration that rounded to nothing. Rounding up is what forecloses it, and this
+    is the test that holds that reasoning in place.
+    """
+    epoch = _FakeClock(now=0.0)
+    with ttl_engine(tmp_path / "data", epoch) as engine:
+        engine.put(b"key", b"value", ttl=0.000001)
+
+        deadline = wal_records(engine)[0].expires_at_ms
+        assert deadline != NO_EXPIRY
+        assert deadline == 1
+
+        epoch.advance(1)
+        assert engine.get(b"key") is None
+
+
+def test_the_three_layers_agree_about_the_expiry_sentinel_and_its_range() -> None:
+    """The layers declare these separately, so nothing stops them drifting apart.
+
+    CLAUDE.md asks that the WAL, the memtable and the SSTable stay independently
+    testable, which is why each declares its own constants rather than importing
+    another's. The cost of that is exactly this: a sentinel changed in one place
+    would make a record written through one layer read as no-expiry in the next,
+    and no test of either layer on its own would notice. This is the check that
+    would.
+    """
+    assert wal_module.NO_EXPIRY == memtable_module.NO_EXPIRY == sstable_module.NO_EXPIRY
+    assert wal_module.MAX_EXPIRY_MS == memtable_module.MAX_EXPIRY_MS
+    assert wal_module.MAX_EXPIRY_MS == sstable_module.MAX_EXPIRY_MS

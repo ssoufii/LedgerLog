@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import contextlib
 import random
+import struct
 import sys
 import threading
 from collections.abc import Callable, Iterator
@@ -55,6 +56,8 @@ from ledgerlog.memtable import (
     _TAG_PUT,
     DEFAULT_LEVEL_PROBABILITY,
     DEFAULT_MAX_LEVEL,
+    MAX_EXPIRY_MS,
+    NO_EXPIRY,
     READS_TAKE_THE_WRITER_LOCK,
     Memtable,
     MemtableEntry,
@@ -633,7 +636,9 @@ def test_a_put_of_an_empty_value_is_not_a_tombstone() -> None:
     # The two records differ in the bytes actually stored, not just in how they
     # are read back, so nothing downstream can conflate them either.
     assert stored_value(memtable, b"empty") != stored_value(memtable, b"deleted")
-    assert stored_value(memtable, b"empty") == _TAG_PUT
+    # A put of b"" is its tag and its expiry with no value after them, which is
+    # still a different run of bytes from the bare tag a tombstone is.
+    assert stored_value(memtable, b"empty") == _TAG_PUT + struct.pack("<Q", NO_EXPIRY)
     assert stored_value(memtable, b"deleted") == _TAG_DELETE
 
 
@@ -2257,3 +2262,201 @@ def test_readers_keep_working_across_a_freeze() -> None:
 
     assert reads, "the reader never ran"
     assert all(value == b"anchored" for value in reads), "a read across the freeze saw a gap"
+
+
+# ---------------------------------------------------------------------------
+# Story M8.8: a put record carries an absolute expiry.
+#
+# The memtable's share of the TTL story is narrow and worth stating, because the
+# temptation is to test the engine's behavior from here: nothing in this module
+# compares a deadline against a clock, so there is no expired record to find. The
+# claims that belong here are that the field survives a round trip through the
+# tagged bytes the skip list holds, that a tombstone cannot carry one, that the
+# byte total did not quietly change meaning when the framing grew, and that the
+# wider framing is still read correctly while a writer is inserting.
+# ---------------------------------------------------------------------------
+
+
+def test_a_put_round_trips_the_expiry_it_was_given() -> None:
+    memtable = Memtable()
+    memtable.put(b"key", b"value", expires_at_ms=1_700_000_000_000)
+
+    entry = memtable.lookup(b"key")
+    assert entry == MemtableEntry(key=b"key", value=b"value", expires_at_ms=1_700_000_000_000)
+    assert entry.has_expiry is True
+
+
+def test_a_put_without_an_expiry_carries_the_no_expiry_sentinel() -> None:
+    memtable = Memtable()
+    memtable.put(b"key", b"value")
+
+    entry = memtable.lookup(b"key")
+    assert entry.expires_at_ms == NO_EXPIRY
+    assert entry.has_expiry is False
+
+
+def test_an_expiry_already_in_the_past_is_stored_and_read_back_unchanged() -> None:
+    """The memtable has no clock, so a past deadline is data like any other.
+
+    Hiding it here would be the wrong layer: the record still has to shadow an
+    older SSTable's value for its key, which it cannot do if it never reaches the
+    read path.
+    """
+    memtable = Memtable()
+    memtable.put(b"key", b"value", expires_at_ms=1)
+
+    assert memtable.lookup(b"key").expires_at_ms == 1
+    assert memtable.get(b"key") == b"value"
+
+
+def test_the_largest_and_smallest_expiries_the_field_holds_round_trip() -> None:
+    memtable = Memtable()
+    memtable.put(b"max", b"value", expires_at_ms=MAX_EXPIRY_MS)
+    memtable.put(b"min", b"value", expires_at_ms=NO_EXPIRY)
+
+    assert memtable.lookup(b"max").expires_at_ms == MAX_EXPIRY_MS
+    assert memtable.lookup(b"min").expires_at_ms == NO_EXPIRY
+
+
+def test_an_expiry_past_the_field_is_refused_without_storing_anything() -> None:
+    memtable = Memtable()
+
+    with pytest.raises(ValueError, match="outside the 0 to"):
+        memtable.put(b"key", b"value", expires_at_ms=MAX_EXPIRY_MS + 1)
+    with pytest.raises(ValueError, match="outside the 0 to"):
+        memtable.put(b"key", b"value", expires_at_ms=-1)
+
+    assert memtable.lookup(b"key") is None
+    assert len(memtable) == 0
+    assert memtable.nbytes == 0
+
+
+def test_a_non_integer_expiry_is_refused() -> None:
+    memtable = Memtable()
+
+    with pytest.raises(TypeError, match="expires_at_ms must be an int"):
+        memtable.put(b"key", b"value", expires_at_ms=1.5)
+    with pytest.raises(TypeError, match="expires_at_ms must be an int"):
+        memtable.put(b"key", b"value", expires_at_ms="1")
+
+    # bool is an int subclass, so True would otherwise encode as a 1970 deadline
+    # one millisecond after the no-expiry sentinel.
+    with pytest.raises(TypeError, match="expires_at_ms must be an int"):
+        memtable.put(b"key", b"value", expires_at_ms=True)
+
+    assert memtable.lookup(b"key") is None
+
+
+def test_a_tombstone_carries_no_expiry_and_has_no_way_to_be_given_one() -> None:
+    """A tombstone that expired would unshadow the value it buries."""
+    memtable = Memtable()
+    memtable.put(b"key", b"value", expires_at_ms=1_700_000_000_000)
+    memtable.delete(b"key")
+
+    assert memtable.lookup(b"key") == MemtableEntry(key=b"key", value=None)
+    assert memtable.lookup(b"key").expires_at_ms == NO_EXPIRY
+    with pytest.raises(TypeError):
+        memtable.delete(b"key", expires_at_ms=1)
+
+
+def test_overwriting_a_record_replaces_its_expiry() -> None:
+    memtable = Memtable()
+    memtable.put(b"key", b"value", expires_at_ms=1_700_000_000_000)
+
+    memtable.put(b"key", b"value")
+
+    assert memtable.lookup(b"key").expires_at_ms == NO_EXPIRY
+    assert len(memtable) == 1
+
+
+def test_the_byte_total_counts_the_key_and_value_and_not_the_expiry() -> None:
+    """The measure the flush threshold is set in did not change meaning.
+
+    A threshold expressed in these bytes means what it meant before records could
+    carry deadlines, which is why the eight byte field is excluded. See
+    ``memtable.py``.
+    """
+    with_expiry = Memtable()
+    with_expiry.put(b"key", b"value", expires_at_ms=1_700_000_000_000)
+    without_expiry = Memtable()
+    without_expiry.put(b"key", b"value")
+
+    assert with_expiry.nbytes == len(b"key") + len(b"value")
+    assert with_expiry.nbytes == without_expiry.nbytes
+    assert with_expiry.nbytes == recount_nbytes(with_expiry)
+
+
+def test_the_byte_total_still_counts_a_tombstone_as_its_key_alone() -> None:
+    """The framing differs by record kind now, so the accounting has to as well."""
+    memtable = Memtable()
+    memtable.put(b"key", b"value", expires_at_ms=1_700_000_000_000)
+
+    memtable.delete(b"key")
+
+    assert memtable.nbytes == len(b"key")
+    assert memtable.nbytes == recount_nbytes(memtable)
+
+
+def test_a_put_record_too_short_to_hold_its_expiry_is_reported_not_unpacked() -> None:
+    """Not reachable through the public API, which is why it is checked rather than assumed.
+
+    An unpack past the end of the stored bytes would raise from inside ``struct``
+    with nothing in it to say which key was wrong, and a slice would silently
+    hand back a truncated deadline.
+    """
+    memtable = Memtable()
+    memtable._skiplist.insert(b"key", _TAG_PUT + b"\x00\x00\x00")
+
+    with pytest.raises(ValueError, match="too short to hold"):
+        memtable.lookup(b"key")
+
+
+def test_expiries_survive_concurrent_readers_against_a_writer() -> None:
+    """Readers never see a record whose expiry belongs to a different write.
+
+    The framing a put is stored behind grew from one byte to nine, and a reader
+    slices the value out from a fixed offset past the expiry, so a reader that
+    saw a half-replaced record would come back with a value and a deadline from
+    different writes. Each key's deadline is derived from the key here, so a
+    mismatch is detectable rather than merely unlikely, and the readers run
+    against a table that is still being built.
+    """
+    memtable = Memtable()
+    keys = [f"key{index:05d}".encode() for index in range(1500)]
+
+    def deadline_for(key: bytes) -> int:
+        return 1_700_000_000_000 + int(key[3:])
+
+    ready = start_together(3)
+    reader_operations: list[int] = []
+    sizes_at_first_read: list[int] = []
+
+    def writer() -> None:
+        ready.wait()
+        for key in keys:
+            memtable.put(key, b"value-" + key, expires_at_ms=deadline_for(key))
+
+    def reader() -> None:
+        reads = 0
+        ready.wait()
+        sizes_at_first_read.append(len(memtable))
+        # Walk the keys repeatedly rather than once, so a reader keeps finding
+        # records the writer has only just inserted.
+        for _ in range(4):
+            for key in keys:
+                entry = memtable.lookup(key)
+                if entry is None:
+                    continue
+                reads += 1
+                assert entry.value == b"value-" + key
+                assert entry.expires_at_ms == deadline_for(key), (
+                    f"record for {key!r} came back with a deadline from another write"
+                )
+        reader_operations.append(reads)
+
+    with forced_thread_interleaving():
+        run_in_threads([writer, reader, reader])
+
+    assert_readers_overlapped_the_writer(
+        reader_operations, sizes_at_first_read, total_keys=len(keys)
+    )
