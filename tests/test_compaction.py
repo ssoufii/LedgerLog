@@ -105,6 +105,7 @@ import struct
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable, Iterator, Sequence
 from dataclasses import FrozenInstanceError, dataclass, replace
 from pathlib import Path
@@ -115,6 +116,7 @@ from hypothesis import strategies as st
 
 import ledgerlog
 from ledgerlog.compaction import (
+    DEFAULT_CLOCK,
     DEFAULT_MIN_TIER_TABLES,
     DEFAULT_SIZE_RATIO,
     CompactionPlan,
@@ -134,11 +136,13 @@ from ledgerlog.compaction import (
     merge_tier,
     older_outside_tables,
     plan_compaction,
+    read_clock_ms,
     swap_in_merged_table,
 )
 from ledgerlog.sstable import (
     FILE_HEADER_SIZE,
     FOOTER_SIZE,
+    NO_EXPIRY,
     SSTABLE_FORMAT_VERSION,
     SSTableFooter,
     SSTableIncompleteError,
@@ -642,6 +646,18 @@ def test_anything_with_a_sequence_and_a_size_is_a_sized_table() -> None:
 # ---------------------------------------------------------------------------
 
 Pair = tuple[bytes, bytes | None]
+Triple = tuple[bytes, bytes | None, int]
+
+
+def no_expiry(*pairs: Pair) -> list[Triple]:
+    """The triples a merge yields for ``pairs``, none of which carries a deadline.
+
+    Spelled out rather than letting the assertions compare pairs, because the
+    sentinel in the third position is a claim worth making: a merge of records
+    nobody gave a deadline must put :data:`NO_EXPIRY` in the merged table and not
+    some deadline of its own invention.
+    """
+    return [(key, value, NO_EXPIRY) for key, value in pairs]
 
 
 def stream(*pairs: Pair) -> Iterator[SSTableRecord]:
@@ -678,12 +694,12 @@ def test_a_key_in_several_sources_takes_the_newest_sources_value() -> None:
     middle = stream((b"middle", b"m1"), (b"shared", b"m2"))
     oldest = stream((b"middle", b"o1"), (b"oldest", b"o2"), (b"shared", b"o3"))
 
-    assert list(merge_records([newest, middle, oldest])) == [
+    assert list(merge_records([newest, middle, oldest])) == no_expiry(
         (b"apple", b"n1"),
         (b"middle", b"m1"),
         (b"oldest", b"o2"),
         (b"shared", b"n2"),
-    ]
+    )
 
 
 def test_a_newer_tombstone_shadows_an_older_value_and_is_kept() -> None:
@@ -697,7 +713,7 @@ def test_a_newer_tombstone_shadows_an_older_value_and_is_kept() -> None:
     newest = stream((b"gone", None))
     oldest = stream((b"gone", b"value"))
 
-    assert list(merge_records([newest, oldest])) == [(b"gone", None)]
+    assert list(merge_records([newest, oldest])) == no_expiry((b"gone", None))
 
 
 def test_a_newer_value_shadows_an_older_tombstone() -> None:
@@ -705,26 +721,26 @@ def test_a_newer_value_shadows_an_older_tombstone() -> None:
     newest = stream((b"back", b"again"))
     oldest = stream((b"back", None))
 
-    assert list(merge_records([newest, oldest])) == [(b"back", b"again")]
+    assert list(merge_records([newest, oldest])) == no_expiry((b"back", b"again"))
 
 
 def test_sources_with_no_keys_in_common_interleave_into_one_sorted_run() -> None:
     newest = stream((b"a", b"1"), (b"d", b"4"))
     oldest = stream((b"b", b"2"), (b"c", b"3"), (b"e", b"5"))
 
-    assert list(merge_records([newest, oldest])) == [
+    assert list(merge_records([newest, oldest])) == no_expiry(
         (b"a", b"1"),
         (b"b", b"2"),
         (b"c", b"3"),
         (b"d", b"4"),
         (b"e", b"5"),
-    ]
+    )
 
 
 def test_one_source_merges_to_its_own_records() -> None:
     pairs: list[Pair] = [(b"a", b"1"), (b"b", None), (b"c", b"3")]
 
-    assert list(merge_records([stream(*pairs)])) == pairs
+    assert list(merge_records([stream(*pairs)])) == no_expiry(*pairs)
 
 
 def test_merging_nothing_yields_nothing() -> None:
@@ -733,7 +749,7 @@ def test_merging_nothing_yields_nothing() -> None:
 
 
 def test_an_empty_source_beside_a_full_one_changes_nothing() -> None:
-    assert list(merge_records([stream(), stream((b"a", b"1"))])) == [(b"a", b"1")]
+    assert list(merge_records([stream(), stream((b"a", b"1"))])) == no_expiry((b"a", b"1"))
 
 
 def test_the_merge_holds_one_record_per_source_rather_than_reading_them_in() -> None:
@@ -752,7 +768,7 @@ def test_the_merge_holds_one_record_per_source_rather_than_reading_them_in() -> 
 
     first = next(merged)
 
-    assert first == (b"\x01", b"v")
+    assert first == (b"\x01", b"v", NO_EXPIRY)
     assert pulled == [2, 2]
 
 
@@ -814,7 +830,7 @@ def test_the_merge_matches_a_reference_newest_wins_computation(
     for source in reversed(sources):
         reference.update(source)
 
-    assert list(merge_records(streams)) == sorted(reference.items())
+    assert list(merge_records(streams)) == no_expiry(*sorted(reference.items()))
 
 
 # ---------------------------------------------------------------------------
@@ -836,8 +852,13 @@ class StubMergeTable:
     path: Path
 
 
-def write_table(path: Path, pairs: Sequence[Pair], *, index_interval: int = 64) -> Path:
-    """Write one real SSTable holding ``pairs``, which must be in ascending key order."""
+def write_table(path: Path, pairs: Sequence[Pair | Triple], *, index_interval: int = 64) -> Path:
+    """Write one real SSTable holding ``pairs``, which must be in ascending key order.
+
+    Triples are accepted beside pairs so that a table carrying deadlines is
+    written through the same helper as one without: the format takes both
+    (story M8.7) and a merge has to handle a tier of either.
+    """
     write_sstable(path, pairs, index_interval=index_interval, expected_keys=len(pairs))
     return path
 
@@ -853,6 +874,26 @@ def table_records(path: Path) -> list[Pair]:
         footer = read_footer(handle)
         return [
             (record.key, record.value)
+            for record in iter_records(
+                handle,
+                start_offset=footer.data_block_offset,
+                end_offset=footer.data_block_end,
+            )
+        ]
+
+
+def table_rows(path: Path) -> list[Triple]:
+    """Every record in the data block, deadline included, in the order it holds them.
+
+    :func:`table_records` with the expiry field, which most tests have no opinion
+    about and the expiry ones turn on: a record that survived a merge having lost
+    its deadline is a record that will never expire again, and a pair would not
+    show that.
+    """
+    with open(path, "rb") as handle:
+        footer = read_footer(handle)
+        return [
+            (record.key, record.value, record.expires_at_ms)
             for record in iter_records(
                 handle,
                 start_offset=footer.data_block_offset,
@@ -1593,7 +1634,7 @@ def test_the_probe_is_asked_only_about_the_keys_a_tombstone_wins() -> None:
 
     merged = list(merge_records([stream], has_older_value=probe))
 
-    assert merged == [(b"a", b"v"), (b"c", b"v")]
+    assert merged == no_expiry((b"a", b"v"), (b"c", b"v"))
     assert probe.asked == [b"b"]
 
 
@@ -1621,7 +1662,7 @@ def test_a_kept_tombstone_is_yielded_where_its_key_belongs() -> None:
 
     merged = list(merge_records([stream], has_older_value=probe))
 
-    assert merged == [(b"b", None), (b"c", b"v")]
+    assert merged == no_expiry((b"b", None), (b"c", b"v"))
     assert probe.asked == [b"a", b"b", b"d"]
 
 
@@ -1629,7 +1670,7 @@ def test_without_a_probe_no_tombstone_is_dropped() -> None:
     """The default, stated as a test because it is the safe reading of silence."""
     stream = records([(b"a", None), (b"b", b"v")])
 
-    assert list(merge_records([stream])) == [(b"a", None), (b"b", b"v")]
+    assert list(merge_records([stream])) == no_expiry((b"a", None), (b"b", b"v"))
 
 
 def test_the_probe_decides_per_key_rather_than_once() -> None:
@@ -1639,7 +1680,7 @@ def test_the_probe_decides_per_key_rather_than_once() -> None:
 
     merged = list(merge_records([stream], has_older_value=probe))
 
-    assert merged == [(b"b", None), (b"d", None)]
+    assert merged == no_expiry((b"b", None), (b"d", None))
     assert probe.asked == [b"a", b"b", b"c", b"d"]
 
 
@@ -2009,6 +2050,406 @@ def test_consulting_an_older_table_does_not_disturb_a_reader_of_it(tmp_path: Pat
 
 
 # ---------------------------------------------------------------------------
+# M8.4: a record past its deadline is dropped from the merge, under the same
+# condition a tombstone is. The time comes from a clock the test moves, never
+# from a sleep.
+# ---------------------------------------------------------------------------
+
+
+class FakeClock:
+    """A clock the test sets by hand, counting how many times it was read.
+
+    Seconds since the epoch, like :data:`~ledgerlog.compaction.DEFAULT_CLOCK`
+    and like the clock an engine is built with, so what a merge is handed here is
+    the same shape as what it will be handed in production. The count is what
+    makes "read once per merge" testable: a merge that read the clock per record
+    would pass every other test in this section.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        self.reads = 0
+
+    def __call__(self) -> float:
+        self.reads += 1
+        return self.seconds
+
+    def advance(self, seconds: float) -> None:
+        self.seconds += seconds
+
+
+def expiring_records(triples: Sequence[Triple]) -> list[SSTableRecord]:
+    """One source's records, each with the deadline its triple carries."""
+    return [
+        SSTableRecord(
+            key=key,
+            value=value,
+            offset=index,
+            end_offset=index + 1,
+            expires_at_ms=expires_at_ms,
+        )
+        for index, (key, value, expires_at_ms) in enumerate(triples)
+    ]
+
+
+MERGE_TIME_MS = 1_700_000_000_000
+"""The instant the merges in this section happen at, in Unix milliseconds."""
+
+
+def test_a_record_whose_deadline_has_passed_is_dropped_from_the_merge() -> None:
+    """The story's first criterion: an expired record is not in the merge output."""
+    probe = RecordingProbe(answer=False)
+    source = expiring_records(
+        [
+            (b"expired", b"v", MERGE_TIME_MS - 1),
+            (b"live", b"v", NO_EXPIRY),
+        ]
+    )
+
+    merged = list(merge_records([source], has_older_value=probe, merge_time_ms=MERGE_TIME_MS))
+
+    assert merged == [(b"live", b"v", NO_EXPIRY)]
+    assert probe.asked == [b"expired"]
+
+
+def test_a_record_with_no_deadline_or_a_future_one_is_kept_with_that_deadline() -> None:
+    """The story's second criterion, and that the deadline itself survives the merge.
+
+    A future deadline rewritten as "no deadline" would read as retained and
+    behave as a record that never expires, so the expiry is asserted and not just
+    the key.
+    """
+    probe = RecordingProbe(answer=False)
+    source = expiring_records(
+        [
+            (b"forever", b"v", NO_EXPIRY),
+            (b"later", b"v", MERGE_TIME_MS + 5_000),
+        ]
+    )
+
+    merged = list(merge_records([source], has_older_value=probe, merge_time_ms=MERGE_TIME_MS))
+
+    assert merged == [
+        (b"forever", b"v", NO_EXPIRY),
+        (b"later", b"v", MERGE_TIME_MS + 5_000),
+    ]
+    assert probe.asked == []
+
+
+def test_a_deadline_exactly_at_the_merge_time_counts_as_passed() -> None:
+    """The same "at or after" boundary a read uses, so the two cannot disagree.
+
+    A record readable through ``get`` but already dropped by a compaction, or the
+    reverse, would be a window in which the engine's answer depended on whether a
+    merge had happened to run.
+    """
+    probe = RecordingProbe(answer=False)
+    source = expiring_records([(b"k", b"v", MERGE_TIME_MS)])
+
+    merged = list(merge_records([source], has_older_value=probe, merge_time_ms=MERGE_TIME_MS))
+
+    assert merged == []
+
+
+def test_a_deadline_one_millisecond_past_the_merge_time_survives() -> None:
+    probe = RecordingProbe(answer=False)
+    source = expiring_records([(b"k", b"v", MERGE_TIME_MS + 1)])
+
+    merged = list(merge_records([source], has_older_value=probe, merge_time_ms=MERGE_TIME_MS))
+
+    assert merged == [(b"k", b"v", MERGE_TIME_MS + 1)]
+
+
+def test_an_expired_record_is_kept_when_an_older_table_outside_holds_its_key() -> None:
+    """The resurrection an expired record is holding back, exactly as a tombstone does.
+
+    No read returns the expired record and no read looks past it either, so
+    dropping it while an older table outside the merge still holds a value for
+    the key would hand the next read that older value: a key that had expired
+    coming back to life.
+    """
+    probe = RecordingProbe(answer=True)
+    source = expiring_records([(b"k", b"v", MERGE_TIME_MS - 1)])
+
+    merged = list(merge_records([source], has_older_value=probe, merge_time_ms=MERGE_TIME_MS))
+
+    assert merged == [(b"k", b"v", MERGE_TIME_MS - 1)]
+    assert probe.asked == [b"k"]
+
+
+def test_an_expired_record_still_shadows_an_older_value_inside_the_merge() -> None:
+    """The older copy inside the merge goes with it rather than taking its place.
+
+    A merge that dropped the expired winner and then emitted the next stream's
+    record for the same key would resurrect the value the expired write replaced,
+    which is the one mistake this rule must not make.
+    """
+    probe = RecordingProbe(answer=False)
+    newer = expiring_records([(b"k", b"new", MERGE_TIME_MS - 1)])
+    older = expiring_records([(b"k", b"old", NO_EXPIRY)])
+
+    merged = list(merge_records([newer, older], has_older_value=probe, merge_time_ms=MERGE_TIME_MS))
+
+    assert merged == []
+
+
+def test_the_winning_records_deadline_is_the_one_carried_through() -> None:
+    """Newest wins takes the deadline with the value, not one from an older copy."""
+    newer = expiring_records([(b"k", b"new", MERGE_TIME_MS + 1_000)])
+    older = expiring_records([(b"k", b"old", NO_EXPIRY)])
+
+    merged = list(merge_records([newer, older], merge_time_ms=MERGE_TIME_MS))
+
+    assert merged == [(b"k", b"new", MERGE_TIME_MS + 1_000)]
+
+
+def test_a_merge_told_no_time_drops_nothing_for_having_expired() -> None:
+    """The safe reading of silence, as it is for a merge told nothing about tombstones."""
+    probe = RecordingProbe(answer=False)
+    source = expiring_records([(b"k", b"v", 1)])
+
+    merged = list(merge_records([source], has_older_value=probe))
+
+    assert merged == [(b"k", b"v", 1)]
+    assert probe.asked == []
+
+
+def test_a_merge_with_a_time_but_no_probe_drops_nothing_either() -> None:
+    """Both halves are needed: the time says expired, the probe says safe to drop."""
+    source = expiring_records([(b"k", b"v", MERGE_TIME_MS - 1)])
+
+    merged = list(merge_records([source], merge_time_ms=MERGE_TIME_MS))
+
+    assert merged == [(b"k", b"v", MERGE_TIME_MS - 1)]
+
+
+def test_the_probe_is_asked_once_per_dead_key_and_not_about_live_ones() -> None:
+    """A lookup per record would make every merge pay for a rule about dead ones."""
+    probe = RecordingProbe(answer=False)
+    source = expiring_records(
+        [
+            (b"a", b"v", NO_EXPIRY),
+            (b"b", b"v", MERGE_TIME_MS - 1),
+            (b"c", None, NO_EXPIRY),
+            (b"d", b"v", MERGE_TIME_MS + 1),
+        ]
+    )
+
+    merged = list(merge_records([source], has_older_value=probe, merge_time_ms=MERGE_TIME_MS))
+
+    assert merged == [(b"a", b"v", NO_EXPIRY), (b"d", b"v", MERGE_TIME_MS + 1)]
+    assert probe.asked == [b"b", b"c"]
+
+
+@pytest.mark.parametrize("merge_time_ms", [1.0, "1", True])
+def test_a_merge_time_that_is_not_an_int_of_milliseconds_is_refused(
+    merge_time_ms: object,
+) -> None:
+    with pytest.raises(TypeError, match="merge_time_ms"):
+        merge_records([], merge_time_ms=merge_time_ms)  # type: ignore[arg-type]
+
+
+def test_a_negative_merge_time_is_refused() -> None:
+    with pytest.raises(ValueError, match="must not be negative"):
+        merge_records([], merge_time_ms=-1)
+
+
+# ---------------------------------------------------------------------------
+# The expiry rule against real files, and the clock it reads the time from.
+# ---------------------------------------------------------------------------
+
+
+def merge_over_an_expired_key(tmp_path: Path, *, merge_time_ms: int) -> tuple[list[Path], Path]:
+    """Two sources holding deadlines, plus an older table outside them.
+
+    ``shadowed`` is expired in the newest source and still live in the table
+    outside, so it is the key the rule has to keep. ``solo`` is expired and held
+    nowhere else, so it is the key the rule has to drop. ``live`` has no deadline
+    at all and must come through untouched.
+    """
+    outside = write_table(tmp_path / "source-0.sst", [(b"shadowed", b"outside", NO_EXPIRY)])
+    older = write_table(tmp_path / "source-1.sst", [(b"live", b"inside", NO_EXPIRY)])
+    newer = write_table(
+        tmp_path / "source-2.sst",
+        [
+            (b"shadowed", b"inside", merge_time_ms - 1),
+            (b"solo", b"inside", merge_time_ms - 1),
+        ],
+    )
+    return [newer, older], outside
+
+
+def test_merge_sstables_drops_an_expired_record_and_keeps_the_live_ones(
+    tmp_path: Path,
+) -> None:
+    """The story's two criteria over real tables, with the deadlines read back off disk."""
+    clock = FakeClock(MERGE_TIME_MS / 1000)
+    newer = write_table(
+        tmp_path / "newer.sst",
+        [
+            (b"expired", b"v", MERGE_TIME_MS - 1),
+            (b"forever", b"v", NO_EXPIRY),
+            (b"later", b"v", MERGE_TIME_MS + 60_000),
+        ],
+    )
+
+    layout = merge_sstables([newer], tmp_path / "merged.sst", older_tables=[], clock=clock)
+
+    assert table_rows(layout.path) == [
+        (b"forever", b"v", NO_EXPIRY),
+        (b"later", b"v", MERGE_TIME_MS + 60_000),
+    ]
+
+
+def test_merge_sstables_without_a_clock_keeps_every_expired_record(tmp_path: Path) -> None:
+    """A caller that has not said when the merge is happening gets today's behavior."""
+    newer = write_table(tmp_path / "newer.sst", [(b"expired", b"v", 1)])
+
+    layout = merge_sstables([newer], tmp_path / "merged.sst", older_tables=[])
+
+    assert table_rows(layout.path) == [(b"expired", b"v", 1)]
+
+
+def test_merge_sstables_keeps_an_expired_record_an_older_table_outside_needs(
+    tmp_path: Path,
+) -> None:
+    """The engine's case, over real files: the key outside the merge stays hidden."""
+    clock = FakeClock(MERGE_TIME_MS / 1000)
+    sources, outside = merge_over_an_expired_key(tmp_path, merge_time_ms=MERGE_TIME_MS)
+
+    layout = merge_sstables(sources, tmp_path / "merged.sst", older_tables=[outside], clock=clock)
+
+    assert table_rows(layout.path) == [
+        (b"live", b"inside", NO_EXPIRY),
+        (b"shadowed", b"inside", MERGE_TIME_MS - 1),
+    ]
+
+    # The point of keeping it: a read of the merged table still finds the expired
+    # record rather than falling through to the value outside the merge.
+    with SSTableReader.open(layout.path) as reader:
+        record = reader.lookup(b"shadowed")
+        assert record is not None
+        assert record.expires_at_ms == MERGE_TIME_MS - 1
+
+
+def test_merge_sstables_drops_an_expired_record_nothing_older_holds(tmp_path: Path) -> None:
+    clock = FakeClock(MERGE_TIME_MS / 1000)
+    sources, outside = merge_over_an_expired_key(tmp_path, merge_time_ms=MERGE_TIME_MS)
+
+    layout = merge_sstables(sources, tmp_path / "merged.sst", older_tables=[outside], clock=clock)
+
+    assert b"solo" not in {key for key, _, _ in table_rows(layout.path)}
+
+
+def test_a_record_live_at_one_merge_and_expired_at_the_next_is_dropped_by_the_second(
+    tmp_path: Path,
+) -> None:
+    """A moved clock, not a sleep, is what makes the deadline arrive between merges."""
+    clock = FakeClock(MERGE_TIME_MS / 1000)
+    source = write_table(tmp_path / "source.sst", [(b"k", b"v", MERGE_TIME_MS + 10_000)])
+
+    first = merge_sstables([source], tmp_path / "first.sst", older_tables=[], clock=clock)
+    assert table_rows(first.path) == [(b"k", b"v", MERGE_TIME_MS + 10_000)]
+
+    clock.advance(10)
+    second = merge_sstables([first.path], tmp_path / "second.sst", older_tables=[], clock=clock)
+
+    assert table_rows(second.path) == []
+
+
+def test_the_clock_is_read_once_for_the_whole_merge(tmp_path: Path) -> None:
+    """So every record in one merge is judged against one instant.
+
+    A clock read per record would let a merge long enough to cross a deadline keep
+    one record and drop its neighbour for no reason the caller could predict.
+    """
+    clock = FakeClock(MERGE_TIME_MS / 1000)
+    source = write_table(
+        tmp_path / "source.sst",
+        [(bytes([index]), b"v", MERGE_TIME_MS + 1_000) for index in range(1, 20)],
+    )
+
+    merge_sstables([source], tmp_path / "merged.sst", older_tables=[], clock=clock)
+
+    assert clock.reads == 1
+
+
+def test_a_clock_that_is_not_callable_is_refused(tmp_path: Path) -> None:
+    source = write_table(tmp_path / "source.sst", [(b"k", b"v")])
+
+    with pytest.raises(TypeError, match="clock must be callable"):
+        merge_sstables([source], tmp_path / "merged.sst", clock=MERGE_TIME_MS)  # type: ignore[arg-type]
+
+
+def test_the_default_clock_is_the_wall_clock_deadlines_are_written_against() -> None:
+    """Not a monotonic clock, whose zero moves every boot and would not compare."""
+    assert DEFAULT_CLOCK is time.time
+
+
+def test_reading_the_clock_truncates_to_the_millisecond_it_falls_in() -> None:
+    assert read_clock_ms(lambda: 1.0019) == 1001
+    assert read_clock_ms(lambda: 0.0) == 0
+
+
+@pytest.mark.parametrize("reading", [float("nan"), float("inf"), -1.0])
+def test_a_clock_reading_that_is_not_a_usable_time_is_refused(reading: float) -> None:
+    """A NaN compares false against every deadline, so it would silently keep them all."""
+    with pytest.raises(ValueError, match="clock returned"):
+        read_clock_ms(lambda: reading)
+
+
+@pytest.mark.parametrize("reading", ["1700000000", None, True])
+def test_a_clock_that_does_not_return_a_number_is_refused(reading: object) -> None:
+    with pytest.raises(TypeError, match="real number of seconds"):
+        read_clock_ms(lambda: reading)  # type: ignore[arg-type,return-value]
+
+
+def test_merge_tier_drops_expired_records_against_the_clock_it_is_given(
+    tmp_path: Path,
+) -> None:
+    """The whole rule the way a caller reaches it: a tier, the tables around it, a clock."""
+    clock = FakeClock(MERGE_TIME_MS / 1000)
+    sources, outside = merge_over_an_expired_key(tmp_path, merge_time_ms=MERGE_TIME_MS)
+    outside_handle = StubMergeTable(sequence=0, size_bytes=outside.stat().st_size, path=outside)
+
+    layout = merge_tier(
+        tier_of(sources), tmp_path / "merged.sst", other_tables=[outside_handle], clock=clock
+    )
+
+    assert table_rows(layout.path) == [
+        (b"live", b"inside", NO_EXPIRY),
+        (b"shadowed", b"inside", MERGE_TIME_MS - 1),
+    ]
+
+
+def test_merge_tier_told_no_clock_keeps_every_expired_record(tmp_path: Path) -> None:
+    sources, _ = merge_over_an_expired_key(tmp_path, merge_time_ms=MERGE_TIME_MS)
+
+    layout = merge_tier(tier_of(sources), tmp_path / "merged.sst", other_tables=[])
+
+    assert table_rows(layout.path) == [
+        (b"live", b"inside", NO_EXPIRY),
+        (b"shadowed", b"inside", MERGE_TIME_MS - 1),
+        (b"solo", b"inside", MERGE_TIME_MS - 1),
+    ]
+
+
+def test_compact_tier_reclaims_the_expired_records_and_retires_the_sources(
+    tmp_path: Path,
+) -> None:
+    """A whole compaction: the expired bytes are gone and so are the tables they were in."""
+    clock = FakeClock(MERGE_TIME_MS / 1000)
+    sources, _ = merge_over_an_expired_key(tmp_path, merge_time_ms=MERGE_TIME_MS)
+    merged_path = tmp_path / "merged.sst"
+
+    swap = compact_tier(tier_of(sources), merged_path, other_tables=[], clock=clock)
+
+    assert swap.retired_count == len(sources)
+    assert not any(source.exists() for source in sources)
+    assert table_rows(merged_path) == [(b"live", b"inside", NO_EXPIRY)]
+
+
+# ---------------------------------------------------------------------------
 # M8.5: the swap. Nothing is deleted until the merged table's footer is on the
 # disk and reads back valid, and what a crash can leave behind at each point.
 # ---------------------------------------------------------------------------
@@ -2069,11 +2510,11 @@ class StallingWriter(SSTableWriter):
     land at a known point instead of a likely one.
     """
 
-    def add(self, key, value):
+    def add(self, key, value, **kwargs):
         if self.record_count >= STALL_AFTER_RECORDS:
             announce("stalled")
             wait_to_be_killed()
-        return super().add(key, value)
+        return super().add(key, value, **kwargs)
 
 
 def stall_instead_of_swapping(*args, **kwargs):
