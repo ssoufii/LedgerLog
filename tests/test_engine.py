@@ -2560,18 +2560,19 @@ def test_a_background_flush_tracks_every_table_it_writes(tmp_path: Path) -> None
         assert sequences == sorted(sequences, reverse=True), "the list is not newest first"
 
 
-def test_a_reopened_engine_tracks_only_the_tables_it_flushed_itself(tmp_path: Path) -> None:
-    """The gap story M9.1 closes, pinned so it is a decision rather than a surprise.
+def test_a_reopened_engine_tracks_the_earlier_runs_tables_as_well_as_its_own(
+    tmp_path: Path,
+) -> None:
+    """The list spans both runs once startup adopts what is on disk (story M9.2).
 
-    An earlier run's tables are on disk and are not in this list, because nothing
-    discovers them yet. What the reopened engine does read from the directory is
-    the names, so its own tables do not land on top of one of theirs.
+    An earlier run's tables are loaded into this list, behind the ones this run
+    flushes, and the names the earlier run used are still its own: this run's
+    tables go in front of them rather than on top of them.
 
     The reopened engine flushes more than the writes made through it, because
     replay rebuilds a memtable from the log and freezes it if it is over the
-    threshold. That is the existing recovery behavior; what this test pins is that
-    every table in the list is one this run committed and none of them is the
-    earlier run's.
+    threshold. That is why the count below is a comparison against the directory
+    rather than against ``flush_count``, which only counts this run's flushes.
     """
     directory = tmp_path / "data"
     with freezing_engine(directory, 40) as first:
@@ -2585,9 +2586,14 @@ def test_a_reopened_engine_tracks_only_the_tables_it_flushed_itself(tmp_path: Pa
         second.flush_pending()
 
         tracked = [handle.path for handle in second.sstables]
-        assert len(tracked) == second.flush_count
-        assert not set(tracked) & set(earlier), "the run wrote over an earlier table"
-        assert set(earlier) <= set(sstable_paths(second)), "an earlier table left the directory"
+        assert second.flush_count > 0, "this run flushed nothing, so there is no 'as well as'"
+        assert len(tracked) == second.flush_count + len(earlier)
+        assert tracked[-len(earlier) :] == earlier, "the earlier tables are not behind this run's"
+        assert tracked == list(reversed(sstable_paths(second))), (
+            "a table on disk is unaccounted for"
+        )
+        sequences = [handle.sequence for handle in second.sstables]
+        assert sequences == sorted(sequences, reverse=True), "the list is not newest first"
 
 
 def test_a_handle_serves_its_bloom_filter_and_reader_without_reparsing_the_footer(
@@ -2726,7 +2732,7 @@ def test_a_handle_refuses_a_negative_sequence_number(tmp_path: Path) -> None:
     layout = write_sstable(tmp_path / sstable_filename(0), [(b"key", b"value")])
 
     with pytest.raises(ValueError, match="sequence number"):
-        SSTableHandle(-1, layout)
+        SSTableHandle.from_layout(-1, layout)
 
 
 def test_the_table_list_is_never_seen_half_updated_while_flushes_prepend_to_it(
@@ -3125,21 +3131,26 @@ def test_only_the_tables_whose_bloom_filter_accepts_the_key_are_opened(
         assert probes.calls == len(engine.sstables), "a table was passed over without being asked"
 
 
-def test_a_reopened_engine_reads_a_flushed_key_out_of_the_log(tmp_path: Path) -> None:
-    """The tables of an earlier run are not discovered yet, and no key is lost to that.
+def test_a_reopened_engine_reads_a_flushed_key_from_both_places_it_is_in(
+    tmp_path: Path,
+) -> None:
+    """A flushed key is in a table and still in the log, and both come back.
 
-    Startup discovery is story M9.1. Until it lands, a reopened engine tracks no
-    tables and answers from the replayed log instead, which is why the flush does
-    not trim it. Pinned here so that M9.1 changing where these answers come from
-    is a visible change rather than a silent one.
+    Startup now adopts the earlier run's tables (story M9.2) and the flush still
+    does not trim the log, so the record is in two layers at once. A read stops at
+    the first, which is the memtable the replay rebuilt. The point of the test is
+    that neither layer is missing: the table is tracked, and the key is readable.
+    Which of the two answers it does not say, and cannot, because they agree.
     """
     directory = tmp_path / "data"
     with layered_engine(directory) as engine:
         flush_as_one_table(engine, [(b"key", b"value")])
-        assert engine.sstables
+        committed = [handle.path for handle in engine.sstables]
+        assert committed
 
     with layered_engine(directory) as reopened:
-        assert reopened.sstables == ()
+        assert [handle.path for handle in reopened.sstables] == committed
+        assert reopened.recovery.records_replayed > 0, "the log was trimmed after all"
         assert reopened.get(b"key") == b"value"
 
 
@@ -4103,8 +4114,9 @@ def test_the_three_layers_agree_about_the_expiry_sentinel_and_its_range() -> Non
 # a TTL into a deadline, flushes it into a real table, and a merge handed the
 # engine's own clock drops exactly the record the engine had already stopped
 # answering for. The merged table is written beside the engine's tables rather
-# than swapped in, because the engine does not discover tables on its disk yet
-# (story M9.1), so adopting one is not this story's to do.
+# than swapped in, because nothing swaps a merged table into a running engine
+# (the compaction stories stop at the plan), so adopting one is not this story's
+# to do.
 # ---------------------------------------------------------------------------
 
 
@@ -4165,9 +4177,9 @@ def test_a_merge_on_the_engines_clock_drops_the_record_the_engine_has_expired(
 # agree with a correct one on every directory a test filled in one pass and
 # disagree only here.
 #
-# Discovery does not run inside the engine yet; wiring it in is story M9.2. The
-# tests below call it against directories a real engine filled and then closed,
-# which is the input it will get there.
+# The tests below call discovery directly, against directories a real engine
+# filled and then closed, which is the input it gets inside an engine's
+# constructor (story M9.2, tested at the bottom of this file).
 # ---------------------------------------------------------------------------
 
 
@@ -4467,10 +4479,15 @@ def test_a_rejected_table_still_owns_its_name_for_the_next_flush(tmp_path: Path)
     assert damaged not in discovered_paths(directory)
 
     with layered_engine(directory) as reopened:
+        # The tables startup loaded are older than the damaged one by definition,
+        # so they are set aside here: what this test is about is the sequence
+        # numbers the reopened engine hands to tables of its own.
+        loaded = set(reopened.sstables)
         freeze_as_one_table(reopened, [(b"after", b"value")])
         reopened.flush_pending()
-        assert reopened.sstables, "the reopened engine committed no table"
-        for handle in reopened.sstables:
+        flushed = [handle for handle in reopened.sstables if handle not in loaded]
+        assert flushed, "the reopened engine committed no table"
+        for handle in flushed:
             assert handle.sequence > rejected_sequence
 
     assert damaged.read_bytes() == damaged_bytes, "a later flush wrote over the damaged table"
@@ -4654,7 +4671,7 @@ def test_a_directory_that_does_not_exist_is_reported_not_treated_as_empty(
         engine_module.discover_sstables(tmp_path / "absent")
 
 
-# What a discovered table reports about itself, which is what story M9.2 has to
+# What a discovered table reports about itself, which is what the load in M9.2
 # build a handle out of.
 
 
@@ -4733,3 +4750,605 @@ def test_every_file_the_scan_opened_is_closed_again(
 
     assert opened, "the scan opened nothing, so this proves nothing"
     assert all(handle.closed for handle in opened), "the scan left a file open"
+
+
+# ---------------------------------------------------------------------------
+# Story M9.2: the full startup sequence, SSTables loaded and then the log
+# replayed on top of them.
+#
+# Every test here runs two engines over one directory: a first that writes and
+# closes, and a second that has to come back with everything the first one made
+# durable, whether that was flushed or only logged. One engine cannot show this,
+# and neither can a test that only checks ``get`` after the reopen, because an
+# engine that replayed its whole log and loaded no table at all would answer
+# every such get correctly: the log is not trimmed yet, so it still holds every
+# record the tables hold. So the tests that are about the tables take the log out
+# of the way first, by trimming it to the header a trim would leave or deleting
+# it outright, which is also the third acceptance criterion in its own right. What
+# is left answering is the tables, and nothing else can be mistaken for them.
+#
+# The ordering criterion gets the same treatment from the other side: a key is
+# written into two tables with different values and the log is trimmed, so the
+# answer is whichever table the engine consults first. An engine that loaded the
+# directory in ascending sequence order would pass every other test here and fail
+# only that one.
+#
+# Shadowing by the log is tested with the table on disk checked as well as the
+# get, since an engine that somehow rewrote the table would give the same answer
+# for a reason that would not survive the next restart.
+# ---------------------------------------------------------------------------
+
+
+def sstable_paths_in(directory: Path) -> list[Path]:
+    """Every file in ``directory`` named as an SSTable, newest sequence number first.
+
+    By name rather than through an engine, so a test can list what is on disk
+    without an engine's view of it being the thing under test.
+    """
+    candidates = [
+        (sequence, path)
+        for path, sequence in (
+            (path, parse_sstable_sequence(path.name)) for path in directory.iterdir()
+        )
+        if sequence is not None
+    ]
+    return [path for _, path in sorted(candidates, reverse=True)]
+
+
+def trim_log(directory: Path) -> None:
+    """Replace the directory's log with the header-only file a trim would leave.
+
+    What a clean shutdown will leave behind once the log is trimmed (which
+    nothing does yet, see ``engine.py``), and what is left here on purpose: with
+    no records to replay, a reopened engine can only answer from its tables, so a
+    get that still returns the right value proves the tables were loaded rather
+    than the log replayed.
+    """
+    (directory / WAL_FILENAME).write_bytes(encode_file_header())
+
+
+def remove_log(directory: Path) -> None:
+    """Delete the directory's log, leaving the tables and nothing else."""
+    (directory / WAL_FILENAME).unlink()
+
+
+def tracked_opens(monkeypatch: pytest.MonkeyPatch) -> list[Any]:
+    """Collect every file object opened from here on, so a test can check it closed."""
+    opened: list[Any] = []
+    real_open = builtins.open
+
+    def tracking_open(*args: Any, **kwargs: Any) -> Any:
+        handle = real_open(*args, **kwargs)
+        opened.append(handle)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+    return opened
+
+
+def corrupt_bloom_section(path: Path) -> None:
+    """Damage the bloom filter of a committed table, leaving its footer valid.
+
+    The footer's checksum covers the footer alone and no checksum covers the
+    sections it points at, so a table damaged here is one discovery accepts and
+    the load then cannot use. That is the one case the startup sequence has to
+    treat differently from a file no footer committed: this table was committed,
+    so its records are not guaranteed to still be in the log.
+    """
+    with open(path, "rb") as handle:
+        footer = read_footer(handle)
+    raw = bytearray(path.read_bytes())
+    raw[footer.bloom_filter_offset] ^= 0xFF
+    path.write_bytes(bytes(raw))
+
+
+# Acceptance criterion 1: tables plus a log holding writes made after the last
+# flush recover both, and the log wins the keys they disagree about.
+
+
+def test_a_reopened_engine_answers_from_its_tables_and_from_its_log(tmp_path: Path) -> None:
+    directory = tmp_path / "data"
+    with layered_engine(directory) as first:
+        flush_as_one_table(first, [(b"flushed-early", b"one")])
+        flush_as_one_table(first, [(b"flushed-late", b"two")])
+        first.put(b"logged-only", b"three")
+        assert not first.frozen_memtables, "the last write was meant to stay in the memtable"
+        committed = [handle.path for handle in first.sstables]
+
+    with layered_engine(directory) as second:
+        assert [handle.path for handle in second.sstables] == committed
+        assert second.recovery.records_replayed > 0, "the log was not replayed"
+        assert second.get(b"flushed-early") == b"one"
+        assert second.get(b"flushed-late") == b"two"
+        assert second.get(b"logged-only") == b"three"
+
+
+def test_a_logged_write_shadows_the_tables_value_for_the_same_key(tmp_path: Path) -> None:
+    """The precedence half of criterion 1: the log is newer than any table."""
+    directory = tmp_path / "data"
+    with layered_engine(directory) as first:
+        flush_as_one_table(first, [(b"shared", b"old")])
+        first.put(b"shared", b"new")
+        table = first.sstables[0].path
+
+    assert (b"shared", b"old") in sstable_records(table), "the old value is not on disk"
+
+    with layered_engine(directory) as second:
+        assert second.get(b"shared") == b"new"
+        # The table is still the one the first engine wrote: the newer value wins
+        # by shadowing from a layer above, which is what survives the next
+        # restart, not by anything having rewritten an immutable file.
+        assert (b"shared", b"old") in sstable_records(table)
+
+
+def test_a_logged_delete_still_hides_a_tables_value_after_a_restart(tmp_path: Path) -> None:
+    """A tombstone only in the log must not let the table's value resurface."""
+    directory = tmp_path / "data"
+    with layered_engine(directory) as first:
+        flush_as_one_table(first, [(b"doomed", b"value")])
+        first.delete(b"doomed")
+        table = first.sstables[0].path
+
+    assert (b"doomed", b"value") in sstable_records(table)
+
+    with layered_engine(directory) as second:
+        assert second.get(b"doomed") is None
+        assert second.sstables, "the table was not loaded, so this proves nothing"
+
+
+def test_a_logged_expiry_still_hides_a_tables_value_after_a_restart(tmp_path: Path) -> None:
+    """A TTL written over a flushed key keeps its deadline across the restart."""
+    directory = tmp_path / "data"
+    clock = _FakeClock()
+    with flushing_ttl_engine(directory, clock) as first:
+        first.put(b"key", b"permanent")
+        first.flush_pending()
+        first.put(b"key", b"brief", ttl=60)
+        assert first.sstables, "the first value was not flushed"
+
+    with flushing_ttl_engine(directory, clock) as second:
+        assert second.get(b"key") == b"brief"
+        clock.advance(120)
+        assert second.get(b"key") is None, "the replayed deadline did not survive the restart"
+
+
+# Acceptance criterion 2: no tables and a non-empty log recovers from the replay
+# alone, into an empty memtable.
+
+
+def test_a_directory_with_only_a_log_recovers_from_the_replay_alone(tmp_path: Path) -> None:
+    directory = tmp_path / "data"
+    with LedgerLog(directory, fsync_policy=FsyncPolicy.NEVER, flush_in_background=False) as first:
+        first.put(b"alpha", b"one")
+        first.put(b"beta", b"two")
+        first.delete(b"alpha")
+        assert not first.sstables, "nothing should have been flushed at the default threshold"
+
+    assert sstable_paths_in(directory) == [], "the test wrote a table it did not mean to"
+
+    with LedgerLog(directory, fsync_policy=FsyncPolicy.NEVER, flush_in_background=False) as second:
+        assert second.sstables == ()
+        assert second.discovery.tables == ()
+        assert second.discovery.rejected == ()
+        assert second.recovery.records_replayed == 3
+        assert second.get(b"beta") == b"two"
+        assert second.get(b"alpha") is None
+
+
+def test_the_replay_lands_in_a_memtable_that_started_empty(tmp_path: Path) -> None:
+    """The replay builds the state, rather than adding to a state already there."""
+    directory = tmp_path / "data"
+    with LedgerLog(directory, fsync_policy=FsyncPolicy.NEVER, flush_in_background=False) as first:
+        first.put(b"key", b"first")
+        first.put(b"key", b"second")
+
+    with LedgerLog(directory, fsync_policy=FsyncPolicy.NEVER, flush_in_background=False) as second:
+        # Reaching into the memtable because the claim is about which layer holds
+        # the recovered state, which a get deliberately does not reveal.
+        assert list(second._memtable.keys()) == [b"key"]
+        assert second.get(b"key") == b"second"
+
+
+# Acceptance criterion 3: tables with no log, or a log with nothing in it, are
+# served from the tables.
+
+
+@pytest.mark.parametrize("empty_the_log", [trim_log, remove_log], ids=["trimmed", "absent"])
+def test_tables_with_nothing_left_in_the_log_are_still_read(
+    tmp_path: Path, empty_the_log: Callable[[Path], None]
+) -> None:
+    directory = tmp_path / "data"
+    with layered_engine(directory) as first:
+        flush_as_one_table(first, [(b"alpha", b"one")])
+        flush_as_one_table(first, [(b"beta", b"two")])
+        committed = [handle.path for handle in first.sstables]
+
+    empty_the_log(directory)
+
+    with layered_engine(directory) as second:
+        assert second.recovery.records_replayed == 0
+        assert second.recovery.is_intact
+        assert [handle.path for handle in second.sstables] == committed
+        # Nothing is in memory, so both answers came off the disk.
+        assert second._memtable.lookup(b"alpha") is None
+        assert second.get(b"alpha") == b"one"
+        assert second.get(b"beta") == b"two"
+        assert second.get(b"absent") is None
+
+
+def test_an_absent_log_is_not_mistaken_for_a_torn_one(tmp_path: Path) -> None:
+    """A directory of tables and no log recovered everything there was to recover."""
+    directory = tmp_path / "data"
+    with layered_engine(directory) as first:
+        flush_as_one_table(first, [(b"alpha", b"one")])
+
+    remove_log(directory)
+
+    with layered_engine(directory) as second:
+        assert second.recovery.is_intact
+        assert second.recovery.stopped_at is None
+        assert second.recovery.reason is None
+
+
+def test_an_empty_directory_opens_as_a_fresh_install(tmp_path: Path) -> None:
+    with layered_engine(tmp_path / "data") as engine:
+        assert engine.sstables == ()
+        assert engine.discovery.tables == ()
+        assert engine.discovery.rejected == ()
+        assert engine.recovery.records_replayed == 0
+        assert engine.get(b"anything") is None
+
+
+# The order the tables are loaded in, which is the order a correct answer depends
+# on (ARCHITECTURE.md section 5).
+
+
+def test_a_reopened_engine_keeps_the_newest_first_order_its_predecessor_had(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 4)
+
+    with layered_engine(directory) as second:
+        assert [handle.path for handle in second.sstables] == committed
+        sequences = [handle.sequence for handle in second.sstables]
+        assert sequences == sorted(sequences, reverse=True)
+
+
+def test_a_key_in_two_tables_still_resolves_to_the_newer_one_after_a_restart(
+    tmp_path: Path,
+) -> None:
+    """The test an ascending load order would fail, and only this one.
+
+    With the log trimmed, the answer is whichever table the read path reaches
+    first, so the value it returns is a direct readout of the load order.
+    """
+    directory = tmp_path / "data"
+    with layered_engine(directory) as first:
+        flush_as_one_table(first, [(b"shared", b"old")])
+        flush_as_one_table(first, [(b"shared", b"new")])
+
+    trim_log(directory)
+
+    with layered_engine(directory) as second:
+        assert len(second.sstables) == 2
+        assert second.get(b"shared") == b"new"
+
+
+def test_a_tombstone_in_a_newer_table_still_hides_the_older_value_after_a_restart(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "data"
+    with layered_engine(directory) as first:
+        flush_as_one_table(first, [(b"doomed", b"value")])
+        flush_as_one_table(first, [(b"doomed", None)])
+
+    trim_log(directory)
+
+    with layered_engine(directory) as second:
+        assert len(second.sstables) == 2
+        assert second.get(b"doomed") is None, "a restart resurrected a deleted key"
+
+
+# What a loaded handle carries: the same thing the handle that flushed the table
+# carried, since everything above the handle treats the two as the same kind.
+
+
+def test_a_loaded_handle_reports_what_the_flushing_handle_reported(tmp_path: Path) -> None:
+    directory = tmp_path / "data"
+    with layered_engine(directory) as first:
+        flush_as_one_table(first, [(b"alpha", b"one")])
+        flush_as_one_table(first, [(b"beta", b"two")])
+        before = [
+            (handle.sequence, handle.path, handle.footer, handle.record_count, handle.size_bytes)
+            for handle in first.sstables
+        ]
+
+    with layered_engine(directory) as second:
+        after = [
+            (handle.sequence, handle.path, handle.footer, handle.record_count, handle.size_bytes)
+            for handle in second.sstables
+        ]
+
+    assert after == before
+
+
+def test_a_loaded_tables_bloom_filter_accepts_every_key_the_table_holds(tmp_path: Path) -> None:
+    """A filter read back wrong would make the read path skip a table that has the key.
+
+    The damage that causes is invisible to a get for a key the memtable still
+    holds, which is every key until the log is trimmed, so it is asserted against
+    the table's own records rather than through the read path.
+    """
+    directory = tmp_path / "data"
+    with layered_engine(directory) as first:
+        for index in range(3):
+            flush_as_one_table(first, [(f"key{index:03d}".encode(), b"value")])
+
+    with layered_engine(directory) as second:
+        assert len(second.sstables) == 3
+        for handle in second.sstables:
+            keys = [key for key, _ in sstable_records(handle.path)]
+            assert keys, "a loaded table reported no records"
+            for key in keys:
+                assert handle.bloom_filter.might_contain(key), (
+                    f"the filter loaded for {handle.path.name} rejects its own key {key!r}"
+                )
+
+
+def test_a_loaded_table_is_skipped_for_a_key_its_filter_rejects(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The filter is loaded to be used: a missing key must open no data block."""
+    directory = tmp_path / "data"
+    with layered_engine(directory) as first:
+        for index in range(3):
+            flush_as_one_table(first, [(f"key{index:03d}".encode(), b"value")])
+
+    trim_log(directory)
+
+    with layered_engine(directory) as second:
+        absent = key_rejected_by_every_bloom_filter(second)
+        lookups = count_data_block_lookups(monkeypatch)
+
+        assert second.get(absent) is None
+
+        assert lookups.calls == 0, "a table was opened for a key its loaded filter rejected"
+
+
+def test_a_loaded_table_is_read_for_a_key_it_does_hold(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: a positive filter has to be followed by a real read."""
+    directory = tmp_path / "data"
+    with layered_engine(directory) as first:
+        flush_as_one_table(first, [(b"present", b"value")])
+
+    trim_log(directory)
+
+    with layered_engine(directory) as second:
+        lookups = count_data_block_lookups(monkeypatch)
+
+        assert second.get(b"present") == b"value"
+
+        assert lookups.calls == 1
+
+
+# Files no footer committed, and committed files this build cannot use.
+
+
+def test_a_file_no_footer_committed_is_left_out_of_the_tables_the_engine_serves(
+    tmp_path: Path,
+) -> None:
+    """A killed flush's output stays on disk, out of the read path, and reported."""
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 3)
+    partial = committed[1]
+    truncate_at_footer(partial)
+
+    with layered_engine(directory) as second:
+        loaded = [handle.path for handle in second.sstables]
+        assert partial not in loaded
+        assert loaded == [path for path in committed if path != partial]
+        assert [rejection.path for rejection in second.discovery.rejected] == [partial]
+        assert second.discovery.rejected[0].status is SSTableStatus.INCOMPLETE
+
+    assert partial.exists(), "startup deleted a file it was only asked to pass over"
+
+
+def test_a_record_from_a_discarded_file_is_still_recovered_from_the_log(tmp_path: Path) -> None:
+    """The reconciliation ARCHITECTURE.md section 6 describes, from the engine's side."""
+    directory = tmp_path / "data"
+    with layered_engine(directory) as first:
+        flush_as_one_table(first, [(b"kept", b"one")])
+        flush_as_one_table(first, [(b"discarded", b"two")])
+        partial = first.sstables[0].path
+
+    truncate_at_footer(partial)
+
+    with layered_engine(directory) as second:
+        assert [handle.path for handle in second.sstables] == [
+            path for path in sstable_paths_in(directory) if path != partial
+        ]
+        assert second.get(b"kept") == b"one"
+        # Not in any loaded table, and nothing trims the log, so this value comes
+        # back from the replay: the discard cost nothing.
+        assert second.get(b"discarded") == b"two"
+
+
+def test_a_directory_of_nothing_but_discarded_files_opens_on_the_log_alone(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "data"
+    with layered_engine(directory) as first:
+        flush_as_one_table(first, [(b"alpha", b"one")])
+        flush_as_one_table(first, [(b"beta", b"two")])
+
+    for path in sstable_paths_in(directory):
+        truncate_at_footer(path)
+
+    with layered_engine(directory) as second:
+        assert second.sstables == ()
+        assert len(second.discovery.rejected) == 2
+        assert second.get(b"alpha") == b"one"
+        assert second.get(b"beta") == b"two"
+
+
+def test_a_committed_table_this_build_cannot_read_stops_the_startup(tmp_path: Path) -> None:
+    """A table that was committed and then damaged is not quietly left out.
+
+    Leaving it out would serve an older value, or none, for every key it holds,
+    and both are indistinguishable from a correct answer. The records are not
+    guaranteed to be in the log either, since the table did commit, so there is
+    nothing for the discard rule to fall back on.
+    """
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 2)
+    corrupt_bloom_section(committed[0])
+
+    with pytest.raises(bloom_module.BloomFormatError):
+        layered_engine(directory)
+
+
+def test_a_startup_that_cannot_load_a_table_leaves_no_file_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The failure path above runs after other tables have been opened and read."""
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 3)
+    corrupt_bloom_section(committed[0])
+
+    opened = tracked_opens(monkeypatch)
+    with pytest.raises(bloom_module.BloomFormatError):
+        layered_engine(directory)
+    monkeypatch.undo()
+
+    assert opened, "the failed startup opened nothing, so this proves nothing"
+    assert all(handle.closed for handle in opened), "a failed startup left a file open"
+
+
+# What happens after the startup: a flush, the tier plan, and the close.
+
+
+def test_a_flush_after_a_restart_lands_in_front_of_the_tables_it_found(tmp_path: Path) -> None:
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 2)
+    # Trimmed so that the only thing flushed here is what this test writes: a
+    # replay big enough to cross the threshold freezes a table of its own, and
+    # flush_pending would commit that one too.
+    trim_log(directory)
+
+    with layered_engine(directory) as second:
+        found = list(second.sstables)
+        flush_as_one_table(second, [(b"after", b"restart")])
+
+        assert len(second.sstables) == 3
+        newest = second.sstables[0]
+        assert newest.sequence > found[0].sequence, "a flush reused or undercut a loaded sequence"
+        assert newest.path not in committed
+        assert list(second.sstables[1:]) == found
+        assert second.get(b"after") == b"restart"
+
+
+def test_a_flush_after_a_restart_does_not_overwrite_a_discarded_files_name(
+    tmp_path: Path,
+) -> None:
+    """A discarded file still owns its name, so the next flush has to go past it."""
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 2)
+    truncate_at_footer(committed[0])
+    partial_bytes = committed[0].read_bytes()
+    trim_log(directory)
+
+    with layered_engine(directory) as second:
+        flush_as_one_table(second, [(b"after", b"restart")])
+
+        assert second.sstables[0].path != committed[0]
+
+    assert committed[0].read_bytes() == partial_bytes
+
+
+def test_the_tier_plan_after_a_restart_covers_the_tables_found_on_disk(tmp_path: Path) -> None:
+    directory = tmp_path / "data"
+    committed_tables(directory, 3)
+
+    with layered_engine(directory) as second:
+        planned = [table for tier in second.compaction_plan.tiers for table in tier.tables]
+
+        assert sorted(planned, key=lambda handle: handle.sequence) == sorted(
+            second.sstables, key=lambda handle: handle.sequence
+        )
+
+
+def test_closing_a_reopened_engine_releases_the_readers_it_opened(tmp_path: Path) -> None:
+    directory = tmp_path / "data"
+    committed_tables(directory, 3)
+
+    second = layered_engine(directory)
+    loaded = list(second.sstables)
+    for handle in loaded:
+        for key, _ in sstable_records(handle.path):
+            assert second.get(key) is not None
+    second.close()
+
+    assert loaded, "nothing was loaded, so this proves nothing"
+    assert all(handle.closed for handle in loaded), "a loaded table's reader was left open"
+
+
+# Concurrency, per CLAUDE.md: the loaded handles join the read path, where each
+# one lends a single reader to one lookup at a time. A startup that gave two
+# tables one reader, or that published the list in a state a reader could catch
+# halfway, would show up here and nowhere else: readers that share a cursor
+# interleave seeks and return records from the wrong offset, which reads as a
+# wrong value rather than as a crash.
+
+
+def test_concurrent_readers_see_the_loaded_tables_while_a_writer_works(tmp_path: Path) -> None:
+    directory = tmp_path / "data"
+    table_keys = [f"key{index:03d}".encode() for index in range(8)]
+    with layered_engine(directory) as first:
+        for key in table_keys:
+            flush_as_one_table(first, [(key, b"from-disk-" + key)])
+
+    trim_log(directory)
+
+    reader_count = 6
+    rounds = 40
+    with layered_engine(directory) as second:
+        assert len(second.sstables) == len(table_keys)
+        start = threading.Barrier(reader_count + 1)
+        wrong: list[str] = []
+        stop = threading.Event()
+
+        def read_loop() -> None:
+            start.wait()
+            for _ in range(rounds):
+                for key in table_keys:
+                    found = second.get(key)
+                    if found != b"from-disk-" + key:
+                        wrong.append(f"{key!r} read back as {found!r}")
+
+        def write_loop() -> None:
+            start.wait()
+            index = 0
+            # Bounded as well as stoppable, so a reader thread that somehow never
+            # finishes cannot turn this into a writer filling memory until the
+            # suite is killed.
+            while not stop.is_set() and index < 500:
+                second.put(f"written{index:05d}".encode(), b"value")
+                index += 1
+
+        readers = [threading.Thread(target=read_loop) for _ in range(reader_count)]
+        writer = threading.Thread(target=write_loop)
+        writer.start()
+        for thread in readers:
+            thread.start()
+        for thread in readers:
+            thread.join(timeout=60)
+            assert not thread.is_alive(), "a reader thread did not finish"
+        stop.set()
+        writer.join(timeout=60)
+        assert not writer.is_alive(), "the writer thread did not finish"
+
+        assert wrong == [], f"concurrent reads of the loaded tables disagreed: {wrong[:5]}"
+        assert second.get(b"written00000") == b"value", "the writer's records are not readable"
