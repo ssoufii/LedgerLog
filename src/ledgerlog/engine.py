@@ -217,13 +217,33 @@ lookup. A read path that took a path and opened it per get would pay a footer
 parse and an index decode for every one of them, which is exactly the cost the
 sparse index exists to amortize.
 
-What the list does not yet hold is tables from a previous run. Finding those is
-what :func:`discover_sstables` does (story M9.1): it reports the committed tables
-in a directory, newest first, along with the files it will not read. Installing
-them in this list is story M9.2, so a reopened engine still starts with an empty
-one and reads the old filenames only to avoid reusing a name. Nor is the number
-of readers held open bounded, which is a question for the point where compaction
-(M8) starts producing and retiring tables in bulk.
+The list also holds the tables previous runs left behind. :func:`discover_sstables`
+reports the committed tables in a directory, newest first, along with the files it
+will not read (story M9.1), and the constructor turns each of those into a handle
+before it replays the log (story M9.2), so a reopened engine serves reads from
+every table on its disk and not only from the ones it flushed itself. What is not
+bounded is the number of readers held open, which is a question for the point
+where compaction (M8) starts producing and retiring tables in bulk.
+
+Startup, in order
+-----------------
+
+Opening an engine over a directory that has been used before does two things, in
+this order: it adopts the committed SSTables it finds there, and then it replays
+the log into a fresh memtable on top of them (story M9.2). The order is the
+story's claim. A record still in the log is newer than any table's record for the
+same key, because a flush only ever writes records the log already held, and the
+memtable replay lands in the one layer every read consults before it looks at a
+table, so the log wins every key the two disagree about. Neither step needs
+anything from the other, which is what keeps the rule to one line: load, then
+replay on top.
+
+The three cases the story names fall out of that rather than being handled
+separately. Tables plus a log carrying writes made since the last flush recovers
+both, with the log's records shadowing the tables'. No tables and a log recovers
+from the replay alone, into a memtable with nothing underneath it. Tables and no
+log recovers nothing, replays nothing, and answers from the tables, which is the
+case a clean shutdown leaves behind once the log is trimmed.
 
 Reading across the layers
 -------------------------
@@ -306,23 +326,19 @@ wait for a thread whose last act is to take it.
 
 What is deliberately not here yet:
 
-* Serving reads from the tables a previous run flushed (story M9.2).
-  :func:`discover_sstables` judges which of the files in a directory are
-  committed tables and reports them newest first (story M9.1), but nothing calls
-  it from here: a reopened engine still reads the existing filenames only to
-  avoid reusing one, and answers from the replayed log instead.
 * Trimming the log once the records it holds are on disk. Replay still reads it
   in full at startup, which is why a flush cannot lose data but does leave the
-  same records in two places.
+  same records in two places. It is also why startup replaying a flushed record
+  on top of the table holding it is harmless rather than a duplicate: both layers
+  hold the same record for the key, and a read stops at the first.
 * Running a compaction. Story M8.1 gives the engine a
   :class:`~ledgerlog.compaction.CompactionPlan`, republished whenever a table is
   added, which says which tables are grouped together and which group has enough
   tables to be worth merging. Nothing acts on it. The merge and the swap that
   retires its sources both exist now, as
-  :func:`~ledgerlog.compaction.compact_tier`, but the engine calls neither: it
-  does not yet adopt the tables on its own disk (story M9.2), so a compaction
-  here is something a caller drives and the plan is a report about the directory
-  rather than a thing the engine does.
+  :func:`~ledgerlog.compaction.compact_tier`, but the engine calls neither, so a
+  compaction here is something a caller drives and the plan is a report about the
+  tables the engine holds rather than a thing the engine does.
 """
 
 from __future__ import annotations
@@ -347,6 +363,7 @@ from ledgerlog.sstable import (
     SSTableReader,
     SSTableRecord,
     inspect_sstable,
+    read_bloom_filter,
     write_sstable,
 )
 from ledgerlog.wal import (
@@ -472,8 +489,9 @@ class DiscoveredSSTable:
 
     Deliberately not a handle. A handle owns an open reader and has to be closed;
     this is a finding about a file and owns nothing, which is what lets a caller
-    look at the whole directory before deciding what to open. Turning findings
-    into the tables an engine serves reads from is story M9.2.
+    look at the whole directory before deciding what to open.
+    :meth:`SSTableHandle.from_discovered` is the step that turns one into a table
+    an engine serves reads from (story M9.2).
     """
 
     sequence: int
@@ -529,8 +547,8 @@ def discover_sstables(directory: str | os.PathLike[str]) -> SSTableDiscovery:
     flush: the footer is the commit point, so a file without a whole, consistent
     footer is a flush or a merge that never finished, and the records it was going
     to hold are still in the log for replay to find. Story M9.1. Deciding which
-    files are tables is all that happens here; loading them into a running engine
-    is story M9.2.
+    files are tables is all that happens here; loading them into an engine is
+    :meth:`LedgerLog._load_committed_sstables` (story M9.2).
 
     Only names :func:`sstable_filename` could have produced are candidates, so the
     log, the dot-prefixed temporary file a flush in progress is streaming into,
@@ -632,7 +650,9 @@ class SSTableHandle:
     footer has to be parsed back out of the file, which :func:`discover_sstables`
     does (story M9.1). That is why the footer is kept here as a footer rather than
     as the layout it came from: a discovered table can supply one and has no
-    layout. Building handles from those findings is story M9.2.
+    layout. :meth:`from_layout` and :meth:`from_discovered` are those two paths
+    (story M9.2), and a handle built either way is the same thing afterwards, so
+    nothing above this class has to know which run wrote the table it reads.
 
     The reader, unlike the other two, is opened lazily on the first borrow.
     Nothing reads a table's data block until story M7.2, and a flush that opened
@@ -649,25 +669,92 @@ class SSTableHandle:
     newest-first walk of many tables from turning into one queue.
     """
 
-    def __init__(self, sequence: int, layout: SSTableLayout) -> None:
-        """Build the handle for the table ``layout`` describes.
+    def __init__(
+        self,
+        sequence: int,
+        *,
+        path: Path,
+        footer: SSTableFooter,
+        bloom_filter: BloomFilter,
+        size_bytes: int,
+    ) -> None:
+        """Build a handle over a committed table from the four things reads need.
 
-        ``sequence`` is the number in the table's filename, kept separately
-        because it is what orders tables by age and a layout carries the path but
-        not the number inside it. It is taken as given rather than parsed back out
-        of the name: the flush allocated it, and re-deriving it here would mean
-        two places deciding what a table's age is.
+        Called through :meth:`from_layout` or :meth:`from_discovered` rather than
+        directly, and takes the pieces rather than either source object because
+        there are now two sources: a flush that has the footer and the filter in
+        memory already, and a table a previous run left on disk, where both have
+        to be read back. Taking the union of what those two can offer would mean a
+        constructor whose arguments are each optional and whose body decides which
+        combination it was given.
+
+        ``sequence`` is the number in the table's filename, passed separately
+        because it is what orders tables by age and neither source is asked to
+        agree with the name about it. It is taken as given rather than parsed back
+        out of the name: whoever opens the table knows it, and re-deriving it here
+        would mean two places deciding what a table's age is.
         """
         if sequence < 0:
             raise ValueError(f"SSTable sequence number must not be negative, got {sequence}")
         self._sequence = sequence
-        self._path = layout.path
-        self._footer = layout.footer
-        self._bloom_filter = layout.bloom_filter
-        self._size_bytes = layout.footer_end
+        self._path = path
+        self._footer = footer
+        self._bloom_filter = bloom_filter
+        self._size_bytes = size_bytes
         self._lock = threading.Lock()
         self._reader: SSTableReader | None = None
         self._closed = False
+
+    @classmethod
+    def from_layout(cls, sequence: int, layout: SSTableLayout) -> SSTableHandle:
+        """Build the handle for a table this process has just finished writing.
+
+        The footer and the filter come straight off the layout, and the size is
+        the layout's footer end, because the footer is the last thing written and
+        so the end of it is the end of the file. Nothing is read back: these are
+        bytes this process encoded moments ago, and asking the filesystem about
+        them would only introduce a way for the answer to differ.
+        """
+        return cls(
+            sequence,
+            path=layout.path,
+            footer=layout.footer,
+            bloom_filter=layout.bloom_filter,
+            size_bytes=layout.footer_end,
+        )
+
+    @classmethod
+    def from_discovered(cls, discovered: DiscoveredSSTable) -> SSTableHandle:
+        """Build the handle for a table an earlier run committed. Story M9.2.
+
+        The footer and the size come from the scan, which has already read and
+        validated both, so the only thing left to fetch is the bloom filter. It is
+        read here, eagerly, rather than left for the first lookup to fault in,
+        because the filter is what decides whether a table is opened at all
+        (ARCHITECTURE.md section 5) and so it is consulted by every get that
+        misses in memory, including the ones that touch no table. A lazily loaded
+        filter would put a file read on that path and would need a lock around it,
+        for a cost that is paid once per table at startup either way.
+
+        :func:`~ledgerlog.sstable.read_bloom_filter` is handed the size the scan
+        measured so the section's offsets are re-checked against the file before
+        anything is read, which is what keeps a damaged footer that got this far
+        from turning into a read sized by a number nobody wrote. The file is
+        opened through a context manager and closed before the handle exists, so a
+        startup over a directory of many tables holds one descriptor at a time
+        rather than one per table.
+        """
+        with open(discovered.path, "rb") as stream:
+            bloom_filter = read_bloom_filter(
+                stream, discovered.footer, file_size=discovered.size_bytes
+            )
+        return cls(
+            discovered.sequence,
+            path=discovered.path,
+            footer=discovered.footer,
+            bloom_filter=bloom_filter,
+            size_bytes=discovered.size_bytes,
+        )
 
     @property
     def sequence(self) -> int:
@@ -704,12 +791,15 @@ class SSTableHandle:
     def size_bytes(self) -> int:
         """Size of the table's file in bytes, which is what compaction groups by.
 
-        Taken from the layout's footer end rather than from the filesystem, because
-        the footer is the last thing written and the end of it is the end of the
-        file, so this is the size the table was committed at without a call out to
-        ask. It is also the size that stays true: a ``stat`` would report whatever
-        the file is now, and a file that has grown or shrunk since it was committed
-        is damaged, not resized.
+        For a freshly flushed table this is the layout's footer end rather than a
+        measurement, because the footer is the last thing written and the end of it
+        is the end of the file, so the size is known without a call out to ask. For
+        a discovered one it is the size the scan measured, which is the size the
+        footer was accepted against (see :attr:`DiscoveredSSTable.size_bytes`), so
+        the two agree and a tier grouped from either kind comes out the same. Either
+        way it is the size the table was committed at, and it stays that: a ``stat``
+        per read would report whatever the file is now, and a file that has grown or
+        shrunk since it was committed is damaged, not resized.
 
         Bytes on disk rather than record count, because the tiering in
         ``compaction.py`` is about the I/O a merge would cost, and two tables with
@@ -840,6 +930,14 @@ class LedgerLog:
         writer defaults to it: an acknowledged write should be on the disk unless
         the caller has explicitly asked to trade that away.
 
+        Committed SSTables already in the directory are adopted first, and then
+        the log is replayed into the memtable on top of them (story M9.2), so an
+        engine reopened over a used directory serves reads from both and the log's
+        records win every key the two hold. Files that no footer committed are
+        passed over and left where they are; :attr:`discovery` reports which, and
+        the records they were going to hold are the ones the replay recovers
+        (ARCHITECTURE.md section 6).
+
         If the directory already holds a log, it is replayed into the memtable
         here, before the writer opens and before the constructor returns. The
         constructor is the right place for it precisely because it is the one
@@ -906,8 +1004,9 @@ class LedgerLog:
         self._memtable_threshold_bytes = memtable_threshold_bytes
         self._memtable = Memtable()
         self._frozen_memtables: tuple[Memtable, ...] = ()
-        # Newest first, and empty for a reopened engine until story M9.2 installs
-        # what discover_sstables finds on disk.
+        # Newest first, and filled from the directory by _load_committed_sstables
+        # below before any read can reach it. Declared empty here because the
+        # planner and the loader both want the attribute to exist already.
         self._sstables: tuple[SSTableHandle, ...] = ()
         self._compaction_policy = (
             compaction_policy if compaction_policy is not None else CompactionPolicy()
@@ -932,6 +1031,7 @@ class LedgerLog:
         self._flush_in_background = flush_in_background
         self._flusher: threading.Thread | None = None
 
+        self._discovery = self._load_committed_sstables()
         self._recovery = self._replay_existing_log()
         self._wal = WalWriter(
             self._directory / WAL_FILENAME,
@@ -1009,16 +1109,17 @@ class LedgerLog:
 
     @property
     def sstables(self) -> tuple[SSTableHandle, ...]:
-        """Tables this engine has flushed, newest first.
+        """Tables this engine is serving reads from, newest first.
 
         The order a read has to consult them in (ARCHITECTURE.md section 5): a key
         can appear in several tables, as an old value, a newer value or a
         tombstone, and the first table in this list that holds it holds the record
         that is true. Sequence numbers therefore descend along it.
 
-        Only tables this engine flushed are here. Ones an earlier run committed
-        are on disk, and :func:`discover_sstables` reports them, but nothing puts
-        them in this list until story M9.2.
+        Tables an earlier run committed are here too, adopted at startup by the
+        scan :func:`discover_sstables` makes of the directory (story M9.2), and a
+        handle gives no sign of which run wrote its table because nothing above
+        needs one: age is the sequence number, and that is in the filename.
 
         A tuple rather than a list, for the reason :attr:`frozen_memtables` is
         one: a caller cannot change what the engine will read next, and the engine
@@ -1047,9 +1148,10 @@ class LedgerLog:
         on a ready tier has to expect the set of tables to have moved on by the
         time it does, exactly as it would with :attr:`sstables`.
 
-        Only tables this engine flushed are in it, since that is all
-        :attr:`sstables` holds until story M9.2. A reopened engine therefore
-        reports no tiers even where the directory holds tables.
+        Covers every table in :attr:`sstables`, the ones adopted from the
+        directory at startup included (story M9.2), so a reopened engine reports
+        the tiers its disk actually holds and not only what it has flushed since
+        it opened.
         """
         return self._compaction_plan
 
@@ -1092,6 +1194,24 @@ class LedgerLog:
         recovered everything there was.
         """
         return self._recovery
+
+    @property
+    def discovery(self) -> SSTableDiscovery:
+        """What the scan at startup found in this engine's directory. Story M9.2.
+
+        Both halves of it: the tables that were adopted into :attr:`sstables`, and
+        the files that were passed over because no whole footer committed them. The
+        rejections are reported rather than dropped for the reason
+        :class:`SSTableDiscovery` gives: discarding one half-written file and
+        discarding every table in the directory look the same from the loaded set,
+        and only the second is a disaster.
+
+        Describes the scan and not the directory, so it does not change as the
+        engine flushes: a table written since startup is in :attr:`sstables` and
+        was never part of this. Reports two empty tuples for a fresh directory,
+        which is the honest description of finding nothing where there was nothing.
+        """
+        return self._discovery
 
     @property
     def closed(self) -> bool:
@@ -1450,9 +1570,10 @@ class LedgerLog:
         replays every record they held.
 
         The tracked tables' readers are closed last, after the log, so an engine
-        that flushed many tables leaves no descriptor behind. The handles stay in
-        :attr:`sstables`, closed: the list records which tables this engine wrote,
-        and the files are still on disk for the next open to find.
+        serving many tables leaves no descriptor behind, whether it flushed them
+        itself or adopted them at startup. The handles stay in :attr:`sstables`,
+        closed: the list records which tables this engine was reading, and the
+        files are still on disk for the next open to find.
 
         A second lock serializes closes so that the whole of this runs once, rather
         than the closed flag alone. Without it, a second thread calling close would
@@ -1493,6 +1614,60 @@ class LedgerLog:
         tb: TracebackType | None,
     ) -> None:
         self.close()
+
+    def _load_committed_sstables(self) -> SSTableDiscovery:
+        """Adopt the committed tables in this engine's directory. Story M9.2.
+
+        Called once, from the constructor, before the log is replayed and before
+        the flusher exists, so the tables are in place before any caller or any
+        thread of this engine's can read. The directory is scanned by
+        :func:`discover_sstables`, which decides which files are tables and
+        rejects the rest, and every table it accepts becomes a handle here, in the
+        order it reported them: newest first, which is the order
+        :meth:`_lookup` walks and the order a correct answer depends on
+        (ARCHITECTURE.md section 5).
+
+        Before the replay rather than after it, which is the half of the story
+        that is an ordering claim. A record the log still holds is newer than
+        anything on disk for the same key, since a flush only ever writes records
+        the log already carried, so replay has to land in a layer the read path
+        consults first. The memtable is that layer, and it is already searched
+        ahead of every table, so adopting the tables first and replaying on top
+        gives the log the precedence it is owed with no extra rule: the two steps
+        are independent, and this order is the one that reads as what it means.
+
+        A table that will not load takes the startup down with it, after the
+        handles already built are closed. The alternative, carrying on with the
+        tables that did load, would serve reads from a set the engine knows is
+        incomplete, and for a key whose newest record was in the missing table
+        that means answering with an older value or with "not found", which is
+        indistinguishable from correct output. A refusal to open is also not the
+        case the discard rule is for: ARCHITECTURE.md section 6 discards a file
+        that was never committed, and this is a committed table that cannot be
+        read, which an operator has to hear about.
+
+        The plan is recomputed from the loaded set, rather than left as the empty
+        one the constructor built, so a reopened engine's tiers describe the
+        tables it is actually serving reads from (story M8.1). No lock is taken:
+        no other thread can reach a half-built engine, and the stores below are
+        the ones every later reader of these two attributes sees.
+        """
+        discovery = discover_sstables(self._directory)
+        handles: list[SSTableHandle] = []
+        try:
+            for discovered in discovery.tables:
+                handles.append(SSTableHandle.from_discovered(discovered))
+        except BaseException:
+            # Closing what was built, rather than letting the exception out over
+            # the top of it, because a handle may already hold nothing today and
+            # may hold a descriptor tomorrow, and an engine whose constructor
+            # raised is an engine nobody will ever call close() on.
+            for handle in handles:
+                handle.close()
+            raise
+        self._sstables = tuple(handles)
+        self._compaction_plan = plan_compaction(self._sstables, self._compaction_policy)
+        return discovery
 
     def _replay_existing_log(self) -> RecoveryReport:
         """Replay the directory's log into the memtable, and report what came back.
@@ -1710,7 +1885,7 @@ class LedgerLog:
         what would catch a second flusher or a reused sequence number, at the
         point where the mistake is still one table rather than a wrong answer.
         """
-        handle = SSTableHandle(sequence, layout)
+        handle = SSTableHandle.from_layout(sequence, layout)
         with self._write_lock:
             newest = self._sstables[0] if self._sstables else None
             if newest is not None and sequence <= newest.sequence:
@@ -1738,8 +1913,8 @@ class LedgerLog:
         Every handle is closed even if one of them raises, and the first exception
         is re-raised afterwards, because the point of this is to leave no
         descriptor behind and stopping at the first failure would leak the rest.
-        The handles stay in the list: it is a record of what this engine flushed,
-        which does not stop being true when the engine closes.
+        The handles stay in the list: it is a record of the tables this engine was
+        serving, which does not stop being true when the engine closes.
         """
         first_error: BaseException | None = None
         for handle in self._sstables:
