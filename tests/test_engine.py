@@ -44,6 +44,7 @@ which records come back. Neither kind stands in for the other.
 
 from __future__ import annotations
 
+import builtins
 import itertools
 import os
 import select
@@ -74,6 +75,8 @@ from ledgerlog.engine import (
 )
 from ledgerlog.memtable import Memtable, MemtableEntry, MemtableFrozenError
 from ledgerlog.sstable import (
+    FOOTER_SIZE,
+    SSTableFooter,
     SSTableLayout,
     SSTableReader,
     SSTableStatus,
@@ -4143,3 +4146,590 @@ def test_a_merge_on_the_engines_clock_drops_the_record_the_engine_has_expired(
     assert b"brief" not in rows
     assert rows[b"lasting"] == written_at_ms + 3_600_000
     assert rows[b"forever"] == NO_EXPIRY
+
+
+# ---------------------------------------------------------------------------
+# Story M9.1: startup SSTable discovery with footer validation.
+#
+# Three claims, and each one has a way of passing by accident. That only valid
+# tables come back is tested against files damaged the way a crash damages them,
+# by truncating a real table at the byte its footer starts at (an interrupted
+# flush) and by altering a footer that had already landed (damage after the
+# commit), rather than against files written to be wrong, so that what is
+# rejected here is what the reader would refuse. That discarded files stay out of
+# the loaded set is tested alongside their still being on disk afterwards, since
+# a scan that deleted them would satisfy the first half while quietly settling a
+# policy question the story puts outside itself. That the order is
+# reconstructible is tested with the modification times running backwards against
+# the sequence numbers, because an implementation that sorted by mtime would
+# agree with a correct one on every directory a test filled in one pass and
+# disagree only here.
+#
+# Discovery does not run inside the engine yet; wiring it in is story M9.2. The
+# tests below call it against directories a real engine filled and then closed,
+# which is the input it will get there.
+# ---------------------------------------------------------------------------
+
+
+def committed_tables(directory: Path, batches: int) -> list[Path]:
+    """Fill ``directory`` through a real engine, leaving ``batches`` tables behind.
+
+    Written by the engine rather than by :func:`write_sstable` so the names, the
+    sequence numbers and the footers are the ones discovery will actually meet,
+    and closed before returning so nothing holds a file open. The paths come back
+    newest first, as the engine tracked them, which is the order discovery is
+    expected to reproduce from the filenames alone.
+    """
+    with layered_engine(directory) as engine:
+        for index in range(batches):
+            flush_as_one_table(engine, [(f"key{index:03d}".encode(), b"value")])
+        paths = [handle.path for handle in engine.sstables]
+    assert len(paths) == batches, "the engine did not commit one table per batch"
+    return paths
+
+
+def discovered_paths(directory: Path) -> list[Path]:
+    """The paths discovery would load from ``directory``, in the order it reports them."""
+    return [table.path for table in engine_module.discover_sstables(directory).tables]
+
+
+def truncate_at_footer(path: Path) -> None:
+    """Cut a committed table back to the byte its footer starts at.
+
+    What a process killed mid-flush leaves: a data block, an index and a bloom
+    filter that all landed, and no footer, so nothing ever committed the file. The
+    records are still in the log, which is what makes discarding this the correct
+    recovery rather than a loss (ARCHITECTURE.md section 6).
+    """
+    size = path.stat().st_size
+    assert size > FOOTER_SIZE, "a real table is longer than its own footer"
+    with open(path, "r+b") as handle:
+        handle.truncate(size - FOOTER_SIZE)
+
+
+def corrupt_footer(path: Path) -> None:
+    """Invert a byte inside a committed table's footer, leaving its length alone.
+
+    A whole footer that fails its own checksum, which is damage after the commit
+    rather than a write that never finished, and the other half of the story's
+    "missing or corrupt footer" case.
+    """
+    raw = bytearray(path.read_bytes())
+    assert len(raw) > FOOTER_SIZE
+    raw[len(raw) - FOOTER_SIZE] ^= 0xFF
+    path.write_bytes(bytes(raw))
+
+
+def rewritten_footer(layout: SSTableLayout, **changes: int) -> bytes:
+    """The table's bytes with its footer fields changed and its checksum recomputed.
+
+    So that what a test damages is the field itself, rather than a footer that
+    fails its checksum first and never reaches the check under test.
+    """
+    fields = {
+        "data_block_offset": layout.data_block_offset,
+        "data_block_end": layout.data_block_end,
+        "index_offset": layout.index_offset,
+        "index_end": layout.index_end,
+        "bloom_filter_offset": layout.bloom_filter_offset,
+        "bloom_filter_end": layout.bloom_filter_end,
+        "record_count": layout.record_count,
+        "format_version": layout.format_version,
+    }
+    fields.update(changes)
+    raw = layout.path.read_bytes()
+    return raw[:-FOOTER_SIZE] + SSTableFooter(**fields).encode()
+
+
+# Acceptance criterion: given a mix of valid tables and one with a missing or
+# corrupt footer, discovery returns only the valid ones.
+
+
+def test_discovery_returns_every_committed_table_in_a_clean_directory(tmp_path: Path) -> None:
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 3)
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert [table.path for table in discovery.tables] == committed
+    assert discovery.rejected == ()
+
+
+def test_a_table_truncated_where_its_footer_starts_is_not_returned(tmp_path: Path) -> None:
+    """A killed flush, as ARCHITECTURE.md section 6 describes it: no footer, no table."""
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 3)
+    truncate_at_footer(committed[1])
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert [table.path for table in discovery.tables] == [committed[0], committed[2]]
+    assert [rejection.path for rejection in discovery.rejected] == [committed[1]]
+    assert discovery.rejected[0].status is SSTableStatus.INCOMPLETE
+
+
+def test_a_table_whose_footer_fails_its_own_checksum_is_not_returned(tmp_path: Path) -> None:
+    """A flipped byte inside a footer, which reads as a footer that never landed.
+
+    The verdict is ``INCOMPLETE`` rather than ``CORRUPT`` and that is the format
+    being honest: a checksum says the bytes under it did not all arrive, and
+    nothing in a fixed size trailer can tell a write that stopped early from a
+    byte that rotted afterwards. What matters to this story is the same either
+    way, that the file is not loaded.
+    """
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 3)
+    corrupt_footer(committed[0])
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert [table.path for table in discovery.tables] == [committed[1], committed[2]]
+    assert [rejection.path for rejection in discovery.rejected] == [committed[0]]
+    assert discovery.rejected[0].status is SSTableStatus.INCOMPLETE
+
+
+def test_a_table_damaged_at_the_front_under_a_whole_footer_is_not_returned(
+    tmp_path: Path,
+) -> None:
+    """A committed table whose header was destroyed afterwards, which is corruption.
+
+    The footer is untouched and passes, so this is the one rejection that cannot
+    be a write that stopped early: the commit point was reached and the front of
+    the file was wrecked later. Discovery has to refuse it, since the header is
+    what says the file is ours and which layout its records are in.
+    """
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 2)
+    target = committed[0]
+    raw = bytearray(target.read_bytes())
+    raw[0:4] = b"XXXX"
+    target.write_bytes(bytes(raw))
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert [table.path for table in discovery.tables] == [committed[1]]
+    assert [rejection.path for rejection in discovery.rejected] == [target]
+    assert discovery.rejected[0].status is SSTableStatus.CORRUPT
+
+
+@pytest.mark.parametrize("tail", [1, 7, FOOTER_SIZE - 1])
+def test_a_footer_that_landed_in_part_is_not_returned(tmp_path: Path, tail: int) -> None:
+    """A kill can land anywhere, so a partial footer is not one offset but a range.
+
+    A file whose footer is short by a byte must be refused exactly as one with no
+    footer at all is: the commit point is the whole footer, and a length check
+    that only noticed a missing one would admit a table whose offsets are being
+    read out of whatever bytes happened to arrive.
+    """
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 2)
+    target = committed[0]
+    size = target.stat().st_size
+    with open(target, "r+b") as handle:
+        handle.truncate(size - FOOTER_SIZE + tail)
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert [table.path for table in discovery.tables] == [committed[1]]
+    assert [rejection.path for rejection in discovery.rejected] == [target]
+
+
+def test_a_footer_pointing_outside_its_own_file_is_not_returned(tmp_path: Path) -> None:
+    """The damage a checksum cannot catch, since re-encoding recomputes it.
+
+    Discovery has to refuse this for the reason story M4.4 gave: the offsets are
+    what a reader slices the file with, and a table admitted here with offsets
+    past the end of its file is a table the read path would then fail on.
+    """
+    directory = tmp_path / "data"
+    directory.mkdir()
+    layout = write_sstable(directory / sstable_filename(0), [(b"key", b"value")])
+    layout.path.write_bytes(rewritten_footer(layout, index_offset=1 << 30, index_end=1 << 30))
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert discovery.tables == ()
+    assert [rejection.status for rejection in discovery.rejected] == [SSTableStatus.CORRUPT]
+
+
+def test_an_empty_file_under_a_tables_name_is_not_returned(tmp_path: Path) -> None:
+    """What a crash between creating a file and writing anything into it leaves."""
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 1)
+    (directory / sstable_filename(900)).write_bytes(b"")
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert [table.path for table in discovery.tables] == committed
+    assert [rejection.status for rejection in discovery.rejected] == [SSTableStatus.INCOMPLETE]
+
+
+def test_a_table_this_build_cannot_read_is_excluded_but_not_called_damage(
+    tmp_path: Path,
+) -> None:
+    """A later format version is kept out of the loaded set without being called debris.
+
+    Its footer landed, so the data is real and only the reader for it is missing.
+    Discovery has to exclude it, because this build cannot parse it, and has to
+    say which kind of rejection it is, because the two call for opposite
+    treatment: debris can be swept, a table from a newer build must not be.
+    """
+    directory = tmp_path / "data"
+    directory.mkdir()
+    layout = write_sstable(directory / sstable_filename(0), [(b"key", b"value")])
+    layout.path.write_bytes(rewritten_footer(layout, format_version=layout.format_version + 1))
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert discovery.tables == ()
+    assert [rejection.status for rejection in discovery.rejected] == [
+        SSTableStatus.UNSUPPORTED_VERSION
+    ]
+    assert discovery.rejected[0].is_complete, "a committed table is not debris"
+
+
+def test_every_rejection_carries_the_reason_the_file_failed(tmp_path: Path) -> None:
+    """An operator reading a startup log is told which check a file failed."""
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 2)
+    truncate_at_footer(committed[0])
+    corrupt_footer(committed[1])
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert len(discovery.rejected) == 2
+    for rejection in discovery.rejected:
+        assert rejection.reason, f"{rejection.path} was rejected with no reason given"
+
+
+def test_a_directory_of_nothing_but_damaged_tables_loads_none_of_them(tmp_path: Path) -> None:
+    """The case that must not read as a clean fresh install, because it is not one."""
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 3)
+    for path in committed:
+        truncate_at_footer(path)
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert discovery.tables == ()
+    assert [rejection.path for rejection in discovery.rejected] == sorted(committed)
+
+
+# Acceptance criterion: discarded files are excluded from the loaded set, and
+# whatever else happens to them is a separate concern.
+
+
+def test_a_discarded_file_is_left_exactly_where_it_was(tmp_path: Path) -> None:
+    """Exclusion is not deletion. The cleanup policy is explicitly not this story's."""
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 2)
+    truncate_at_footer(committed[0])
+    before = {path: path.read_bytes() for path in committed}
+
+    engine_module.discover_sstables(directory)
+
+    for path, content in before.items():
+        assert path.exists(), f"{path.name} was removed by a scan that only had to skip it"
+        assert path.read_bytes() == content, f"{path.name} was rewritten by a scan"
+
+
+def test_discovery_run_twice_gives_the_same_answer(tmp_path: Path) -> None:
+    """Follows from the scan changing nothing, and is what makes it safe to repeat."""
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 3)
+    truncate_at_footer(committed[1])
+
+    first = engine_module.discover_sstables(directory)
+    second = engine_module.discover_sstables(directory)
+
+    assert [table.path for table in first.tables] == [table.path for table in second.tables]
+    assert [rejection.path for rejection in first.rejected] == [
+        rejection.path for rejection in second.rejected
+    ]
+
+
+def test_a_rejected_table_still_owns_its_name_for_the_next_flush(tmp_path: Path) -> None:
+    """Leaving debris in place has a consequence, and this is it being the right one.
+
+    A sequence number belongs to a file until something deletes that file, so a
+    later flush lands past a rejected table rather than on top of it. The two
+    halves have to agree: discovery refusing to load a file while the allocator
+    reused its name would overwrite evidence an operator may want to look at.
+    """
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 2)
+    damaged = committed[0]
+    rejected_sequence = parse_sstable_sequence(damaged.name)
+    assert rejected_sequence is not None
+    truncate_at_footer(damaged)
+    damaged_bytes = damaged.read_bytes()
+
+    assert damaged not in discovered_paths(directory)
+
+    with layered_engine(directory) as reopened:
+        freeze_as_one_table(reopened, [(b"after", b"value")])
+        reopened.flush_pending()
+        assert reopened.sstables, "the reopened engine committed no table"
+        for handle in reopened.sstables:
+            assert handle.sequence > rejected_sequence
+
+    assert damaged.read_bytes() == damaged_bytes, "a later flush wrote over the damaged table"
+
+
+# Acceptance criterion: valid tables come back in an order the engine can
+# reconstruct newest-first ordering from, taken from the sequence number in the
+# name and not from the filesystem's timestamps.
+
+
+def test_discovery_reports_tables_newest_sequence_number_first(tmp_path: Path) -> None:
+    directory = tmp_path / "data"
+    committed_tables(directory, 5)
+
+    tables = engine_module.discover_sstables(directory).tables
+
+    sequences = [table.sequence for table in tables]
+    assert sequences == sorted(sequences, reverse=True), "the report is not newest first"
+    assert sequences == [parse_sstable_sequence(table.path.name) for table in tables]
+
+
+def test_discovery_agrees_with_the_order_the_engine_itself_kept(tmp_path: Path) -> None:
+    """The order is only worth having if it is the read path's order (ARCHITECTURE.md 5)."""
+    directory = tmp_path / "data"
+    with layered_engine(directory) as engine:
+        for index in range(4):
+            flush_as_one_table(engine, [(f"key{index:03d}".encode(), b"value")])
+        tracked = [handle.path for handle in engine.sstables]
+
+    assert discovered_paths(directory) == tracked
+
+
+def test_modification_times_running_against_the_sequence_numbers_change_nothing(
+    tmp_path: Path,
+) -> None:
+    """The ordering the story rules out, arranged so that using it would fail here.
+
+    The newest table is stamped as the oldest file and the oldest as the newest,
+    which is what a restore from a backup or a copy of a data directory can do to
+    a set of files whose write order is fixed. A scan that sorted by mtime would
+    hand back the exact reverse of the right answer.
+    """
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 4)
+    base = time.time()
+    for index, path in enumerate(committed):
+        # committed is newest first, so a timestamp rising along it makes the
+        # newest table the least recently modified file and vice versa.
+        stamp = base + index
+        os.utime(path, (stamp, stamp))
+
+    assert discovered_paths(directory) == committed
+
+
+def test_the_order_does_not_depend_on_the_order_the_directory_is_read_in(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pinned by handing the scan its entries backwards, which a sort has to absorb.
+
+    A directory read returns entries in whatever order the filesystem keeps them,
+    which for a few files on most filesystems is close enough to creation order to
+    hide a missing sort. Reversing it is what makes the sort load-bearing.
+    """
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 4)
+    real_iterdir = Path.iterdir
+
+    def reversed_iterdir(self: Path) -> Iterator[Path]:
+        return iter(sorted(real_iterdir(self), reverse=True))
+
+    monkeypatch.setattr(Path, "iterdir", reversed_iterdir)
+
+    assert discovered_paths(directory) == committed
+
+
+def test_a_longer_sequence_number_is_still_reported_as_the_newer_table(tmp_path: Path) -> None:
+    """Table 10 is newer than table 9 and has to come first.
+
+    Sorting the padded filenames as text gives the same answer, which is the point
+    of the padding, and the sort here is on the number so the two cannot disagree.
+    """
+    directory = tmp_path / "data"
+    directory.mkdir()
+    for sequence in (9, 10, 100):
+        write_sstable(directory / sstable_filename(sequence), [(b"key", b"value")])
+
+    tables = engine_module.discover_sstables(directory).tables
+
+    assert [table.sequence for table in tables] == [100, 10, 9]
+
+
+# Which files are candidates at all.
+
+
+def test_the_log_and_a_flush_in_progress_are_passed_over_in_silence(tmp_path: Path) -> None:
+    """Neither is a table, so neither is loaded and neither is a rejection.
+
+    A temporary file is what a live flush streams into and what a killed one
+    leaves behind. Reporting it as a damaged table would bury the rejections that
+    mean something, which is why only names this module writes are candidates.
+    """
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 1)
+    assert (directory / WAL_FILENAME).exists(), "the engine left no log to pass over"
+    partial = sstable_module.temp_table_path(directory / sstable_filename(500))
+    partial.write_bytes(b"half a table")
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert [table.path for table in discovery.tables] == committed
+    assert discovery.rejected == ()
+    assert partial.exists(), "a scan removed a file it only had to pass over"
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "backup.sst",
+        "sstable-9.sst",
+        "sstable-000000001.sst",
+        "sstable-00000000001.sst",
+        "sstable-00000000x1.sst",
+        "sstable-0000000001.sstable",
+        "sstable-0000000001",
+        "notes.txt",
+    ],
+)
+def test_a_name_this_engine_would_never_write_is_not_a_candidate(tmp_path: Path, name: str) -> None:
+    """Including the near misses, since those are the ones a loose match would take."""
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 1)
+    (directory / name).write_bytes(b"not a table")
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert [table.path for table in discovery.tables] == committed
+    assert discovery.rejected == ()
+
+
+def test_a_subdirectory_wearing_a_tables_name_is_passed_over(tmp_path: Path) -> None:
+    """Inspecting it would raise, and one odd entry must not stop a startup."""
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 1)
+    (directory / sstable_filename(700)).mkdir()
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert [table.path for table in discovery.tables] == committed
+    assert discovery.rejected == ()
+
+
+def test_an_empty_directory_yields_nothing_rather_than_failing(tmp_path: Path) -> None:
+    """A fresh install, which is the common case and not an error."""
+    directory = tmp_path / "data"
+    directory.mkdir()
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert discovery.tables == ()
+    assert discovery.rejected == ()
+
+
+def test_a_directory_holding_only_a_log_yields_nothing(tmp_path: Path) -> None:
+    """An engine that has never flushed, which is also not an error."""
+    directory = tmp_path / "data"
+    with layered_engine(directory) as engine:
+        engine.put(b"key", b"value")
+        assert not engine.sstables
+
+    discovery = engine_module.discover_sstables(directory)
+
+    assert discovery.tables == ()
+    assert discovery.rejected == ()
+
+
+def test_a_directory_that_does_not_exist_is_reported_not_treated_as_empty(
+    tmp_path: Path,
+) -> None:
+    """An engine creates its own directory, so a missing one is a real failure."""
+    with pytest.raises(FileNotFoundError):
+        engine_module.discover_sstables(tmp_path / "absent")
+
+
+# What a discovered table reports about itself, which is what story M9.2 has to
+# build a handle out of.
+
+
+def test_a_discovered_table_reports_the_footer_the_file_was_committed_with(
+    tmp_path: Path,
+) -> None:
+    directory = tmp_path / "data"
+    committed_tables(directory, 2)
+
+    for table in engine_module.discover_sstables(directory).tables:
+        with open(table.path, "rb") as handle:
+            assert table.footer == read_footer(handle)
+
+
+def test_a_discovered_table_reports_the_counts_and_size_a_handle_would(
+    tmp_path: Path,
+) -> None:
+    """The measures compaction tiers by, so the two sources have to agree exactly."""
+    directory = tmp_path / "data"
+    with layered_engine(directory) as engine:
+        for index in range(3):
+            flush_as_one_table(engine, [(f"key{index:03d}".encode(), b"value")])
+        expected = {
+            handle.path: (handle.sequence, handle.record_count, handle.size_bytes)
+            for handle in engine.sstables
+        }
+
+    for table in engine_module.discover_sstables(directory).tables:
+        assert (table.sequence, table.record_count, table.size_bytes) == expected[table.path]
+        assert table.size_bytes == table.path.stat().st_size
+
+
+def test_a_discovered_table_can_be_opened_and_read(tmp_path: Path) -> None:
+    """The check that makes the verdict worth anything: valid means readable.
+
+    A scan that admitted a file the reader then refused would move the failure out
+    of startup, where it can be handled, and into the first get that touched the
+    table.
+    """
+    directory = tmp_path / "data"
+    with layered_engine(directory) as engine:
+        flush_as_one_table(engine, [(b"alpha", b"one")])
+        flush_as_one_table(engine, [(b"beta", b"two")])
+
+    found: dict[bytes, bytes] = {}
+    for table in engine_module.discover_sstables(directory).tables:
+        with SSTableReader.open(table.path) as reader:
+            assert reader.footer == table.footer
+            for key in (b"alpha", b"beta"):
+                record = reader.lookup(key)
+                if record is not None and record.value is not None:
+                    found[key] = record.value
+
+    assert found == {b"alpha": b"one", b"beta": b"two"}
+
+
+def test_every_file_the_scan_opened_is_closed_again(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A scan runs over every file in a data directory, so a leak here scales with it."""
+    directory = tmp_path / "data"
+    committed = committed_tables(directory, 3)
+    truncate_at_footer(committed[1])
+
+    opened: list[Any] = []
+    real_open = builtins.open
+
+    def tracking_open(*args: Any, **kwargs: Any) -> Any:
+        handle = real_open(*args, **kwargs)
+        opened.append(handle)
+        return handle
+
+    monkeypatch.setattr(builtins, "open", tracking_open)
+    engine_module.discover_sstables(directory)
+    monkeypatch.undo()
+
+    assert opened, "the scan opened nothing, so this proves nothing"
+    assert all(handle.closed for handle in opened), "the scan left a file open"
