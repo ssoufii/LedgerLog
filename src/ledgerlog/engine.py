@@ -217,11 +217,13 @@ lookup. A read path that took a path and opened it per get would pay a footer
 parse and an index decode for every one of them, which is exactly the cost the
 sparse index exists to amortize.
 
-What the list does not yet hold is tables from a previous run: nothing discovers
-those until story M9.1, so a reopened engine starts with an empty list and reads
-the old filenames only to avoid reusing one. Nor is the number of readers held
-open bounded, which is a question for the point where compaction (M8) starts
-producing and retiring tables in bulk.
+What the list does not yet hold is tables from a previous run. Finding those is
+what :func:`discover_sstables` does (story M9.1): it reports the committed tables
+in a directory, newest first, along with the files it will not read. Installing
+them in this list is story M9.2, so a reopened engine still starts with an empty
+one and reads the old filenames only to avoid reusing a name. Nor is the number
+of readers held open bounded, which is a question for the point where compaction
+(M8) starts producing and retiring tables in bulk.
 
 Reading across the layers
 -------------------------
@@ -304,9 +306,11 @@ wait for a thread whose last act is to take it.
 
 What is deliberately not here yet:
 
-* Discovering the tables a previous run flushed (story M9.1). A reopened engine
-  reads the existing filenames only to avoid reusing one, and nothing yet opens
-  those files or judges whether they are complete.
+* Serving reads from the tables a previous run flushed (story M9.2).
+  :func:`discover_sstables` judges which of the files in a directory are
+  committed tables and reports them newest first (story M9.1), but nothing calls
+  it from here: a reopened engine still reads the existing filenames only to
+  avoid reusing one, and answers from the replayed log instead.
 * Trimming the log once the records it holds are on disk. Replay still reads it
   in full at startup, which is why a flush cannot lose data but does leave the
   same records in two places.
@@ -316,7 +320,7 @@ What is deliberately not here yet:
   tables to be worth merging. Nothing acts on it. The merge and the swap that
   retires its sources both exist now, as
   :func:`~ledgerlog.compaction.compact_tier`, but the engine calls neither: it
-  cannot yet discover the tables on its own disk (story M9.1), so a compaction
+  does not yet adopt the tables on its own disk (story M9.2), so a compaction
   here is something a caller drives and the plan is a report about the directory
   rather than a thing the engine does.
 """
@@ -338,9 +342,11 @@ from ledgerlog.compaction import CompactionPlan, CompactionPolicy, plan_compacti
 from ledgerlog.memtable import Memtable, MemtableEntry
 from ledgerlog.sstable import (
     SSTableFooter,
+    SSTableInspection,
     SSTableLayout,
     SSTableReader,
     SSTableRecord,
+    inspect_sstable,
     write_sstable,
 )
 from ledgerlog.wal import (
@@ -454,6 +460,159 @@ def parse_sstable_sequence(name: str) -> int | None:
     return int(digits)
 
 
+@dataclass(frozen=True)
+class DiscoveredSSTable:
+    """One committed table found in a data directory, with the footer it carries.
+
+    What :func:`discover_sstables` reports for a file that passed every check
+    :class:`~ledgerlog.sstable.SSTableReader` would make of it. The footer comes
+    along rather than the path alone because the scan has already read it whole,
+    and making the caller read it back to build an :class:`SSTableHandle` would
+    decode the same bytes twice inside one startup.
+
+    Deliberately not a handle. A handle owns an open reader and has to be closed;
+    this is a finding about a file and owns nothing, which is what lets a caller
+    look at the whole directory before deciding what to open. Turning findings
+    into the tables an engine serves reads from is story M9.2.
+    """
+
+    sequence: int
+    path: Path
+    footer: SSTableFooter
+    size_bytes: int
+    """Size of the committed file, which is what compaction groups tables by.
+
+    Measured from the file rather than derived from the footer, because a footer
+    carries the extent of each section and not the end of the file, and the only
+    thing it could be derived from is an adjacency between the last section and
+    the footer that :class:`~ledgerlog.sstable.SSTableFooter` deliberately
+    declines to promise. The measurement is sound regardless: the footer this
+    table was accepted on was validated against exactly this size, so a file
+    whose sections did not fit inside it would not be here to report one.
+
+    It is therefore the same number :attr:`SSTableHandle.size_bytes` reports off
+    a flush's layout, which is what lets a tier grouped from discovered tables
+    come out the same as one grouped from freshly flushed tables.
+    """
+
+    @property
+    def record_count(self) -> int:
+        """Number of records in the table, as its footer reports it."""
+        return self.footer.record_count
+
+
+@dataclass(frozen=True)
+class SSTableDiscovery:
+    """One scan of a data directory: the tables to load, and the files passed over.
+
+    Both halves are reported, not just the usable tables, because the rejections
+    are the half an operator has to see. A startup that discarded one half-written
+    file and a startup that discarded every table in the directory look identical
+    from the loaded set alone, and only the second is a disaster.
+
+    :attr:`tables` is newest first and :attr:`rejected` is sorted by filename, so
+    two scans of an unchanged directory report the same thing in the same order
+    rather than in whatever order the directory happened to be read in.
+
+    Frozen, like :class:`RecoveryReport`, because it describes a scan that is over
+    by the time anything can look at it: the directory is free to have moved on.
+    """
+
+    tables: tuple[DiscoveredSSTable, ...]
+    rejected: tuple[SSTableInspection, ...]
+
+
+def discover_sstables(directory: str | os.PathLike[str]) -> SSTableDiscovery:
+    """Find the committed SSTables in ``directory``, newest first, and reject the rest.
+
+    The startup half of the rule ARCHITECTURE.md section 6 states for a killed
+    flush: the footer is the commit point, so a file without a whole, consistent
+    footer is a flush or a merge that never finished, and the records it was going
+    to hold are still in the log for replay to find. Story M9.1. Deciding which
+    files are tables is all that happens here; loading them into a running engine
+    is story M9.2.
+
+    Only names :func:`sstable_filename` could have produced are candidates, so the
+    log, the dot-prefixed temporary file a flush in progress is streaming into,
+    and anything else an operator keeps in the directory are passed over in
+    silence rather than counted as rejected tables. A file that was never one of
+    ours is not debris from a crash, and reporting it as such would bury the one
+    rejection that matters among files that were never going to be read.
+
+    Order comes from the sequence number inside each filename, descending, which
+    is the order :attr:`LedgerLog.sstables` keeps and the order a read needs: a
+    key can sit in several tables, as an old value, a newer one, or a tombstone,
+    and the first table holding it holds the record that is true (ARCHITECTURE.md
+    section 5). Modification times are not consulted, and the story asks for that
+    specifically. A restore from a backup, a copy into a new directory, or a
+    filesystem with coarse timestamps each reorder mtimes without reordering the
+    writes, and a read path that trusted them would serve a stale value while
+    looking entirely correct doing it.
+
+    A rejected file is excluded and left exactly where it is. What to do about one
+    is a policy question with a real answer on either side, since a corrupt table
+    may be worth keeping for an operator to examine while a temporary file is
+    worth sweeping (:func:`~ledgerlog.compaction.discard_partial_tables` does
+    that, for the debris it can recognise from the name alone), and a scan that
+    deleted as it went would settle it for every caller.
+
+    Rejection means "this build will not read it", which is not the same as
+    damage: a table another build committed in a later format version is rejected
+    here with its footer intact, and the status on each
+    :class:`~ledgerlog.sstable.SSTableInspection` is what tells the two apart.
+
+    A directory that does not exist raises, as the filesystem reports it. An
+    engine creates its own directory before anything gets this far, so a missing
+    one is not a fresh install, it is the directory having gone away underneath.
+    So does a candidate file that cannot be opened at all, for the reason
+    :func:`~ledgerlog.sstable.inspect_sstable` gives: a table the engine is not
+    allowed to read is not a table it may quietly leave out, because leaving it
+    out would serve older values for every key it holds.
+    """
+    root = Path(directory)
+    found: list[DiscoveredSSTable] = []
+    rejected: list[SSTableInspection] = []
+    for entry in root.iterdir():
+        sequence = parse_sstable_sequence(entry.name)
+        if sequence is None:
+            continue
+        if not entry.is_file():
+            # A directory (or a device node) wearing a table's name is not a
+            # damaged table and must not be reported as one. Inspecting it would
+            # raise rather than return a verdict, which would turn one odd entry
+            # in the directory into a startup that cannot finish at all.
+            continue
+        inspection = inspect_sstable(entry)
+        footer = inspection.footer
+        if not inspection.is_valid or footer is None:
+            # The footer arm cannot be reached for a valid verdict, and it is
+            # written as a narrowing rather than an assertion so that a status
+            # added later without one would reject the file rather than stop a
+            # startup on an exception.
+            rejected.append(inspection)
+            continue
+        found.append(
+            DiscoveredSSTable(
+                sequence=sequence,
+                path=entry,
+                footer=footer,
+                # Measured after the verdict, so what is reported is the size the
+                # footer was accepted against. CLAUDE.md puts multi-process use
+                # out of scope, so at startup no other writer is extending the
+                # file between the two.
+                size_bytes=entry.stat().st_size,
+            )
+        )
+
+    # Sorted here rather than trusting the directory read, which returns entries
+    # in whatever order the filesystem keeps them in. The key is the number out
+    # of the filename, so the result is the write order even for a directory that
+    # was copied, restored, or read back on a different filesystem.
+    found.sort(key=lambda table: table.sequence, reverse=True)
+    rejected.sort(key=lambda rejection: rejection.path.name)
+    return SSTableDiscovery(tables=tuple(found), rejected=tuple(rejected))
+
+
 class SSTableHandle:
     """One committed SSTable, with what the read path needs about it kept resident.
 
@@ -469,10 +628,11 @@ class SSTableHandle:
     than from the file, because the writer had already built both on the way past
     (see :class:`~ledgerlog.sstable.SSTableLayout`). Reading them back off the disk
     to populate a handle would be decoding bytes this process encoded moments
-    earlier. Discovering a table a previous run left behind is story M9.1, and that
-    is the path where a handle will have to be built by parsing, which is why the
-    footer is kept as a footer rather than as the layout it came from: a discovered
-    table can supply a footer and has no layout.
+    earlier. A table a previous run left behind is the other path, and there the
+    footer has to be parsed back out of the file, which :func:`discover_sstables`
+    does (story M9.1). That is why the footer is kept here as a footer rather than
+    as the layout it came from: a discovered table can supply one and has no
+    layout. Building handles from those findings is story M9.2.
 
     The reader, unlike the other two, is opened lazily on the first borrow.
     Nothing reads a table's data block until story M7.2, and a flush that opened
@@ -746,8 +906,8 @@ class LedgerLog:
         self._memtable_threshold_bytes = memtable_threshold_bytes
         self._memtable = Memtable()
         self._frozen_memtables: tuple[Memtable, ...] = ()
-        # Newest first, and empty for a reopened engine until story M9.1 teaches
-        # startup to discover the tables previous runs committed.
+        # Newest first, and empty for a reopened engine until story M9.2 installs
+        # what discover_sstables finds on disk.
         self._sstables: tuple[SSTableHandle, ...] = ()
         self._compaction_policy = (
             compaction_policy if compaction_policy is not None else CompactionPolicy()
@@ -857,7 +1017,8 @@ class LedgerLog:
         that is true. Sequence numbers therefore descend along it.
 
         Only tables this engine flushed are here. Ones an earlier run committed
-        are on disk and not in this list until startup discovery (story M9.1).
+        are on disk, and :func:`discover_sstables` reports them, but nothing puts
+        them in this list until story M9.2.
 
         A tuple rather than a list, for the reason :attr:`frozen_memtables` is
         one: a caller cannot change what the engine will read next, and the engine
@@ -887,8 +1048,8 @@ class LedgerLog:
         time it does, exactly as it would with :attr:`sstables`.
 
         Only tables this engine flushed are in it, since that is all
-        :attr:`sstables` holds until startup discovery (story M9.1). A reopened
-        engine therefore reports no tiers even where the directory holds tables.
+        :attr:`sstables` holds until story M9.2. A reopened engine therefore
+        reports no tiers even where the directory holds tables.
         """
         return self._compaction_plan
 
