@@ -66,7 +66,13 @@ from ledgerlog import engine as engine_module
 from ledgerlog import memtable as memtable_module
 from ledgerlog import sstable as sstable_module
 from ledgerlog import wal as wal_module
-from ledgerlog.compaction import CompactionPolicy, merge_sstables
+from ledgerlog.compaction import (
+    CompactionPolicy,
+    CompactionTier,
+    compact_tier,
+    discard_partial_tables,
+    merge_sstables,
+)
 from ledgerlog.engine import (
     WAL_FILENAME,
     SSTableHandle,
@@ -1312,6 +1318,42 @@ class _KilledEngine:
         """Kill the child outright and wait for the operating system to reap it."""
         os.kill(self._process.pid, signal.SIGKILL)
         assert self._process.wait(timeout=30) != 0, "the child exited cleanly instead of dying"
+
+    def send(self, command: str) -> None:
+        """Send one operation without waiting for the child to answer it.
+
+        The counterpart to :meth:`run` for a command whose answer is not an
+        acknowledgement. Story M9.4's child stops inside a compaction and reports
+        what it had written when it got there, so the parent has to read that
+        report rather than wait for a ``done`` line that is never coming. A
+        broken pipe is tolerated for the reason :meth:`run_until_it_dies` gives:
+        a child already dead is one outcome of sending it something, not a
+        failure to send it.
+        """
+        assert self._process.stdin is not None
+        self._process.stdin.write(command + "\n")
+        try:
+            self._process.stdin.flush()
+        except BrokenPipeError:
+            pass
+
+    def wait_for(self, prefix: str, *, timeout: float = 60.0) -> str:
+        """Block until the child announces a line starting with ``prefix``, and return it.
+
+        What lets a test kill the child at a known point rather than a likely
+        one: the child says it has arrived and then waits, so the signal lands
+        where the test meant it to and not wherever a sleep happened to leave it.
+        The deadline is :meth:`run`'s, for the same reason, and the prefix is
+        checked so that a child announcing something else fails the test here
+        rather than further down where the message would make no sense.
+        """
+        assert self._process.stdout is not None
+        ready, _, _ = select.select([self._process.stdout], [], [], timeout)
+        assert ready, f"child did not announce {prefix!r} within {timeout} seconds"
+
+        line = self._process.stdout.readline()
+        assert line.startswith(prefix), f"child announced {line!r} instead of {prefix!r}"
+        return line.strip()
 
     def run_until_it_dies(self, command: str, *, timeout: float = 60.0) -> None:
         """Send one operation the child is meant to die of, and wait for the corpse.
@@ -5986,3 +6028,486 @@ def test_an_overwrite_committed_by_the_flush_reads_as_its_newest_value(
 
     with LedgerLog(directory) as restarted:
         assert restarted.get(b"shared") == b"second"
+
+
+# ---------------------------------------------------------------------------
+# Story M9.4: a compaction killed before its merged table was committed leaves
+# an engine that still recovers everything, and resurrects nothing.
+#
+# The module-level tests for the swap itself (test_compaction.py, story M8.5)
+# already show what a kill mid-merge leaves on the disk: the sources intact, a
+# temporary file holding the partial output, and a sweep that clears it away.
+# What is checked here is the half those cannot reach, because they work in
+# paths and never open an engine: that a LedgerLog started on such a directory
+# adopts those source tables again and answers from them.
+#
+# Every table here is written by a real flush and every merge is a real merge,
+# so the state the restart inherits is one the engine itself produced. The
+# engine does not run compactions of its own (see engine.py), so the child
+# drives this one the way a caller would, through compaction.compact_tier.
+# ---------------------------------------------------------------------------
+
+
+_BEFORE_FOOTER = "before-footer"
+"""Prefix of the line the child sends from inside the merge, before the footer."""
+
+
+_COMPACTION_CHILD_SOURCE = """
+import sys
+from pathlib import Path
+
+from ledgerlog import LedgerLog, compaction
+from ledgerlog.compaction import CompactionTier
+from ledgerlog.engine import sstable_filename
+from ledgerlog.sstable import SSTableWriter
+
+merged_keys = []
+
+
+def announce(message):
+    sys.stdout.write(message + "\\n")
+    sys.stdout.flush()
+
+
+def wait_to_be_killed():
+    \"\"\"Block until the signal lands. The parent sends nothing more.\"\"\"
+    sys.stdin.read()
+    raise SystemExit("parent closed stdin instead of killing the child")
+
+
+class StallingWriter(SSTableWriter):
+    \"\"\"A writer that stops for good at the merged table's commit point.
+
+    Interposed on the name the merge looks its writer up under, so everything
+    around it is the real thing: real source tables, a real merge deciding which
+    records the output gets, and a real temporary file holding what it wrote. The
+    stop is in finish() rather than partway through add(), because the footer is
+    what the story turns on and finish() is the call that writes it: stopping on
+    entry means every record the merge chose has been handed over and none of the
+    footer exists, which is exactly the window the crash is meant to land in.
+
+    The keys are reported on the way past so the parent can see which records the
+    discarded output had taken, and in particular which one it had dropped. The
+    bytes of the temporary file cannot answer that: a SIGKILL takes the writer's
+    userspace buffer with it, so what reached the disk is a question about buffer
+    sizes rather than about the merge.
+    \"\"\"
+
+    def add(self, key, value, **kwargs):
+        merged_keys.append(key)
+        return super().add(key, value, **kwargs)
+
+    def finish(self):
+        announce("before-footer " + b" ".join(merged_keys).decode())
+        wait_to_be_killed()
+
+
+compaction.SSTableWriter = StallingWriter
+
+directory = Path(sys.argv[1])
+threshold = int(sys.argv[2])
+engine = LedgerLog(
+    directory,
+    fsync_policy="always",
+    memtable_threshold_bytes=threshold,
+    flush_in_background=False,
+)
+
+for line in sys.stdin:
+    command = line.strip()
+    if not command:
+        continue
+    kind, _, argument = command.partition(" ")
+    if kind == "put":
+        key, _, value = argument.partition("=")
+        engine.put(key.encode(), value.encode())
+    elif kind == "delete":
+        engine.delete(argument.encode())
+    elif kind == "freeze":
+        engine.put(argument.encode(), b"x" * threshold)
+    elif kind == "flush":
+        engine.flush_pending()
+    elif kind == "compact":
+        tables = engine.sstables
+        tier = CompactionTier(tables=tuple(tables), ready=True)
+        destination = directory / sstable_filename(max(t.sequence for t in tables) + 1)
+        compaction.compact_tier(tier, destination, other_tables=())
+    else:
+        raise SystemExit("unknown command: " + command)
+    print("done " + command, flush=True)
+"""
+"""A child engine that flushes and then compacts on command, stopping in the merge.
+
+``flush_in_background=False`` and the stdin-driven loop are ``_FLUSH_CHILD_SOURCE``'s,
+and for its reasons: nothing happens until the parent asks for it, so the parent
+knows exactly which tables exist and which records are in them when the kill
+lands.
+
+``compact`` is the command this child adds. It compacts every table the engine
+holds, as one tier, into the next free table name. The name comes from
+:func:`sstable_filename` applied to one past the newest sequence number on disk,
+which is what makes the merged table newer than its sources and so the table a
+read would reach first; :func:`~ledgerlog.compaction.swap_in_merged_table`
+documents why that is the caller's job and not the swap's.
+
+``other_tables=()`` says the tier is every table there is, so nothing older can
+resurrect a key and every tombstone the merge resolves may be dropped. That is
+what gives the second acceptance criterion something to drop, and it is the
+truth here: the tier really is the whole directory.
+"""
+
+
+@pytest.fixture
+def compacting_engine(tmp_path: Path) -> Iterator[Callable[[Path], _KilledEngine]]:
+    """Factory for child engines that compact on command, each cleaned up afterwards."""
+    children: list[_KilledEngine] = []
+
+    def start(directory: Path) -> _KilledEngine:
+        child = _KilledEngine(
+            directory,
+            tmp_path / f"compaction_child_{len(children)}.py",
+            source=_COMPACTION_CHILD_SOURCE,
+            arguments=(str(_FLUSH_CHILD_THRESHOLD),),
+        )
+        children.append(child)
+        return child
+
+    try:
+        yield start
+    finally:
+        for child in children:
+            child.close()
+
+
+def merge_marker(index: int) -> str:
+    """Key of the oversized record that freezes the child's memtable for table ``index``.
+
+    One per table rather than one shared key, because the markers are real
+    records in real tables and two tables holding the same key would make the
+    merge resolve it, which would quietly change what the merged output is
+    expected to contain.
+    """
+    return f"merge-marker-{index}"
+
+
+def kill_mid_compaction(
+    start: Callable[[Path], _KilledEngine], directory: Path, batches: list[list[str]]
+) -> list[bytes]:
+    """Flush each batch into a table of its own, then kill the child inside the merge.
+
+    Returns the keys the discarded merge output had taken, in the order the merge
+    handed them over, as reported by the child from the commit point it never got
+    past. Returns with the child dead, its source tables on the disk, and a
+    temporary file holding a merge output that no footer committed.
+    """
+    child = start(directory)
+    for index, batch in enumerate(batches):
+        for command in batch:
+            child.run(command)
+        child.run(f"freeze {merge_marker(index)}")
+        child.run("flush")
+
+    child.send("compact")
+    announcement = child.wait_for(_BEFORE_FOOTER)
+    child.kill()
+    return [key.encode() for key in announcement.split()[1:]]
+
+
+def merge_batch(start: int, count: int = 6) -> list[tuple[bytes, bytes]]:
+    """A run of short records for one table, numbered from ``start``.
+
+    Short on purpose: a whole batch has to fit in one memtable under the child's
+    threshold, so that it freezes once, when the marker asks it to, and the table
+    the compaction reads is one table rather than several.
+    """
+    return [
+        (f"key-{index:04d}".encode(), f"value-{index:04d}".encode())
+        for index in range(start, start + count)
+    ]
+
+
+def two_tables_killed_mid_compaction(
+    start: Callable[[Path], _KilledEngine], directory: Path
+) -> list[tuple[bytes, bytes]]:
+    """Two flushed tables and a merge of them killed before its footer.
+
+    Returns every key and value the two tables hold between them, the marker
+    records aside, which is what the first criterion asks to still be reachable.
+    """
+    older = merge_batch(0)
+    newer = merge_batch(6)
+    kill_mid_compaction(start, directory, [put_commands(older), put_commands(newer)])
+    return older + newer
+
+
+def tier_of_everything(
+    engine: LedgerLog, directory: Path
+) -> tuple[CompactionTier[SSTableHandle], Path]:
+    """Every table ``engine`` holds as one tier, with the name a merge of it would take.
+
+    What the child's ``compact`` command does, for a parent that wants to run the
+    same compaction itself. The tier and the destination are read off the engine,
+    but the merge is deliberately left to the caller to run after the engine has
+    closed: a swap deletes the source files, and doing that under a live engine
+    would leave it serving reads from a table list that no longer describes the
+    directory. The handles keep their path and sequence once closed, so the tier
+    stays usable afterwards.
+
+    The destination is one past the newest sequence number, which is what makes
+    the merged table the one a read reaches first (see
+    :func:`~ledgerlog.compaction.swap_in_merged_table`).
+    """
+    handles = engine.sstables
+    newest = max(handle.sequence for handle in handles)
+    return CompactionTier(tables=tuple(handles), ready=True), directory / sstable_filename(
+        newest + 1
+    )
+
+
+# Acceptance criterion 1: the source tables are loaded again, and everything in
+# them is still reachable.
+
+
+def test_a_kill_mid_compaction_commits_no_merged_table(
+    tmp_path: Path, compacting_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The crash really was mid-merge: both sources there, no third table, debris behind.
+
+    The premise every other test in this section rests on, so it is checked on
+    its own. A child killed before the merge started would leave no temporary
+    file, and one killed after the swap would leave a single merged table and no
+    sources at all, so either would fail here rather than quietly weaken the
+    tests below.
+    """
+    directory = tmp_path / "data"
+    two_tables_killed_mid_compaction(compacting_engine, directory)
+
+    assert len(sstable_paths_in(directory)) == 2, "the sources are not both on the disk"
+    assert temp_table_paths(directory), "the merge left no partial output, so it never started"
+
+
+def test_the_source_tables_a_dead_compaction_left_are_loaded_again(
+    tmp_path: Path, compacting_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The criterion's first half: a restart adopts exactly the sources, newest first.
+
+    Compared against the directory rather than against a count, so a restart that
+    adopted the partial merge output, or that left a source behind, fails here.
+    """
+    directory = tmp_path / "data"
+    two_tables_killed_mid_compaction(compacting_engine, directory)
+    sources = sstable_paths_in(directory)
+
+    with LedgerLog(directory) as restarted:
+        assert [handle.path for handle in restarted.sstables] == sources
+        assert restarted.discovery.rejected == ()
+
+
+def test_every_record_in_the_sources_is_still_reachable_after_a_kill_mid_compaction(
+    tmp_path: Path, compacting_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The criterion's headline: nothing the sources held was lost to the dead merge."""
+    directory = tmp_path / "data"
+    pairs = two_tables_killed_mid_compaction(compacting_engine, directory)
+
+    with LedgerLog(directory) as restarted:
+        for key, value in pairs:
+            assert restarted.get(key) == value
+
+
+def test_the_source_tables_alone_answer_for_every_record_after_a_kill_mid_compaction(
+    tmp_path: Path, compacting_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """Reachable "via get()" off the tables, not off a log that happens to still hold it.
+
+    The log is trimmed first, which loses nothing: every record in it was flushed
+    into one of these tables before the compaction began, so the tables are
+    already the durable copy. Without the trim this test would pass on a replay
+    even if both source tables had been destroyed, which is the one failure the
+    criterion is about.
+    """
+    directory = tmp_path / "data"
+    pairs = two_tables_killed_mid_compaction(compacting_engine, directory)
+    trim_log(directory)
+
+    with LedgerLog(directory) as restarted:
+        assert restarted.recovery.records_replayed == 0
+        assert len(restarted.sstables) == 2
+        for key, value in pairs:
+            assert restarted._memtable.lookup(key) is None, "the answer came from memory"
+            assert restarted.get(key) == value
+        assert restarted.get(b"never-written") is None
+
+
+def test_a_key_in_both_source_tables_still_resolves_to_the_newer_one(
+    tmp_path: Path, compacting_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """Still reachable means still correct: the newer table wins the keys it shares.
+
+    The merge the crash interrupted was going to resolve this key down to one
+    record. It did not land, so the resolution has to come from the load order
+    instead, and with the log trimmed the value returned is a direct readout of
+    that order (ARCHITECTURE.md section 5).
+    """
+    directory = tmp_path / "data"
+    kill_mid_compaction(compacting_engine, directory, [["put shared=old"], ["put shared=new"]])
+    trim_log(directory)
+
+    with LedgerLog(directory) as restarted:
+        assert len(restarted.sstables) == 2
+        assert restarted.get(b"shared") == b"new"
+
+
+def test_the_partial_merge_output_is_passed_over_and_left_alone(
+    tmp_path: Path, compacting_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The temporary file is neither adopted by a startup nor swept away by one.
+
+    Startup discards it by not looking at it: the name is one discovery does not
+    match, so it is not a rejected table either. Clearing it up is
+    :func:`~ledgerlog.compaction.discard_partial_tables`' job and not a startup's,
+    which this pins down so that a change moving the sweep into the constructor
+    is a deliberate one rather than a surprise.
+    """
+    directory = tmp_path / "data"
+    two_tables_killed_mid_compaction(compacting_engine, directory)
+    debris = temp_table_paths(directory)
+
+    with LedgerLog(directory) as restarted:
+        assert [handle.path for handle in restarted.sstables] == sstable_paths_in(directory)
+        assert restarted.discovery.rejected == ()
+    assert temp_table_paths(directory) == debris, "a startup moved the partial output"
+
+
+def test_a_compaction_rerun_after_the_restart_finishes_what_the_crash_interrupted(
+    tmp_path: Path, compacting_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The recovered engine is one a compaction can be run on again, losing nothing.
+
+    The point of leaving the sources alone is that the work is still there to be
+    redone, so this is the criterion followed through one step: sweep the debris,
+    merge the same tier for real, and every record is still readable afterwards,
+    now out of one table instead of two.
+    """
+    directory = tmp_path / "data"
+    pairs = two_tables_killed_mid_compaction(compacting_engine, directory)
+    assert len(discard_partial_tables(directory)) == 1
+    trim_log(directory)
+
+    with LedgerLog(directory) as restarted:
+        tier, destination = tier_of_everything(restarted, directory)
+    swap = compact_tier(tier, destination, other_tables=())
+    assert swap.retired_count == 2
+
+    with LedgerLog(directory) as merged:
+        assert [handle.path for handle in merged.sstables] == [destination]
+        for key, value in pairs:
+            assert merged.get(key) == value
+
+
+# Acceptance criterion 2: a tombstone the dead merge had already dropped does
+# not come back as the value it was shadowing.
+#
+# The older table holds a value for the doomed key and the newer one holds the
+# tombstone over it. Merged with other_tables=(), nothing older than the tier
+# can hold that key, so the merge drops the tombstone instead of copying it
+# forward (ARCHITECTURE.md section 4). That output is the one the crash throws
+# away, which is what makes the question real: the only record of the delete
+# left anywhere on disk is the tombstone in a source table the swap never
+# deleted.
+
+
+def tombstone_dropped_mid_compaction(
+    start: Callable[[Path], _KilledEngine], directory: Path
+) -> list[bytes]:
+    """A merge that dropped a tombstone, killed before it could commit the output."""
+    return kill_mid_compaction(
+        start,
+        directory,
+        [["put doomed-key=value", "put survivor=kept"], ["delete doomed-key"]],
+    )
+
+
+def test_the_discarded_merge_output_really_had_dropped_the_tombstone(
+    tmp_path: Path, compacting_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The criterion's premise: the lost output held no record at all for the deleted key.
+
+    Taken from the merge itself, as the keys it handed the writer before the
+    footer it never wrote. A merge that had copied the tombstone forward would
+    list the key here, and then the tests below would be measuring an ordinary
+    crash rather than the one the criterion describes.
+    """
+    directory = tmp_path / "data"
+    merged_keys = tombstone_dropped_mid_compaction(compacting_engine, directory)
+
+    assert b"doomed-key" not in merged_keys, "the merge kept the tombstone, so none was dropped"
+    assert b"survivor" in merged_keys, "the merge dropped a record it had no reason to"
+
+
+def test_a_tombstone_dropped_by_a_dead_merge_still_hides_the_older_value(
+    tmp_path: Path, compacting_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The criterion's headline: the deleted key reads as absent after the restart.
+
+    The log is trimmed so that the answer can only come from the tables, which is
+    where the resurrection would be: the newer source table's tombstone is the
+    last record of the delete on disk, and the older source table still holds the
+    value underneath it. An engine that had retired either of them, or that had
+    loaded them in the wrong order, hands back the value here.
+    """
+    directory = tmp_path / "data"
+    tombstone_dropped_mid_compaction(compacting_engine, directory)
+    trim_log(directory)
+
+    with LedgerLog(directory) as restarted:
+        assert len(restarted.sstables) == 2
+        assert restarted.get(b"doomed-key") is None, "a dead compaction resurrected a deleted key"
+        assert restarted.get(b"survivor") == b"kept"
+
+
+def test_the_tombstone_and_the_value_it_shadows_are_both_still_on_the_disk(
+    tmp_path: Path, compacting_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """Why the answer above is right: neither source table was retired by the dead swap.
+
+    Read out of the files rather than through an engine, so what is being checked
+    is the state the crash left and not an engine's reading of it. The tombstone
+    is in the newer table and the value is in the older one, which is the pair
+    the read path resolves to "absent".
+    """
+    directory = tmp_path / "data"
+    tombstone_dropped_mid_compaction(compacting_engine, directory)
+
+    newer, older = sstable_paths_in(directory)
+    assert (b"doomed-key", None) in sstable_records(newer)
+    assert (b"doomed-key", b"value") in sstable_records(older)
+
+
+def test_a_delete_a_dead_merge_dropped_stays_deleted_through_the_next_compaction(
+    tmp_path: Path, compacting_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The delete survives the restart and the compaction the crash interrupted.
+
+    The merge is run again on the recovered engine, this time to completion, and
+    it drops the tombstone the same way the dead one did. That is the safe drop
+    rather than the dangerous one: the value it was shadowing goes with it in the
+    same merge, so after the swap there is no record of the key anywhere and the
+    read is still correct.
+    """
+    directory = tmp_path / "data"
+    tombstone_dropped_mid_compaction(compacting_engine, directory)
+    discard_partial_tables(directory)
+    trim_log(directory)
+
+    with LedgerLog(directory) as restarted:
+        tier, destination = tier_of_everything(restarted, directory)
+    compact_tier(tier, destination, other_tables=())
+
+    with LedgerLog(directory) as merged:
+        assert [handle.path for handle in merged.sstables] == [destination]
+        assert merged.get(b"doomed-key") is None, "a completed compaction resurrected the key"
+        assert merged.get(b"survivor") == b"kept"
+        assert [key for key, _ in sstable_records(destination)] == sorted(
+            [b"merge-marker-0", b"merge-marker-1", b"survivor"]
+        )
