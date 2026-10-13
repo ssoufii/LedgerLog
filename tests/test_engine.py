@@ -83,6 +83,7 @@ from ledgerlog.sstable import (
     SSTableWriter,
     inspect_sstable,
     is_complete_sstable,
+    is_temp_table_path,
     iter_records,
     read_footer,
     write_sstable,
@@ -1256,10 +1257,22 @@ class _KilledEngine:
     which is exactly the code path a crash does not take. SIGKILL cannot be
     caught, blocked, or handled, so there is no clean shutdown to accidentally
     depend on.
+
+    ``source`` and ``arguments`` are what let a story drive a different child
+    without a second copy of this harness: story M9.3's child patches its own
+    SSTable writer so that it can die at a chosen point inside a flush, and
+    takes its memtable threshold on the command line. The defaults are the plain
+    stdin-driven engine the kill tests for story M3.2 use.
     """
 
-    def __init__(self, directory: Path, script: Path) -> None:
-        script.write_text(_CHILD_SOURCE)
+    def __init__(
+        self,
+        directory: Path,
+        script: Path,
+        source: str = _CHILD_SOURCE,
+        arguments: tuple[str, ...] = (),
+    ) -> None:
+        script.write_text(source)
         source_root = str(Path(ledgerlog.__file__).resolve().parent.parent)
         environment = dict(os.environ)
         existing = environment.get("PYTHONPATH")
@@ -1267,7 +1280,7 @@ class _KilledEngine:
             source_root if not existing else os.pathsep.join([source_root, existing])
         )
         self._process = subprocess.Popen(
-            [sys.executable, str(script), str(directory)],
+            [sys.executable, str(script), str(directory), *arguments],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             text=True,
@@ -1299,6 +1312,36 @@ class _KilledEngine:
         """Kill the child outright and wait for the operating system to reap it."""
         os.kill(self._process.pid, signal.SIGKILL)
         assert self._process.wait(timeout=30) != 0, "the child exited cleanly instead of dying"
+
+    def run_until_it_dies(self, command: str, *, timeout: float = 60.0) -> None:
+        """Send one operation the child is meant to die of, and wait for the corpse.
+
+        The counterpart to :meth:`run` for a command the child is not expected to
+        survive (story M9.3 arranges one that SIGKILLs itself partway through a
+        flush). The acknowledgement is what must *not* arrive: a child that
+        answered would mean the operation ran to completion, so the crash the
+        test is built on never happened and every assertion after it would be
+        measuring an ordinary shutdown.
+
+        The status is checked for being that signal rather than merely for being
+        a failure, because the two differ in exactly the way these tests depend
+        on: a child that raised would exit through Python's teardown, flushing
+        the buffers and closing the files that a crash leaves as they were, and
+        would leave a directory a test could mistake for the real thing.
+        """
+        assert self._process.stdin is not None
+        self._process.stdin.write(command + "\n")
+        try:
+            self._process.stdin.flush()
+        except BrokenPipeError:
+            # The child can die before the write reaches it, which is the
+            # outcome being asked for rather than a failure to ask for it.
+            pass
+
+        status = self._process.wait(timeout=timeout)
+        assert status == -signal.SIGKILL, (
+            f"the child did not die of a SIGKILL during {command!r}, exit status {status}"
+        )
 
     def close(self) -> None:
         """Make sure the child is gone, whatever the test did or did not do."""
@@ -5352,3 +5395,594 @@ def test_concurrent_readers_see_the_loaded_tables_while_a_writer_works(tmp_path:
 
         assert wrong == [], f"concurrent reads of the loaded tables disagreed: {wrong[:5]}"
         assert second.get(b"written00000") == b"value", "the writer's records are not readable"
+
+
+# ---------------------------------------------------------------------------
+# Story M9.3: a crash during a flush, taken from both sides of the footer.
+#
+# The story names two moments, and the footer is the line between them: the
+# records are in the log and the footer is not yet written, or the footer is
+# written and nothing has cleaned the log up afterwards. ARCHITECTURE.md section
+# 6 is what makes the footer the line, since a table only counts as existing
+# once its footer does.
+#
+# Both moments need a crash that ran no cleanup, and the first one needs it to
+# land on a chosen instruction. A SIGKILL from the parent gives the first but
+# cannot aim, so the child here kills itself: it replaces
+# ``SSTableWriter.finish`` with one that sends its own process a SIGKILL before
+# the real method runs. ``finish`` is where the index, the bloom filter and the
+# footer are written and where the finished file is renamed into place, so a
+# child killed on the way into it leaves the temporary file the writer streams
+# to, no committed table at all, and a log holding every write it acknowledged.
+# That is the first moment exactly, with no sleeping and no race to lose.
+#
+# The second moment needs no hook, because the engine is permanently in it:
+# nothing trims the log after a flush yet (``engine.py``, "What a flush still
+# does not do"), so a committed flush is always a flush whose records are still
+# in the log. The child flushes, the parent waits for the acknowledgement that
+# the footer is down, and then kills it.
+#
+# What "exactly once" and "not duplicated" are measured as, since this engine
+# has no way to enumerate its keys and a flushed record is deliberately in two
+# places at once:
+#
+# * Within a layer, by counting records rather than reading values. The
+#   committed table must hold one record per key, and the replay must apply one
+#   record per write that was acknowledged. A recovery doing arithmetic on each
+#   pass would show up here as a count that is too high.
+# * Across layers, by what a read answers. One value per key, from the newest
+#   layer holding it, which is the copy in the log shadowing the copy in the
+#   table rather than doubling it. A record in both places is what the roadmap
+#   asks for until the log is trimmed, and ``engine.py`` works through why it is
+#   harmless: a read stops at the first layer that holds the key.
+# * Across restarts, by reopening the same directory twice and asserting the
+#   table count, the table's records and the replay count do not move. That is
+#   the shape real duplication would take, a directory that grows every time it
+#   is recovered.
+#
+# The restarted engines take the default memtable threshold deliberately. A
+# restart whose threshold the replayed batch crosses would freeze that memtable
+# and flush it again, writing the same records into a second table, and that is
+# the known price of a log nothing trims, not a bug for this story to catch. A
+# test asserting on it would be asserting on its own choice of threshold.
+# ---------------------------------------------------------------------------
+
+
+_FLUSH_CHILD_SOURCE = """
+import os
+import signal
+import sys
+
+from ledgerlog import LedgerLog
+from ledgerlog.sstable import SSTableWriter
+
+real_finish = SSTableWriter.finish
+die_before_footer = False
+
+
+def finish(self):
+    if die_before_footer:
+        os.kill(os.getpid(), signal.SIGKILL)
+    return real_finish(self)
+
+
+SSTableWriter.finish = finish
+
+threshold = int(sys.argv[2])
+engine = LedgerLog(
+    sys.argv[1],
+    fsync_policy="always",
+    memtable_threshold_bytes=threshold,
+    flush_in_background=False,
+)
+
+for line in sys.stdin:
+    command = line.strip()
+    if not command:
+        continue
+    kind, _, argument = command.partition(" ")
+    if kind == "put":
+        key, _, value = argument.partition("=")
+        engine.put(key.encode(), value.encode())
+    elif kind == "delete":
+        engine.delete(argument.encode())
+    elif kind == "freeze":
+        engine.put(argument.encode(), b"x" * threshold)
+    elif kind == "flush":
+        engine.flush_pending()
+    elif kind == "diebeforefooter":
+        die_before_footer = True
+    else:
+        raise SystemExit("unknown command: " + command)
+    print("done " + command, flush=True)
+"""
+"""A child engine that flushes when it is told to, and can die inside the flush.
+
+Three differences from ``_CHILD_SOURCE`` above, each one a thing these tests
+have to control.
+
+``flush_in_background=False``, because a background flusher would commit the
+table the moment the freeze woke it and there would be no window left to crash
+in. Here nothing is written until the parent says ``flush``, so the parent
+decides which side of the footer the crash lands on.
+
+``freeze <key>`` writes one record whose value is the whole memtable threshold,
+which pushes the active table over the line and freezes it with the batch
+inside. The engine has no public "freeze now", and a record big enough to fill
+the table is how the rest of this file asks for one. The marker is a real write
+and is counted as one everywhere below.
+
+``diebeforefooter`` arms the patched ``finish``. Arming it is a separate command
+from the flush that trips it so that the arming is acknowledged, which leaves no
+doubt about what the child had done when it died.
+"""
+
+
+_FLUSH_CHILD_THRESHOLD = 4096
+"""Payload bytes the child's memtable holds before it freezes.
+
+Large enough that a batch of short records stays comfortably inside one table,
+so a batch freezes exactly once, when the marker asks it to, and the flush under
+test writes one table rather than a handful.
+"""
+
+
+_FREEZE_MARKER = "freeze-marker"
+"""Key of the oversized record that freezes the child's memtable on demand."""
+
+
+@pytest.fixture
+def flushing_engine(tmp_path: Path) -> Iterator[Callable[[Path], _KilledEngine]]:
+    """Factory for child engines that flush on command, each cleaned up afterwards."""
+    children: list[_KilledEngine] = []
+
+    def start(directory: Path) -> _KilledEngine:
+        child = _KilledEngine(
+            directory,
+            tmp_path / f"flush_child_{len(children)}.py",
+            source=_FLUSH_CHILD_SOURCE,
+            arguments=(str(_FLUSH_CHILD_THRESHOLD),),
+        )
+        children.append(child)
+        return child
+
+    try:
+        yield start
+    finally:
+        for child in children:
+            child.close()
+
+
+def temp_table_paths(directory: Path) -> list[Path]:
+    """Every file in ``directory`` named the way a flush in progress names its output.
+
+    By name, like :func:`sstable_paths_in`, and for a sharper reason here: the
+    temporary name is deliberately one discovery does not match, so an engine
+    would not report these files at all and a test asking an engine could not
+    tell debris from an empty directory.
+    """
+    return sorted(path for path in directory.iterdir() if is_temp_table_path(path))
+
+
+def crash_batch(count: int = 12) -> list[tuple[bytes, bytes]]:
+    """The keys and values that make up the batch of writes a crash interrupts here.
+
+    Short records on purpose: the whole batch has to fit in one memtable under
+    the child's threshold, so that it freezes once, when the marker asks it to,
+    and the interrupted flush is one table rather than several.
+    """
+    return [(f"key-{index:04d}".encode(), f"value-{index:04d}".encode()) for index in range(count)]
+
+
+def put_commands(pairs: Iterable[tuple[bytes, bytes]]) -> list[str]:
+    """The child commands that write ``pairs``, one put each."""
+    return [f"put {key.decode()}={value.decode()}" for key, value in pairs]
+
+
+def kill_before_footer(
+    start: Callable[[Path], _KilledEngine], directory: Path, commands: Iterable[str]
+) -> None:
+    """Run ``commands`` through a child, then kill it inside the flush, before the footer.
+
+    Returns with the child dead, its log holding every command it acknowledged
+    plus the freeze marker, and its directory holding a partial table that no
+    footer committed.
+    """
+    child = start(directory)
+    for command in commands:
+        child.run(command)
+    child.run(f"freeze {_FREEZE_MARKER}")
+    child.run("diebeforefooter")
+    child.run_until_it_dies("flush")
+
+
+def kill_after_footer(
+    start: Callable[[Path], _KilledEngine], directory: Path, commands: Iterable[str]
+) -> None:
+    """Run ``commands`` through a child, let the flush commit, then kill it.
+
+    The acknowledgement of the flush is what makes this the other side of the
+    footer: the child only answers once :meth:`LedgerLog.flush_pending` has
+    returned, which is after the footer is on the disk and the file has been
+    renamed into place.
+    """
+    child = start(directory)
+    for command in commands:
+        child.run(command)
+    child.run(f"freeze {_FREEZE_MARKER}")
+    child.run("flush")
+    child.kill()
+
+
+def replayed_keys(engine: LedgerLog) -> list[bytes]:
+    """Every key the replay left in a restarted engine's active memtable.
+
+    Reaches for ``engine._memtable``, marked here as it is elsewhere in this
+    file: the point of these tests is how many records came back, and ``get``
+    answers that question for one key at a time and cannot tell one record from
+    two for the same key.
+    """
+    return [entry.key for entry in engine._memtable.entries()]
+
+
+# Acceptance criterion 1: a crash after the batch is logged and before the
+# footer lands recovers every one of those writes, exactly once, from the log.
+
+
+def test_a_kill_before_the_footer_commits_no_table(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The crash really was mid-flush: debris at the temporary name, nothing committed.
+
+    This is the premise every other test in this half rests on, so it is checked
+    on its own. A child that died before the flush started, or after it finished,
+    would leave a directory that fails one of these two assertions.
+    """
+    directory = tmp_path / "data"
+    kill_before_footer(flushing_engine, directory, put_commands(crash_batch()))
+
+    assert sstable_paths_in(directory) == [], "a table was committed despite the crash"
+    assert temp_table_paths(directory), "the flush left no partial table, so it never started"
+
+
+def test_every_write_logged_before_a_kill_mid_flush_comes_back(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The criterion's headline: the batch survives a flush that died before its footer."""
+    directory = tmp_path / "data"
+    pairs = crash_batch()
+    kill_before_footer(flushing_engine, directory, put_commands(pairs))
+
+    with LedgerLog(directory) as restarted:
+        for key, value in pairs:
+            assert restarted.get(key) == value
+
+
+def test_a_batch_killed_before_the_footer_is_recovered_from_the_log_alone(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """Recovered "via WAL replay", which means no table answered any of it.
+
+    The engine adopts no table, and the replay accounts for every write the child
+    acknowledged: the batch plus the marker that froze it. An engine that had
+    somehow adopted the partial file would still pass the test above, since the
+    log holds the same records.
+    """
+    directory = tmp_path / "data"
+    pairs = crash_batch()
+    kill_before_footer(flushing_engine, directory, put_commands(pairs))
+
+    with LedgerLog(directory) as restarted:
+        assert restarted.sstables == ()
+        assert restarted.recovery.records_replayed == len(pairs) + 1
+        assert restarted.recovery.is_intact, "the log lost a tail it should not have"
+
+
+def test_each_write_killed_before_the_footer_comes_back_exactly_once(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """One record per key in the recovered memtable, not one per replay step.
+
+    Counted rather than read, because a replay that applied every record twice
+    would leave every value correct and would be wrong anyway.
+    """
+    directory = tmp_path / "data"
+    pairs = crash_batch()
+    kill_before_footer(flushing_engine, directory, put_commands(pairs))
+
+    with LedgerLog(directory) as restarted:
+        keys = replayed_keys(restarted)
+        assert keys == sorted(keys), "the recovered memtable is not in key order"
+        assert len(keys) == len(set(keys)), "a key came back as more than one record"
+        assert set(keys) == {key for key, _ in pairs} | {_FREEZE_MARKER.encode()}
+
+
+def test_an_overwrite_killed_before_the_footer_comes_back_as_its_last_value(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """Two logged writes for one key collapse back into one record, the newer one.
+
+    The replay reads both records, so this is where a recovery that appended
+    instead of overwriting would show itself.
+    """
+    directory = tmp_path / "data"
+    kill_before_footer(
+        flushing_engine, directory, ["put shared=first", "put other=kept", "put shared=second"]
+    )
+
+    with LedgerLog(directory) as restarted:
+        assert restarted.get(b"shared") == b"second"
+        assert restarted.get(b"other") == b"kept"
+        assert replayed_keys(restarted).count(b"shared") == 1
+
+
+def test_a_delete_killed_before_the_footer_is_still_a_delete(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """A logged delete comes back as a tombstone, not as the value it replaced.
+
+    Checked at the memtable as well as through ``get``, because with no table
+    underneath it a recovery that dropped the delete record entirely would also
+    answer ``None`` here, for the wrong reason.
+    """
+    directory = tmp_path / "data"
+    kill_before_footer(
+        flushing_engine, directory, ["put doomed=value", "put kept=value", "delete doomed"]
+    )
+
+    with LedgerLog(directory) as restarted:
+        assert restarted.get(b"doomed") is None
+        assert restarted.get(b"kept") == b"value"
+        entry = restarted._memtable.lookup(b"doomed")
+        assert entry is not None and entry.is_tombstone
+
+
+def test_the_partial_table_a_dead_flush_left_is_passed_over_and_left_alone(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """Startup neither adopts the debris nor reports it as a damaged table, nor deletes it.
+
+    Not rejected, because the temporary name is not a candidate in the first
+    place (story M9.1), and a startup that counted it among the files it threw
+    out would be telling an operator its directory holds corruption when it holds
+    a flush that did not finish. It is left where it is for the same reason M9.1
+    leaves a damaged table alone: deciding what to delete is not recovery's job.
+    """
+    directory = tmp_path / "data"
+    kill_before_footer(flushing_engine, directory, put_commands(crash_batch()))
+    debris = temp_table_paths(directory)
+    before = {path: path.read_bytes() for path in debris}
+
+    with LedgerLog(directory) as restarted:
+        assert restarted.discovery.tables == ()
+        assert restarted.discovery.rejected == ()
+
+    assert temp_table_paths(directory) == debris
+    assert {path: path.read_bytes() for path in debris} == before
+
+
+def test_a_kill_with_a_frozen_table_and_no_flush_started_recovers_the_batch(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The same criterion one step earlier, where the flush never began at all.
+
+    "Before the footer is written" covers a crash with the table frozen and no
+    file open yet, and that case has a different way to fail: there is no partial
+    output to notice, so an engine that recovered from its files rather than its
+    log would come back empty rather than come back wrong.
+    """
+    directory = tmp_path / "data"
+    pairs = crash_batch()
+    child = flushing_engine(directory)
+    for command in put_commands(pairs):
+        child.run(command)
+    child.run(f"freeze {_FREEZE_MARKER}")
+    child.kill()
+
+    assert sstable_paths_in(directory) == []
+    assert temp_table_paths(directory) == []
+
+    with LedgerLog(directory) as restarted:
+        for key, value in pairs:
+            assert restarted.get(key) == value
+        assert restarted.sstables == ()
+        assert restarted.recovery.records_replayed == len(pairs) + 1
+
+
+def test_a_flush_after_the_restart_writes_each_recovered_write_once(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The recovered batch is flushable, and the table it produces holds each key once.
+
+    The crash interrupted a flush, so the next flush of those records is the one
+    that has to come out right. It is driven here through the public API, with an
+    oversized record to cross the default threshold, the same way the child
+    freezes its own table.
+    """
+    directory = tmp_path / "data"
+    pairs = crash_batch()
+    kill_before_footer(flushing_engine, directory, put_commands(pairs))
+
+    with LedgerLog(directory, flush_in_background=False) as restarted:
+        restarted.put(b"second-marker", b"x" * restarted.memtable_threshold_bytes)
+        written = restarted.flush_pending()
+        assert len(written) == 1
+
+    records = sstable_records(written[0].path)
+    keys = [key for key, _ in records]
+    assert keys == sorted(keys)
+    assert len(keys) == len(set(keys)), "a key was written to the table twice"
+    assert set(keys) == {key for key, _ in pairs} | {_FREEZE_MARKER.encode(), b"second-marker"}
+    assert all(value == dict(records)[key] for key, value in pairs), (
+        "a recovered value changed on its way into the table"
+    )
+
+
+# Acceptance criterion 2: a crash after the footer is written and before
+# anything trimmed the log leaves the writes present once, not twice.
+
+
+def test_a_kill_after_the_footer_keeps_the_table_the_flush_committed(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The premise of this half: one committed table on disk, and it is adopted."""
+    directory = tmp_path / "data"
+    pairs = crash_batch()
+    kill_after_footer(flushing_engine, directory, put_commands(pairs))
+
+    assert len(sstable_paths_in(directory)) == 1
+    assert temp_table_paths(directory) == [], "a committed flush left its temporary file behind"
+
+    with LedgerLog(directory) as restarted:
+        assert len(restarted.sstables) == 1
+        for key, value in pairs:
+            assert restarted.get(key) == value
+
+
+def test_the_table_a_committed_flush_left_holds_each_key_once(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """Duplication inside the table, measured against the footer's own count.
+
+    Read from the file rather than through the engine, so what is counted is what
+    the dead process actually wrote.
+    """
+    directory = tmp_path / "data"
+    pairs = crash_batch()
+    kill_after_footer(flushing_engine, directory, put_commands(pairs))
+
+    path = sstable_paths_in(directory)[0]
+    records = sstable_records(path)
+    keys = [key for key, _ in records]
+    assert keys == sorted(keys)
+    assert len(keys) == len(set(keys)), "the table holds a key twice"
+    assert set(keys) == {key for key, _ in pairs} | {_FREEZE_MARKER.encode()}
+
+    with open(path, "rb") as handle:
+        assert read_footer(handle).record_count == len(records)
+
+
+def test_the_log_a_committed_flush_did_not_trim_replays_each_record_once(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The log still holds the flushed batch, and the replay applies it once.
+
+    Nothing trims the log yet, so this is the criterion's "before WAL cleanup"
+    state in full. The replay count is the batch plus its marker, not twice
+    either, and the memtable it lands in holds one record per key.
+    """
+    directory = tmp_path / "data"
+    pairs = crash_batch()
+    kill_after_footer(flushing_engine, directory, put_commands(pairs))
+
+    with LedgerLog(directory) as restarted:
+        assert restarted.recovery.records_replayed == len(pairs) + 1
+        assert restarted.recovery.is_intact
+        keys = replayed_keys(restarted)
+        assert len(keys) == len(set(keys))
+        assert set(keys) == {key for key, _ in pairs} | {_FREEZE_MARKER.encode()}
+
+
+def test_a_key_in_both_the_table_and_the_log_answers_with_one_value(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """Two copies of a record are a shadow, not a duplicate: the read stops at the first.
+
+    Both layers are checked for holding the key, so the test is making the claim
+    about an engine that really is carrying the record twice, which is the state
+    a crash in this window leaves and will be until the log is trimmed.
+    """
+    directory = tmp_path / "data"
+    pairs = crash_batch()
+    kill_after_footer(flushing_engine, directory, put_commands(pairs))
+    key, value = pairs[0]
+
+    with LedgerLog(directory) as restarted:
+        assert restarted._memtable.lookup(key) is not None, "the log did not replay the key"
+        with restarted.sstables[0].borrow_reader() as reader:
+            record = reader.lookup(key)
+        assert record is not None and record.value == value, "the table does not hold the key"
+        assert restarted.get(key) == value
+
+
+def test_a_restart_after_a_committed_flush_does_not_flush_it_again(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The replayed records sit in an active memtable, with nothing frozen behind them.
+
+    A startup that handed the replay to the flush path would write the committed
+    batch into a second table under a second sequence number, which is the one
+    way a restart in this window could duplicate the writes on disk.
+    """
+    directory = tmp_path / "data"
+    kill_after_footer(flushing_engine, directory, put_commands(crash_batch()))
+    before = sstable_paths_in(directory)
+
+    with LedgerLog(directory, flush_in_background=False) as restarted:
+        assert restarted.frozen_memtables == ()
+        assert restarted.flush_pending() == ()
+        assert len(restarted.sstables) == 1
+
+    assert sstable_paths_in(directory) == before
+
+
+def test_opening_a_directory_recovered_once_again_changes_nothing(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """Recovery is idempotent, which is what rules out duplication that accumulates.
+
+    A restart that duplicated anything would do it again on the next restart, so
+    the counts are compared across two openings of the same directory rather
+    than being asserted once against a number this test chose.
+    """
+    directory = tmp_path / "data"
+    pairs = crash_batch()
+    kill_after_footer(flushing_engine, directory, put_commands(pairs))
+    path = sstable_paths_in(directory)[0]
+    records = sstable_records(path)
+
+    for _ in range(2):
+        with LedgerLog(directory) as restarted:
+            assert len(restarted.sstables) == 1
+            assert restarted.recovery.records_replayed == len(pairs) + 1
+            for key, value in pairs:
+                assert restarted.get(key) == value
+        assert sstable_paths_in(directory) == [path]
+        assert sstable_records(path) == records
+
+
+def test_a_delete_committed_by_the_flush_is_not_resurrected_by_the_replay(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """The tombstone is in the table and in the log, and the key stays deleted.
+
+    The put and the delete are both replayed, in that order, over a table that
+    already holds the tombstone. A recovery that replayed them in any other order,
+    or that let the older put outlive the delete, would resurrect the key here.
+    """
+    directory = tmp_path / "data"
+    kill_after_footer(
+        flushing_engine, directory, ["put doomed=value", "put kept=value", "delete doomed"]
+    )
+
+    path = sstable_paths_in(directory)[0]
+    assert (b"doomed", None) in sstable_records(path)
+
+    with LedgerLog(directory) as restarted:
+        assert restarted.get(b"doomed") is None
+        assert restarted.get(b"kept") == b"value"
+
+
+def test_an_overwrite_committed_by_the_flush_reads_as_its_newest_value(
+    tmp_path: Path, flushing_engine: Callable[[Path], _KilledEngine]
+) -> None:
+    """One record for an overwritten key in the table, and the same value after the replay."""
+    directory = tmp_path / "data"
+    kill_after_footer(flushing_engine, directory, ["put shared=first", "put shared=second"])
+
+    path = sstable_paths_in(directory)[0]
+    assert [key for key, _ in sstable_records(path)].count(b"shared") == 1
+    assert (b"shared", b"second") in sstable_records(path)
+
+    with LedgerLog(directory) as restarted:
+        assert restarted.get(b"shared") == b"second"
