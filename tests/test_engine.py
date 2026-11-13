@@ -1591,6 +1591,62 @@ def test_a_threshold_below_one_byte_is_rejected(tmp_path: Path, threshold: int) 
         LedgerLog(tmp_path / "data", memtable_threshold_bytes=threshold)
 
 
+def test_the_table_tunables_default_to_the_module_defaults(engine: LedgerLog) -> None:
+    """A caller who names neither gets the defaults story M10.4 chose, through one path."""
+    assert engine.index_interval == sstable_module.DEFAULT_INDEX_INTERVAL
+    assert engine.bloom_false_positive_rate == sstable_module.DEFAULT_BLOOM_FALSE_POSITIVE_RATE
+
+
+def test_the_configured_table_tunables_are_reported(tmp_path: Path) -> None:
+    """A benchmark sweeping these has to be able to read back what a table was written under."""
+    with LedgerLog(tmp_path / "data", index_interval=16, bloom_false_positive_rate=0.05) as engine:
+        assert engine.index_interval == 16
+        assert engine.bloom_false_positive_rate == 0.05
+
+
+@pytest.mark.parametrize("interval", [0, -4])
+def test_a_bad_index_interval_is_rejected_at_construction(tmp_path: Path, interval: int) -> None:
+    """A flush runs on a background thread, so the bad value is caught before the thread can.
+
+    Rejected by the constructor rather than surfacing as a stored flush error on
+    some later call, which is the whole reason the engine validates it itself
+    rather than leaving it to the writer.
+    """
+    with pytest.raises(ValueError, match="index_interval"):
+        LedgerLog(tmp_path / "data", index_interval=interval)
+
+
+@pytest.mark.parametrize("rate", [0.0, 1.0, -0.1])
+def test_a_bad_bloom_rate_is_rejected_at_construction(tmp_path: Path, rate: float) -> None:
+    """Same reasoning as the index interval: caught at open, not on a later background flush."""
+    with pytest.raises(ValueError, match="bloom_false_positive_rate"):
+        LedgerLog(tmp_path / "data", bloom_false_positive_rate=rate)
+
+
+def test_flushed_tables_carry_the_engine_s_index_interval(tmp_path: Path) -> None:
+    """The tunable has to reach the table on disk, not just sit on the engine.
+
+    A table of R records written at interval N carries ceil(R / N) sparse index
+    entries. Writing enough records to flush at a small threshold and a small
+    interval and then counting those entries is how we know the flush path used
+    the engine's cadence and not the writer's default.
+    """
+    with LedgerLog(
+        tmp_path / "data",
+        fsync_policy=FsyncPolicy.NEVER,
+        memtable_threshold_bytes=1024,
+        index_interval=4,
+    ) as engine:
+        for i in range(400):
+            engine.put(f"k{i:05d}".encode(), b"v")
+        engine.flush_pending()
+        handles = engine.sstables
+        assert handles, "a flush should have produced at least one table"
+        for handle in handles:
+            with handle.borrow_reader() as reader:
+                assert len(reader.index.entries) == -(-reader.record_count // 4)
+
+
 def test_the_active_memtable_tracks_the_bytes_written_to_it(tmp_path: Path) -> None:
     with LedgerLog(tmp_path / "data", fsync_policy=FsyncPolicy.NEVER) as engine:
         engine.put(SMALL_KEY, b"value")

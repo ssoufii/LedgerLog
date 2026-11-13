@@ -251,16 +251,24 @@ allocate for a record nobody ever wrote. The writer refuses to produce anything
 larger, so a payload above this is damage by definition.
 """
 
-DEFAULT_INDEX_INTERVAL = 64
+DEFAULT_INDEX_INTERVAL = 32
 """Default number of records between two sparse index entries.
 
 The trade-off, per ARCHITECTURE.md section 3, is index size against the length
 of the forward scan a lookup pays after the binary search. Indexing one key in
-64 keeps the resident index roughly two orders of magnitude smaller than the
-table while bounding the scan at 63 records, which for the record sizes this
-engine targets is a small number of sequential bytes off a page or two. The real
-value belongs to the tuning spike in M10, which will pick it from measurements
-rather than from this reasoning.
+32 bounds that scan at 31 records while the resident index stays well under one
+percent of the table it indexes, even for a table far larger than any a single
+flush produces.
+
+Chosen from the M10.4 tuning spike (docs/TUNING.md) rather than from reasoning.
+The sweep measured median read latency across intervals of 16 through 512 on a
+100k-record dataset and found a sharp cliff above 64 (widening 64 to 128 lost
+about 94 microseconds of p50 for 0.3 fewer index bytes per record) and a gentle,
+near-linear trade below it. Thirty-two sits just inside that gentle region: it
+takes a real step down from the old default of 64 (p50 about 0.20 ms to 0.17 ms,
+p99 about 0.50 ms to 0.42 ms) for an index that is still a negligible fraction
+of the table, and stops short of 16, whose further latency gain no longer
+justified doubling the index again.
 """
 
 DEFAULT_BLOOM_FALSE_POSITIVE_RATE = 0.01
@@ -271,9 +279,15 @@ query. The trade-off, per ARCHITECTURE.md section 3, is the size of the filter
 against how often a read opens a table that cannot hold the key: halving the
 rate costs roughly another 1.44 bits per key, and each halving saves half of an
 already small number of wasted lookups, so the returns fall off quickly on the
-accuracy side while the memory cost keeps climbing linearly. Like the index
-interval above, the real value belongs to the M10 tuning spike, which will pick
-it from a measured read amplification rather than from this reasoning.
+accuracy side while the memory cost keeps climbing linearly.
+
+Confirmed by the M10.4 tuning spike (docs/TUNING.md) rather than kept on faith.
+Measured in the compacted steady state a running engine lives in, one in a
+hundred is the knee: loosening it to one in twenty raised the mean tables a read
+searched from about 1.02 to 1.08, while tightening it to one in two hundred
+bought only about 0.007 fewer tables per read for almost half a bit per key
+again. The spike left this default where it was because the measurement put it
+at the knee, not because it went unexamined.
 """
 
 
@@ -1433,8 +1447,8 @@ class SSTableWriter:
         it. ``ledgerlog.bloom`` is what enforces the rule; this repeats its range
         so the report arrives at the useful moment.
         """
-        self._index_interval = _validate_index_interval(index_interval)
-        self._bloom_rate = _validate_false_positive_rate(bloom_false_positive_rate)
+        self._index_interval = validate_index_interval(index_interval)
+        self._bloom_rate = validate_bloom_false_positive_rate(bloom_false_positive_rate)
         self._expected_keys = _validate_expected_keys(expected_keys)
         # Either a filter that is already sized and takes keys as they arrive, or
         # no filter and a list of the keys to size one from at finish. Never
@@ -1709,13 +1723,19 @@ class SSTableWriter:
         self.discard()
 
 
-def _validate_index_interval(index_interval: int) -> int:
+def validate_index_interval(index_interval: int) -> int:
     """Return ``index_interval`` if it is a usable cadence, else raise ``ValueError``.
 
     Checked in the constructor rather than at the first record: an interval of
     zero would divide by zero partway through a flush, and a negative one would
     index nothing at all, and both are easier to understand as a rejected
     argument than as a failure halfway through writing a table.
+
+    Public rather than module-private because the engine takes this cadence as a
+    constructor argument (story M10.4) and has to apply the same rule hours
+    before it writes a table: its flushes run on a background thread, where a
+    rejected argument would surface as a stored flush error rather than as a
+    failure to open. One function so the two cannot drift apart.
     """
     if not isinstance(index_interval, int) or isinstance(index_interval, bool):
         raise TypeError(f"index_interval must be an int, got {type(index_interval).__name__}")
@@ -1740,12 +1760,15 @@ def _validate_expected_keys(expected_keys: int | None) -> int | None:
     return expected_keys
 
 
-def _validate_false_positive_rate(rate: float) -> float:
+def validate_bloom_false_positive_rate(rate: float) -> float:
     """Return ``rate`` if a filter can be sized for it, else raise.
 
     The same range ``ledgerlog.bloom`` enforces, checked early: zero makes the
     sizing formula diverge and one means every query is a false positive, which
     is the same as carrying no filter at all.
+
+    Public for the reason :func:`validate_index_interval` is, and used by the
+    engine on the same constructor argument.
     """
     if not isinstance(rate, (int, float)) or isinstance(rate, bool):
         raise TypeError(f"bloom_false_positive_rate must be a float, got {type(rate).__name__}")

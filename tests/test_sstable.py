@@ -287,6 +287,21 @@ def test_sparse_index_holds_every_nth_key_only(
             assert record.key == entry.key
 
 
+def test_the_default_index_interval_is_the_value_the_m10_spike_chose() -> None:
+    """Pins the default so the M10.4 measurement behind it (docs/TUNING.md) cannot silently rot.
+
+    Thirty-two, not the pre-spike 64: the sweep found the read-latency cliff
+    above 64 and a negligible index cost at 32. If someone changes this, the
+    writeup that justifies it has to change with it.
+    """
+    assert DEFAULT_INDEX_INTERVAL == 32
+
+
+def test_the_default_bloom_rate_is_the_value_the_m10_spike_kept() -> None:
+    """One in a hundred, confirmed as the knee by the M10.4 sweep (docs/TUNING.md)."""
+    assert DEFAULT_BLOOM_FALSE_POSITIVE_RATE == 0.01
+
+
 def test_default_index_interval_is_used_when_none_is_given(tmp_path: Path) -> None:
     record_count = DEFAULT_INDEX_INTERVAL * 2 + 1
     layout = write_sstable(

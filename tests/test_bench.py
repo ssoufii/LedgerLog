@@ -45,6 +45,9 @@ import pytest
 from ledgerlog import bench as bench_module
 from ledgerlog.bench import (
     AMPLIFICATION_DIRNAME,
+    COMPACTION_SCHEDULE_BULK,
+    COMPACTION_SCHEDULE_INCREMENTAL,
+    COMPACTION_SCHEDULES,
     DEFAULT_MAX_READS,
     DEFAULT_VALUE_SIZE_BYTES,
     KEY_INDEX_DIGITS,
@@ -69,7 +72,9 @@ from ledgerlog.bench import (
     nearest_rank_percentile,
     run_bench,
 )
+from ledgerlog.compaction import DEFAULT_MIN_TIER_TABLES, DEFAULT_SIZE_RATIO
 from ledgerlog.engine import DEFAULT_MEMTABLE_THRESHOLD_BYTES, LedgerLog
+from ledgerlog.sstable import DEFAULT_BLOOM_FALSE_POSITIVE_RATE, DEFAULT_INDEX_INTERVAL
 from ledgerlog.wal import FsyncPolicy
 
 # Small enough to keep the suite fast, large enough that the read phase draws a
@@ -1206,3 +1211,206 @@ def test_module_runs_the_amplification_phase_as_a_command(tmp_path) -> None:  # 
     assert "before compaction" in completed.stdout
     assert "after compaction" in completed.stdout
     assert "before -> after:" in completed.stdout
+
+
+# --------------------------------------------------------------------------
+# M10.4: the tuning knobs are part of the measurement, not baked into it
+# --------------------------------------------------------------------------
+
+
+def test_tuning_knobs_default_to_the_engine_defaults() -> None:
+    """A run that names no tunable measures the engine's own defaults, not the harness's."""
+    config = BenchConfig(records=1)
+
+    assert config.index_interval == DEFAULT_INDEX_INTERVAL
+    assert config.bloom_false_positive_rate == DEFAULT_BLOOM_FALSE_POSITIVE_RATE
+    assert config.size_ratio == DEFAULT_SIZE_RATIO
+    assert config.min_tier_tables == DEFAULT_MIN_TIER_TABLES
+    assert config.compaction_schedule == COMPACTION_SCHEDULE_BULK
+
+
+def test_tuning_knobs_round_trip_through_the_parser() -> None:
+    """A figure is only traceable if the printed invocation reproduces the tunables too."""
+    config = BenchConfig(
+        records=321,
+        index_interval=128,
+        bloom_false_positive_rate=0.005,
+        size_ratio=4.0,
+        min_tier_tables=6,
+        compaction_schedule=COMPACTION_SCHEDULE_INCREMENTAL,
+        read_amplification=True,
+    )
+
+    argv = config.command_line().removeprefix("python -m ledgerlog.bench").split()
+    reparsed = config_from_args(build_parser().parse_args(argv))
+
+    assert reparsed.index_interval == config.index_interval
+    assert reparsed.bloom_false_positive_rate == config.bloom_false_positive_rate
+    assert reparsed.size_ratio == config.size_ratio
+    assert reparsed.min_tier_tables == config.min_tier_tables
+    assert reparsed.compaction_schedule == config.compaction_schedule
+
+
+def test_the_tunables_are_printed_even_when_they_hold_the_defaults() -> None:
+    """Unlike the fsync interval, these are the values M10.4 moves, so they are always shown."""
+    printed = BenchConfig(records=1).command_line()
+
+    assert "--index-interval" in printed
+    assert "--bloom-fp-rate" in printed
+    assert "--size-ratio" in printed
+    assert "--min-tier-tables" in printed
+    assert "--compaction-schedule" in printed
+
+
+def test_tuning_knobs_appear_in_the_json() -> None:
+    """``--json`` carries the full configuration, the tunables included."""
+    payload = BenchConfig(records=1).to_dict()
+
+    assert payload["index_interval"] == DEFAULT_INDEX_INTERVAL
+    assert payload["bloom_false_positive_rate"] == DEFAULT_BLOOM_FALSE_POSITIVE_RATE
+    assert payload["size_ratio"] == DEFAULT_SIZE_RATIO
+    assert payload["min_tier_tables"] == DEFAULT_MIN_TIER_TABLES
+    assert payload["compaction_schedule"] == COMPACTION_SCHEDULE_BULK
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"index_interval": 0},
+        {"index_interval": -4},
+        {"bloom_false_positive_rate": 0.0},
+        {"bloom_false_positive_rate": 1.0},
+        {"size_ratio": 1.0},
+        {"min_tier_tables": 1},
+        {"compaction_schedule": "sometimes"},
+    ],
+)
+def test_bad_tunables_are_rejected_by_the_config(overrides: dict[str, object]) -> None:
+    """The harness rejects a value no engine could accept, with the same rules the engine uses."""
+    with pytest.raises(ValueError):
+        BenchConfig(records=1, **overrides)
+
+
+def test_cli_parses_every_tuning_knob() -> None:
+    """The four knobs and the schedule all reach the configuration from the command line."""
+    args = build_parser().parse_args(
+        [
+            "--records",
+            "10",
+            "--index-interval",
+            "256",
+            "--bloom-fp-rate",
+            "0.02",
+            "--size-ratio",
+            "3.0",
+            "--min-tier-tables",
+            "5",
+            "--compaction-schedule",
+            "incremental",
+        ]
+    )
+    config = config_from_args(args)
+
+    assert config.index_interval == 256
+    assert config.bloom_false_positive_rate == 0.02
+    assert config.size_ratio == 3.0
+    assert config.min_tier_tables == 5
+    assert config.compaction_schedule == COMPACTION_SCHEDULE_INCREMENTAL
+
+
+def test_cli_rejects_an_unknown_compaction_schedule() -> None:
+    """A typo in the schedule fails at the parser rather than silently running bulk."""
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["--records", "1", "--compaction-schedule", "lazy"])
+
+
+def test_schedule_names_are_the_two_the_cli_offers() -> None:
+    """The constant the parser is built from and the names used elsewhere cannot drift apart."""
+    assert set(COMPACTION_SCHEDULES) == {
+        COMPACTION_SCHEDULE_BULK,
+        COMPACTION_SCHEDULE_INCREMENTAL,
+    }
+
+
+def test_chosen_tables_are_written_with_the_run_s_index_interval(tmp_path: Path) -> None:
+    """A sweep measuring an interval must actually produce tables laid out at it."""
+    directory = tmp_path / "run"
+    run_bench(
+        _fast_config(
+            records=600,
+            memtable_threshold_bytes=2 * 1024,
+            index_interval=8,
+            directory=directory,
+        )
+    )
+
+    with LedgerLog(directory) as engine:
+        handles = engine.sstables
+        assert handles, "the run should have flushed at least one table"
+        for handle in handles:
+            # The footer does not record the interval, but the index it produced
+            # does: a table of R records written at interval N carries exactly
+            # ceil(R / N) entries, one per indexed key. At interval 8 that is far
+            # more entries than the default interval would leave, which is how a
+            # default-laid-out table (the bug this guards against) would show up.
+            with handle.borrow_reader() as reader:
+                expected = -(-reader.record_count // 8)
+                assert len(reader.index.entries) == expected
+
+
+def test_incremental_schedule_leaves_a_realistic_steady_state() -> None:
+    """Bulk merges everything into one table; incremental settles where a live engine would."""
+    bulk = run_bench(
+        _amplification_config(compaction_schedule=COMPACTION_SCHEDULE_BULK)
+    ).amplification
+    incremental = run_bench(
+        _amplification_config(compaction_schedule=COMPACTION_SCHEDULE_INCREMENTAL)
+    ).amplification
+
+    assert bulk is not None and incremental is not None
+    assert bulk.compaction.schedule == COMPACTION_SCHEDULE_BULK
+    assert incremental.compaction.schedule == COMPACTION_SCHEDULE_INCREMENTAL
+    # Both still describe one dataset and still reduce the tables a read searches.
+    assert incremental.after.records_on_disk == incremental.before.records_on_disk
+    assert incremental.reduced
+    # A finished directory compacted in bulk collapses to a single tier; the
+    # flush-by-flush schedule does not, which is why it is the one the size-tier
+    # knobs can move.
+    assert bulk.compaction.tables_after <= incremental.compaction.tables_after
+
+
+def test_min_tier_tables_trades_write_amplification_against_tables_searched() -> None:
+    """The size-tier trade-off the spike measured, pinned so the default's basis cannot rot."""
+    eager = run_bench(
+        _amplification_config(
+            compaction_schedule=COMPACTION_SCHEDULE_INCREMENTAL,
+            min_tier_tables=2,
+        )
+    ).amplification
+    lazy = run_bench(
+        _amplification_config(
+            compaction_schedule=COMPACTION_SCHEDULE_INCREMENTAL,
+            min_tier_tables=8,
+        )
+    ).amplification
+
+    assert eager is not None and lazy is not None
+    # Merging sooner (a lower threshold) rewrites more bytes to get there.
+    assert eager.compaction.bytes_rewritten > lazy.compaction.bytes_rewritten
+    assert eager.compaction.write_amplification > lazy.compaction.write_amplification
+
+
+def test_write_amplification_is_zero_when_nothing_was_flushed() -> None:
+    """The ratio is defined rather than a division by zero when the before side held no bytes."""
+    from ledgerlog.bench import CompactionSummary
+
+    summary = CompactionSummary(
+        passes=0,
+        tables_before=0,
+        tables_after=0,
+        bytes_before=0,
+        bytes_after=0,
+        elapsed_seconds=0.0,
+    )
+
+    assert summary.write_amplification == 0.0
