@@ -60,7 +60,7 @@ This milestone is a complete, durable, in-memory-only KV store. It's a good chec
 - [x] Tests: kill mid-flush, kill mid-compaction, restart and verify no data loss and no resurrection of deleted keys
 
 ## Milestone 10: benchmarking and polish
-- [ ] `ledgerlog.bench`: sequential write throughput, random read latency, read amplification (how many SSTables touched per read) before/after compaction
+- [x] `ledgerlog.bench`: sequential write throughput, random read latency, read amplification (how many SSTables touched per read) before/after compaction
 - [ ] Tune default sparse index interval, bloom filter false-positive rate, and size-tier thresholds based on bench results
 - [ ] README numbers reflect actual measured results, not estimates (measured after tuning, so they describe the final defaults)
 

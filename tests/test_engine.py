@@ -75,6 +75,7 @@ from ledgerlog.compaction import (
 )
 from ledgerlog.engine import (
     WAL_FILENAME,
+    ReadProbe,
     SSTableHandle,
     parse_sstable_sequence,
     sstable_filename,
@@ -6511,3 +6512,265 @@ def test_a_delete_a_dead_merge_dropped_stays_deleted_through_the_next_compaction
         assert [key for key, _ in sstable_records(destination)] == sorted(
             [b"merge-marker-0", b"merge-marker-1", b"survivor"]
         )
+
+
+# ---------------------------------------------------------------------------
+# Story M10.2: the read path can be asked what it did
+# ---------------------------------------------------------------------------
+#
+# The claim a ReadProbe makes is that it reports the tables a get searched, and
+# that this is not the number of tables the engine holds. So the tests here are
+# built to make those two numbers differ: several tables, and a key that only
+# one of them holds. A probe that was really counting tables rather than work
+# would pass none of them.
+
+
+def probing_engine(directory: Path, threshold: int) -> LedgerLog:
+    """An engine that freezes often and flushes on the calling thread.
+
+    Background flushing is off so that a test knows exactly how many tables
+    exist when it reads: a probe's counts are about the tables the walk found,
+    and a flush landing mid-test would change that number underneath it.
+    """
+    return LedgerLog(
+        directory,
+        fsync_policy=FsyncPolicy.NEVER,
+        memtable_threshold_bytes=threshold,
+        flush_in_background=False,
+    )
+
+
+def engine_with_several_tables(directory: Path, tables: int = 4) -> tuple[LedgerLog, list[bytes]]:
+    """Open an engine holding ``tables`` SSTables, and return it with the keys in them.
+
+    The keys come back in write order, so a caller can pick one it knows is in
+    the oldest table (the first) or in the newest (the last), which is the
+    difference the walk is supposed to make.
+    """
+    engine = probing_engine(directory, 256)
+    written: list[bytes] = []
+    for table_number in range(tables):
+        written.extend(fill_until_frozen(engine, prefix=f"t{table_number}/".encode()))
+    engine.flush_pending()
+    assert len(engine.sstables) == tables, "the fixture did not produce the tables it promised"
+    return engine, written
+
+
+def test_a_probe_counts_the_tables_a_read_searched_and_not_the_tables_held(
+    tmp_path: Path,
+) -> None:
+    """Criterion 1, in its sharpest form: four tables held, one table searched.
+
+    The key read here is in the newest table, so the walk finds it first and
+    stops. A count taken from ``engine.sstables`` would say four.
+    """
+    engine, written = engine_with_several_tables(tmp_path / "data")
+    with engine:
+        probe = ReadProbe()
+        assert engine.get(written[-1], probe=probe) == b"value"
+        assert len(engine.sstables) == 4
+        assert probe.sstables_consulted == 1
+        assert probe.gets == 1
+        assert probe.found_in_memory == 0
+
+
+def test_a_probe_counts_every_table_a_read_walked_past(tmp_path: Path) -> None:
+    """A key in the oldest table is searched for in the newest tables first.
+
+    Every table the walk passed is accounted for exactly once, either as
+    searched or as skipped by its bloom filter, and the table holding the key is
+    the last one searched.
+    """
+    engine, written = engine_with_several_tables(tmp_path / "data")
+    with engine:
+        probe = ReadProbe()
+        assert engine.get(written[0], probe=probe) == b"value"
+        assert probe.sstables_consulted + probe.sstables_skipped_by_bloom == 4
+        assert probe.sstables_consulted >= 1, "the table holding the key must have been searched"
+        assert probe.sstables_without_match == probe.sstables_consulted - 1
+
+
+def test_a_probe_reports_a_read_memory_answered_as_touching_no_table(tmp_path: Path) -> None:
+    """A key still in the active memtable costs no table at all."""
+    engine, _ = engine_with_several_tables(tmp_path / "data")
+    with engine:
+        engine.put(b"still-in-memory", b"fresh")
+        probe = ReadProbe()
+        assert engine.get(b"still-in-memory", probe=probe) == b"fresh"
+        assert probe.found_in_memory == 1
+        assert probe.sstables_consulted == 0
+        assert probe.sstables_skipped_by_bloom == 0
+
+
+def test_a_probe_reports_a_frozen_memtable_hit_as_memory_too(tmp_path: Path) -> None:
+    """A record frozen but not yet flushed is still memory, not a table."""
+    with probing_engine(tmp_path / "data", 256) as engine:
+        frozen_keys = fill_until_frozen(engine)
+        assert engine.frozen_memtables, "the fixture did not freeze a memtable"
+        probe = ReadProbe()
+        assert engine.get(frozen_keys[0], probe=probe) == b"value"
+        assert probe.found_in_memory == 1
+        assert probe.sstables_consulted == 0
+
+
+def test_a_probe_counts_a_key_no_table_holds_as_bloom_skips(tmp_path: Path) -> None:
+    """An absent key should cost hash probes rather than a scan per table.
+
+    The bloom filters may admit a table by mistake, which is what they are
+    allowed to do, so the assertion is that every table was accounted for and
+    that any table searched turned out to hold nothing.
+    """
+    engine, _ = engine_with_several_tables(tmp_path / "data")
+    with engine:
+        probe = ReadProbe()
+        assert engine.get(b"never-written", probe=probe) is None
+        assert probe.sstables_consulted + probe.sstables_skipped_by_bloom == 4
+        assert probe.sstables_without_match == probe.sstables_consulted
+
+
+def test_a_probe_stops_at_the_table_holding_a_tombstone(tmp_path: Path) -> None:
+    """A delete shadowing an older value is found in one table, not chased further.
+
+    The deleted key is written into the oldest table and tombstoned into the
+    newest, so a walk that did not stop at the tombstone would search more
+    tables than this and would also return the old value.
+    """
+    with probing_engine(tmp_path / "data", 256) as engine:
+        fill_until_frozen(engine, prefix=b"a/")
+        engine.put(b"doomed", b"value")
+        fill_until_frozen(engine, prefix=b"b/")
+        engine.delete(b"doomed")
+        fill_until_frozen(engine, prefix=b"c/")
+        engine.flush_pending()
+
+        probe = ReadProbe()
+        assert engine.get(b"doomed", probe=probe) is None
+        assert probe.sstables_consulted >= 1
+        assert probe.sstables_consulted + probe.sstables_skipped_by_bloom < len(engine.sstables), (
+            "the walk did not stop at the tombstone"
+        )
+
+
+def test_probe_counts_accumulate_until_they_are_reset(tmp_path: Path) -> None:
+    """Cumulative by default, per-read on request: both halves of the documented contract."""
+    engine, written = engine_with_several_tables(tmp_path / "data")
+    with engine:
+        probe = ReadProbe()
+        for key in written[:5]:
+            engine.get(key, probe=probe)
+        assert probe.gets == 5
+        assert probe.sstables_consulted >= 5
+
+        probe.reset()
+        assert probe.gets == 0
+        assert probe.sstables_consulted == 0
+        assert probe.sstables_skipped_by_bloom == 0
+        assert probe.sstables_without_match == 0
+        assert probe.found_in_memory == 0
+
+        engine.get(written[-1], probe=probe)
+        assert probe.gets == 1
+
+
+def test_a_read_without_a_probe_returns_the_same_answers(tmp_path: Path) -> None:
+    """The probe is an addition to the read path, not a change to it."""
+    engine, written = engine_with_several_tables(tmp_path / "data")
+    with engine:
+        probe = ReadProbe()
+        for key in [*written[:20], b"never-written"]:
+            assert engine.get(key) == engine.get(key, probe=probe)
+
+
+def test_each_thread_sees_only_its_own_probe_under_concurrent_reads(tmp_path: Path) -> None:
+    """The concurrency claim ReadProbe makes, exercised with real threads and a writer.
+
+    A probe is safe without a lock because the engine only ever touches the one
+    the calling thread handed it. What would break that is any shared state
+    behind the counts, and the way it would show is a thread's totals coming out
+    higher than the reads it performed. So each reader checks its own probe
+    after every read and sums the whole run, while a writer keeps putting
+    through the same engine so that every one of those reads happens against a
+    tree another thread is mutating.
+
+    The writer overwrites a handful of keys rather than writing fresh ones, and
+    that detail is what keeps this test from being a race it can lose on a slow
+    machine. This engine does not flush on its own, so writing fresh keys at
+    this threshold freezes a memtable every few puts and nothing drains the
+    list, and :meth:`LedgerLog._lookup` walks that list on every read. Read cost
+    would then grow with how far the writer had got, while the writer's cost per
+    put stayed flat, so the slower the readers ran the slower they would get:
+    measured here, a read costs about 16 microseconds against no frozen tables
+    and about 4 milliseconds against four thousand of them. Overwriting a fixed
+    key set keeps the active memtable a constant size, so it never freezes, the
+    writer still takes the engine's write lock and appends to the log on every
+    put, and the reads stay a fixed cost however long the run takes.
+    """
+    engine, written = engine_with_several_tables(tmp_path / "data")
+    reads_per_thread = 200
+    thread_count = 4
+    recycled_keys = 8
+    # A bound no correct engine should reach, so that a future change which did
+    # make these puts grow the memtable fails the assertions below instead of
+    # hanging the suite.
+    max_writes = 200_000
+    with engine:
+        stop = threading.Event()
+        failures: list[str] = []
+        totals: list[int] = [0] * thread_count
+        writes_done = 0
+
+        def write() -> None:
+            nonlocal writes_done
+            index = 0
+            while not stop.is_set() and index < max_writes:
+                engine.put(f"concurrent/{index % recycled_keys:03d}".encode(), b"value")
+                index += 1
+            writes_done = index
+
+        def read(slot: int) -> None:
+            probe = ReadProbe()
+            searched = 0
+            for step in range(reads_per_thread):
+                key = written[(slot * 7 + step * 13) % len(written)]
+                probe.reset()
+                value = engine.get(key, probe=probe)
+                if value != b"value":
+                    failures.append(f"thread {slot} read {key!r} as {value!r}")
+                if probe.gets != 1:
+                    failures.append(f"thread {slot} saw {probe.gets} gets on its own probe")
+                if probe.sstables_consulted > len(engine.sstables):
+                    failures.append(
+                        f"thread {slot} searched {probe.sstables_consulted} of"
+                        f" {len(engine.sstables)} tables"
+                    )
+                searched += probe.sstables_consulted
+            totals[slot] = searched
+
+        writer = threading.Thread(target=write, daemon=True)
+        readers = [
+            threading.Thread(target=read, args=(slot,), daemon=True) for slot in range(thread_count)
+        ]
+        writer.start()
+        for reader in readers:
+            reader.start()
+        for reader in readers:
+            reader.join(timeout=120)
+        # Stopped and joined before anything is asserted, so that a failure
+        # cannot leave a thread reading through an engine the end of this block
+        # is about to close: the closed-handle error that follows would bury the
+        # assertion that actually explains the failure.
+        stop.set()
+        writer.join(timeout=120)
+
+        still_running = [thread.name for thread in [*readers, writer] if thread.is_alive()]
+        assert still_running == [], f"threads did not finish: {still_running}"
+        assert failures == []
+        assert writes_done > 0, "the writer never ran, so no read was concurrent with one"
+        assert engine.frozen_memtables == (), (
+            f"the writer froze {len(engine.frozen_memtables)} memtables, which makes every"
+            " read walk a growing list and turns this test into a race"
+        )
+        for slot, searched in enumerate(totals):
+            assert searched >= reads_per_thread, (
+                f"thread {slot} recorded {searched} searches over {reads_per_thread} reads"
+            )
