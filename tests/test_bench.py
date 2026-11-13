@@ -1,6 +1,7 @@
 """Tests for the bench harness's phases, its reported figures and its CLI.
 
-Covers story M10.1 (bench harness: write throughput and random read latency).
+Covers story M10.1 (bench harness: write throughput and random read latency)
+and story M10.2 (read amplification before and after compaction).
 
 What is worth testing in a benchmark, given that the numbers it produces are
 whatever the machine does on the day: not the figures, but everything around
@@ -41,19 +42,24 @@ from pathlib import Path
 
 import pytest
 
+from ledgerlog import bench as bench_module
 from ledgerlog.bench import (
+    AMPLIFICATION_DIRNAME,
     DEFAULT_MAX_READS,
     DEFAULT_VALUE_SIZE_BYTES,
     KEY_INDEX_DIGITS,
+    MAX_HISTOGRAM_ROWS,
     MAX_RECORDS,
     MAX_VALUE_SIZE_BYTES,
     PERCENTILES,
+    AmplificationSummary,
     BenchConfig,
     BenchError,
     BenchResult,
     LatencySummary,
     ReadPhaseResult,
     WritePhaseResult,
+    _snapshot_committed_tables,
     build_parser,
     config_from_args,
     draw_read_indices,
@@ -853,3 +859,350 @@ def test_module_exits_two_on_a_rejected_record_count() -> None:
 
     assert completed.returncode == 2
     assert "records must be at least 1" in completed.stderr
+
+
+# --------------------------------------------------------------------------
+# Story M10.2: read amplification before and after compaction
+# --------------------------------------------------------------------------
+#
+# The figure under test is "tables searched per read", and what makes it worth
+# testing is that it is easy to produce a number that looks like it and is not:
+# the table count, or a mean pulled down by reads the memtable answered. So the
+# assertions below are about the relationships that make the figure mean what
+# the report says it means. Every read reached disk, every table the walk
+# passed is accounted for, the two sides describe one dataset, and the count
+# never exceeds the tables that existed to be searched.
+#
+# The record count here is larger than the rest of this module uses, because a
+# dataset small enough to fit one SSTable has no read amplification to measure
+# and no tier to compact.
+
+AMPLIFICATION_RECORDS = 1200
+AMPLIFICATION_THRESHOLD_BYTES = 1024
+
+
+def _amplification_config(**overrides: object) -> BenchConfig:
+    """A configuration whose threshold is low enough to make many small tables."""
+    settings: dict[str, object] = {
+        "records": AMPLIFICATION_RECORDS,
+        "memtable_threshold_bytes": AMPLIFICATION_THRESHOLD_BYTES,
+        "read_amplification": True,
+    }
+    settings.update(overrides)
+    return _fast_config(**settings)
+
+
+def test_the_phase_is_off_unless_it_is_asked_for() -> None:
+    """It costs a second pass over the data, so it does not happen by default."""
+    result = run_bench(_fast_config(records=100))
+
+    assert result.config.read_amplification is False
+    assert result.amplification is None
+    assert result.to_dict()["amplification"] is None
+    assert "Read amplification" not in result.format_report()
+
+
+def test_criterion_1_the_figure_comes_from_the_read_path_not_the_table_count() -> None:
+    """Instrumentation, not inference: tables searched is below the tables held.
+
+    With many small tables and a bloom filter per table, a read searches one
+    table and skips the rest, so the mean sits near one while the table count is
+    far above it. Equality between the two would mean the harness had counted
+    the directory.
+    """
+    comparison = run_bench(_amplification_config()).amplification
+    assert comparison is not None
+    before = comparison.before
+
+    assert before.sstables > 1, "the fixture did not produce several tables"
+    assert before.mean_tables_per_read >= 1.0
+    assert before.mean_tables_per_read < before.sstables
+    assert before.searched.max_tables <= before.sstables
+    assert before.tables_skipped_by_bloom > 0, "no table was spared by a bloom filter"
+
+
+def test_criterion_2_the_deferred_side_reports_a_figure_over_many_small_tables() -> None:
+    """The before side: a real dataset, several tables, every read served from disk."""
+    comparison = run_bench(_amplification_config()).amplification
+    assert comparison is not None
+    before = comparison.before
+
+    assert before.label == "before compaction"
+    assert before.sstables >= 4, f"only {before.sstables} tables, too few to compact a tier"
+    assert before.records_on_disk > 0
+    assert before.reads == AMPLIFICATION_RECORDS
+    assert before.hits == before.reads
+    assert before.misses == 0
+    assert before.wrong_values == 0
+    assert before.served_from_memory == 0, "a read answered from memory searched no table"
+    assert before.searched.min_tables >= 1, "a read that found its value searched a table"
+
+
+def test_criterion_3_compaction_does_not_raise_the_figure_and_both_are_printed() -> None:
+    """The comparison itself, and the report line that puts the two side by side."""
+    result = run_bench(_amplification_config())
+    comparison = result.amplification
+    assert comparison is not None
+
+    assert comparison.ran_a_compaction, "no tier was ready, so there is nothing to compare"
+    assert comparison.compaction.tables_after < comparison.compaction.tables_before
+    assert comparison.after.sstables < comparison.before.sstables
+    assert comparison.after.mean_tables_per_read <= comparison.before.mean_tables_per_read
+    assert comparison.reduced is True
+
+    report = result.format_report()
+    assert "Read amplification" in report
+    assert "before compaction" in report
+    assert "after compaction" in report
+    assert "before -> after:" in report
+    assert "tier merge(s)" in report
+
+
+def test_both_sides_measure_one_dataset_with_the_same_reads() -> None:
+    """A merge of tables with no tombstones and no expiries loses nothing.
+
+    If the two sides disagreed about the record count or the read count they
+    would not be comparable, which is why the harness raises rather than prints
+    in that case. Here the agreement is asserted from the outside.
+    """
+    comparison = run_bench(_amplification_config()).amplification
+    assert comparison is not None
+
+    assert comparison.after.records_on_disk == comparison.before.records_on_disk
+    assert comparison.after.reads == comparison.before.reads
+    assert comparison.after.searched.count == comparison.before.searched.count
+    assert comparison.after.hits == comparison.after.reads
+    assert comparison.after.misses == 0
+    assert comparison.after.wrong_values == 0
+    assert comparison.after.served_from_memory == 0
+
+
+def test_a_fully_compacted_dataset_searches_exactly_one_table_per_read() -> None:
+    """The floor the comparison is heading for, stated rather than assumed.
+
+    When the compaction ends with one table, every read must search it and
+    nothing else: there is no table left to skip and none to search in vain.
+    """
+    comparison = run_bench(_amplification_config()).amplification
+    assert comparison is not None
+    after = comparison.after
+
+    if after.sstables != 1:
+        pytest.skip(f"the compaction settled at {after.sstables} tables, not one")
+    assert after.mean_tables_per_read == 1.0
+    assert after.searched.min_tables == after.searched.max_tables == 1
+    assert after.tables_skipped_by_bloom == 0
+    assert after.bloom_false_positives == 0
+    assert after.bloom_false_positive_rate == 0.0
+
+
+def test_the_phase_leaves_the_runs_own_tables_alone(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The compaction runs on a snapshot, so the run's directory still reads back.
+
+    The snapshot is made of hard links, and a merge unlinks the tables it
+    consumed. If it were operating on the run's own files instead, reopening the
+    directory afterwards would find them gone.
+    """
+    directory = tmp_path / "run"
+    result = run_bench(_amplification_config(records=600, directory=directory))
+    assert result.amplification is not None
+
+    workspace = directory / AMPLIFICATION_DIRNAME
+    assert workspace.is_dir(), "the phase did not work in a directory of its own"
+
+    with LedgerLog(directory) as reopened:
+        assert len(reopened.sstables) == result.read.sstables_at_read_time
+        for index in (0, 1, result.config.records - 1):
+            assert reopened.get(key_for_index(index)) is not None
+
+
+def test_the_phase_falls_back_to_copying_when_a_hard_link_is_refused(
+    tmp_path,  # type: ignore[no-untyped-def]
+    monkeypatch,  # type: ignore[no-untyped-def]
+) -> None:
+    """Not every filesystem gives hard links, and the figures must not depend on one."""
+    refused: list[str] = []
+
+    def refuse_link(source: object, target: object) -> None:
+        refused.append(str(source))
+        raise OSError("hard links are not supported here")
+
+    monkeypatch.setattr(bench_module.os, "link", refuse_link)
+    comparison = run_bench(
+        _amplification_config(records=600, directory=tmp_path / "run")
+    ).amplification
+
+    assert refused, "the phase never tried a hard link"
+    assert comparison is not None
+    assert comparison.before.misses == 0
+    assert comparison.after.misses == 0
+
+
+def test_the_snapshot_refuses_a_workspace_that_already_holds_something(
+    tmp_path,  # type: ignore[no-untyped-def]
+) -> None:
+    """A workspace it did not create could hold tables from somewhere else."""
+    directory = tmp_path / "run"
+    workspace = directory / AMPLIFICATION_DIRNAME
+    workspace.mkdir(parents=True)
+
+    with LedgerLog(directory) as engine:
+        engine.put(b"key", b"value")
+        with pytest.raises(BenchError, match="read-amplification workspace"):
+            _snapshot_committed_tables(engine, workspace)
+
+
+def test_the_phase_refuses_a_run_that_flushed_nothing(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """No table on disk means no amplification to measure, and no figure to invent."""
+    config = _fast_config(
+        records=20,
+        memtable_threshold_bytes=DEFAULT_MEMTABLE_THRESHOLD_BYTES,
+        read_amplification=True,
+        directory=tmp_path / "run",
+    )
+
+    with pytest.raises(BenchError, match="no records on disk"):
+        run_bench(config)
+
+
+def test_main_reports_a_run_where_no_tier_was_ready(tmp_path, capsys) -> None:  # type: ignore[no-untyped-def]
+    """Equal figures from an uncompacted pair are true but say nothing, so they are flagged.
+
+    A single flushed table cannot form a ready tier, so the compaction makes no
+    passes and the two sides describe the same table. That is a warning on
+    stderr rather than a failure: the numbers printed are correct.
+    """
+    status = main(
+        [
+            "--records",
+            "60",
+            "--value-size",
+            "32",
+            "--fsync-policy",
+            "never",
+            "--memtable-threshold-bytes",
+            "1024",
+            "--reads",
+            "40",
+            "--read-amplification",
+            "--directory",
+            str(tmp_path / "run"),
+        ]
+    )
+
+    assert status == 0
+    captured = capsys.readouterr()
+    assert "no tier was ready to merge" in captured.err
+    assert "Read amplification" in captured.out
+
+
+# --------------------------------------------------------------------------
+# The amplification summary's own arithmetic
+# --------------------------------------------------------------------------
+
+
+def test_amplification_summary_describes_its_samples() -> None:
+    summary = AmplificationSummary.from_samples([1, 1, 2, 3, 1, 2])
+
+    assert summary.count == 6
+    assert summary.min_tables == 1
+    assert summary.max_tables == 3
+    assert summary.mean_tables == pytest.approx(10 / 6)
+    assert summary.histogram == ((1, 3), (2, 2), (3, 1))
+    assert sum(reads for _, reads in summary.histogram) == summary.count
+    assert list(summary.percentiles) == [f"p{p:g}" for p in PERCENTILES]
+    assert summary.percentiles["p50"] <= summary.percentiles["p99"]
+
+
+def test_amplification_summary_does_not_reorder_its_input() -> None:
+    samples = [3, 1, 2]
+    AmplificationSummary.from_samples(samples)
+
+    assert samples == [3, 1, 2]
+
+
+def test_amplification_summary_rejects_an_empty_sample() -> None:
+    with pytest.raises(ValueError, match="empty read-amplification sample"):
+        AmplificationSummary.from_samples([])
+
+
+def test_amplification_histogram_line_caps_its_rows_without_hiding_them() -> None:
+    summary = AmplificationSummary.from_samples(list(range(MAX_HISTOGRAM_ROWS + 3)))
+    line = summary.format_histogram()
+
+    assert line.count("x") == MAX_HISTOGRAM_ROWS
+    assert "(+3 more)" in line
+    assert len(summary.to_dict()["histogram"]) == MAX_HISTOGRAM_ROWS + 3  # type: ignore[arg-type]
+
+
+# --------------------------------------------------------------------------
+# The flag, through the parser and the reported invocation
+# --------------------------------------------------------------------------
+
+
+def test_the_amplification_flag_round_trips_through_the_parser() -> None:
+    """The printed invocation has to reproduce the run, this flag included."""
+    config = _amplification_config()
+    assert "--read-amplification" in config.command_line()
+
+    arguments = config.command_line().removeprefix("python -m ledgerlog.bench").split()
+    reparsed = config_from_args(build_parser().parse_args(arguments))
+
+    assert reparsed.read_amplification is True
+    assert reparsed.command_line() == config.command_line()
+
+
+def test_the_parser_defaults_the_flag_off() -> None:
+    assert config_from_args(build_parser().parse_args(["--records", "10"])).read_amplification is (
+        False
+    )
+
+
+def test_json_output_carries_the_whole_comparison() -> None:
+    """Every figure the report prints is in the machine-readable form too."""
+    payload = run_bench(_amplification_config(records=600)).to_dict()
+    amplification = payload["amplification"]
+
+    assert isinstance(amplification, dict)
+    assert amplification["reduced"] is True
+    assert amplification["compaction"]["passes"] >= 1
+    for side in ("before", "after"):
+        phase = amplification[side]
+        assert phase["misses"] == 0
+        assert phase["served_from_memory"] == 0
+        assert phase["mean_tables_per_read"] >= 1.0
+        assert phase["searched"]["count"] == phase["reads"]
+    assert json.dumps(payload), "the payload must survive a round trip through JSON"
+
+
+def test_module_runs_the_amplification_phase_as_a_command(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """The story's figure, produced end to end by the documented command."""
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "ledgerlog.bench",
+            "--records",
+            "800",
+            "--value-size",
+            "32",
+            "--fsync-policy",
+            "never",
+            "--memtable-threshold-bytes",
+            "1024",
+            "--read-amplification",
+            "--directory",
+            str(tmp_path / "run"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=300,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "--read-amplification" in completed.stdout
+    assert "Read amplification" in completed.stdout
+    assert "before compaction" in completed.stdout
+    assert "after compaction" in completed.stdout
+    assert "before -> after:" in completed.stdout

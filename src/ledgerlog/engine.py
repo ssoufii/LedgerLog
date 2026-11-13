@@ -273,6 +273,15 @@ had already dropped the memtable and published a table that the earlier snapshot
 predates, and a key in neither of the two snapshots would read as absent while
 being on disk the whole time.
 
+How much of that walk a read actually performs is not visible from the outside,
+which is why :meth:`LedgerLog.get` accepts a :class:`ReadProbe`. The number of
+tables a read searches is the thing read amplification means, and it is not the
+number of tables the engine holds: the walk stops at the first layer with the
+key and never opens a table its bloom filter rejects. A caller that counted
+tables instead would be describing the directory. The probe belongs to the
+caller rather than to the engine so that the path can stay lock-free (see
+Concurrency, below); story M10.2.
+
 Concurrency
 -----------
 
@@ -893,6 +902,72 @@ class RecoveryReport:
         return self.stopped_at is None
 
 
+@dataclass
+class ReadProbe:
+    """Counts collected from inside one walk of the read path.
+
+    What a caller measuring read amplification needs and cannot get from the
+    outside: how many SSTables a :meth:`LedgerLog.get` actually searched. The
+    table count is not that number. A read stops at the first layer holding the
+    key and skips every table whose bloom filter rejects it, so an engine serving
+    forty tables may search one, or none, and a figure inferred from
+    :attr:`LedgerLog.sstables` would describe the directory rather than the read.
+
+    Mutable, and owned by the caller rather than by the engine. A probe is passed
+    into a single :meth:`LedgerLog.get`, which only ever touches the probe the
+    calling thread handed it, so several threads may measure at once without a
+    lock. A counter living on the engine would need one, on the single path that
+    deliberately takes none (see this module's concurrency section), and would
+    still mix every thread's reads into one figure.
+
+    Counts are cumulative across every :meth:`LedgerLog.get` the probe is passed
+    to, so a caller wanting a per-read figure calls :meth:`reset` before each one
+    and a caller wanting a total does not. A read the engine refuses outright,
+    because it is closed, records nothing: it is turned away before the walk the
+    probe describes begins.
+    """
+
+    gets: int = 0
+    """Reads whose walk this probe was passed to.
+
+    Counted as the walk starts rather than as it ends, so a walk that raises
+    part way through is still one this probe's other counts describe.
+    """
+
+    sstables_consulted: int = 0
+    """Tables whose data block was searched: the read amplification figure.
+
+    Counted when the table is searched rather than when it answers, because the
+    cost this measures is the lookup, which a table that turns out not to hold
+    the key has already paid by the time it says so.
+    """
+
+    sstables_skipped_by_bloom: int = 0
+    """Tables a bloom filter rejected, so they were never opened."""
+
+    sstables_without_match: int = 0
+    """Consulted tables that held no record for the key, so bloom false positives.
+
+    Every table reached by the walk is one the bloom filter admitted, and a
+    search that then finds nothing can only mean the filter was wrong: the walk
+    stops at the first table that does hold a record. Reported separately from
+    :attr:`sstables_consulted` because the two answer different questions, one
+    how much work a read did and the other how much of that work the filter
+    should have prevented.
+    """
+
+    found_in_memory: int = 0
+    """Reads answered by the active or a frozen memtable, touching no table."""
+
+    def reset(self) -> None:
+        """Zero every count, so the probe can measure the next read on its own."""
+        self.gets = 0
+        self.sstables_consulted = 0
+        self.sstables_skipped_by_bloom = 0
+        self.sstables_without_match = 0
+        self.found_in_memory = 0
+
+
 class LedgerLog:
     """A durable key-value store over a write-ahead log and an in-memory table.
 
@@ -1293,7 +1368,7 @@ class LedgerLog:
             self._memtable.delete(key)
             self._freeze_if_full()
 
-    def get(self, key: bytes) -> bytes | None:
+    def get(self, key: bytes, *, probe: ReadProbe | None = None) -> bytes | None:
         """Return the value stored under ``key``, or ``None`` if there is none.
 
         The active memtable is consulted first, the frozen ones after it and the
@@ -1335,10 +1410,17 @@ class LedgerLog:
         and it is reported rather than swallowed: the alternative, treating a
         closed table as one that does not hold the key, would answer "not found"
         for a key that is on disk.
+
+        ``probe``, when given, is filled in with what this walk did: how many
+        tables it searched, how many a bloom filter spared it and whether memory
+        answered. That is the only way to learn a read's amplification, since the
+        answer depends on where the key turned up and not on how many tables
+        exist. See :class:`ReadProbe`. Passing none is the normal path and costs
+        one ``is not None`` test per layer the walk visits.
         """
         self._check_open()
 
-        entry = self._lookup(key)
+        entry = self._lookup(key, probe)
         if entry is None or entry.is_tombstone:
             return None
         if self._has_expired(entry):
@@ -1416,7 +1498,9 @@ class LedgerLog:
             )
         return expires_at_ms
 
-    def _lookup(self, key: bytes) -> MemtableEntry | SSTableRecord | None:
+    def _lookup(
+        self, key: bytes, probe: ReadProbe | None = None
+    ) -> MemtableEntry | SSTableRecord | None:
         """Return the newest record held for ``key``, or ``None`` if there is none.
 
         Separate from :meth:`get` because the layers have to be walked with the
@@ -1433,14 +1517,28 @@ class LedgerLog:
         engine asks a record, its ``value`` and whether it ``is_tombstone``, so
         converting would allocate a second object per read to restate what the
         first one said.
+
+        ``probe`` is updated as the walk goes rather than from a tally taken at
+        the end, because the walk returns from the middle of itself and a tally
+        would have to reconstruct which layers it had reached. Each count is
+        recorded at the point the work it describes happens, so an exception from
+        a table handle leaves the probe describing the tables searched before it
+        rather than nothing at all.
         """
+        if probe is not None:
+            probe.gets += 1
+
         entry = self._memtable.lookup(key)
         if entry is not None:
+            if probe is not None:
+                probe.found_in_memory += 1
             return entry
 
         for table in self._frozen_memtables:
             entry = table.lookup(key)
             if entry is not None:
+                if probe is not None:
+                    probe.found_in_memory += 1
                 return entry
 
         # Read after the frozen memtables above, never before them. A flush
@@ -1454,11 +1552,17 @@ class LedgerLog:
             # may be wrong, and the lookup below then finds nothing and the walk
             # carries on to the next table.
             if not handle.bloom_filter.might_contain(key):
+                if probe is not None:
+                    probe.sstables_skipped_by_bloom += 1
                 continue
+            if probe is not None:
+                probe.sstables_consulted += 1
             with handle.borrow_reader() as reader:
                 record = reader.lookup(key)
             if record is not None:
                 return record
+            if probe is not None:
+                probe.sstables_without_match += 1
 
         return None
 

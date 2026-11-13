@@ -1,19 +1,45 @@
 """Benchmark harness: what this engine actually does, measured rather than claimed.
 
-Scope of this module today (story M10.1): a sequential write phase that reports
-throughput, a randomized read phase that reports a latency distribution, and the
-CLI arguments that make the record count, the value size and the fsync policy
-part of the measurement instead of baked into it. Run it with::
+Scope of this module today (stories M10.1 and M10.2): a sequential write phase
+that reports throughput, a randomized read phase that reports a latency
+distribution, an optional read-amplification phase that reports how many
+SSTables a ``get`` searches before and after a compaction, and the CLI arguments
+that make the record count, the value size and the fsync policy part of the
+measurement instead of baked into it. Run it with::
 
     python -m ledgerlog.bench --records 100000
+    python -m ledgerlog.bench --records 100000 --read-amplification \\
+        --memtable-threshold-bytes 65536
 
-Read amplification, meaning how many SSTables a single ``get`` consults, is
-deliberately not measured here. Counting that needs the read path itself
-instrumented, which is story M10.2, and a figure guessed from the table count
-would be exactly the kind of estimate this module exists to replace. What is
-printed below is the number of tables the engine was serving when the read phase
-ran, which is context for reading the latency figure, not a measurement of the
-read path.
+Read amplification is measured from inside the read path, through
+:class:`~ledgerlog.engine.ReadProbe`, and not inferred from how many tables the
+engine holds. The two are different numbers and only the first is the one the
+phrase means: a read stops at the first layer holding its key and never opens a
+table whose bloom filter rejects it, so an engine serving forty tables may
+search one. A figure taken from the table count would describe the directory and
+would be exactly the kind of estimate this module exists to replace. The table
+count is still printed next to the read phase, as context for the latency
+figure.
+
+Why the amplification phase runs against copies of the run's tables in a
+directory of its own, rather than against the engine the other two phases used:
+the before and after measurements have to differ by the compaction and by
+nothing else. The live engine still holds the records written since its last
+freeze in its active memtable, and a read that memory answers searches no table
+at all, so measuring the "before" side there would mix a memtable hit rate into
+the figure and quietly deflate it. Both sides instead run against an engine
+opened on tables alone, with no log to replay and therefore an empty memtable,
+so every read in both reaches disk and the only thing that changed between them
+is that a compaction ran. The copies are hard links where the filesystem allows
+them, so the snapshot costs no space and no copy time, and the compaction
+unlinks its sources without touching the run's own tables.
+
+Why the amplification phase is opt-in rather than always on: it reads the whole
+dataset back twice more and rewrites it once, which is a large share of the
+run's cost for a figure a run measuring write throughput has not asked for. It
+also says nothing at a memtable threshold that produced one table, which is what
+the default threshold does at a modest record count, so turning it on is a
+decision that comes with choosing a threshold low enough to make several.
 
 Why throughput and latency are reported differently, and not as two views of one
 number: they answer different questions and have different right answers. A
@@ -83,18 +109,28 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import random
+import shutil
 import statistics
 import sys
 import tempfile
 import time
 from array import array
+from collections import Counter
 from collections.abc import Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
-from ledgerlog.engine import DEFAULT_MEMTABLE_THRESHOLD_BYTES, LedgerLog
+from ledgerlog.compaction import CompactionPolicy, compact_tier, plan_compaction
+from ledgerlog.engine import (
+    DEFAULT_MEMTABLE_THRESHOLD_BYTES,
+    LedgerLog,
+    ReadProbe,
+    discover_sstables,
+    sstable_filename,
+)
 from ledgerlog.sstable import MAX_RECORD_PAYLOAD_SIZE, RECORD_PAYLOAD_HEADER_SIZE
 from ledgerlog.wal import (
     DEFAULT_FSYNC_INTERVAL_SECONDS,
@@ -168,6 +204,27 @@ own memory, not the engine, the thing that limits a large run. An explicit
 
 RAM_BACKED_FILESYSTEMS = frozenset({"tmpfs", "ramfs"})
 """Filesystem types on which ``fsync`` does not reach durable storage."""
+
+AMPLIFICATION_DIRNAME = "read-amplification"
+"""Subdirectory of the run directory the read-amplification phase works in.
+
+A subdirectory rather than a temporary directory elsewhere, for two reasons. The
+snapshot it holds is made of hard links into the run directory, which only works
+within one filesystem, and the engine it opens there should be reading the same
+disk the rest of the run measured. It is not a name
+:func:`~ledgerlog.engine.sstable_filename` could produce and it is a directory
+rather than a file, so the run's own engine passes over it.
+"""
+
+MAX_HISTOGRAM_ROWS = 10
+"""How many distinct per-read table counts the text report lists in full.
+
+The histogram has one row per distinct number of tables a read searched, which
+is bounded by the table count and so is short after a compaction and can be long
+before one. The remainder is summarized in one line rather than dropped, and
+``--json`` carries every row regardless, so the cap shortens the report without
+hiding anything.
+"""
 
 PERCENTILES: tuple[float, ...] = (50.0, 90.0, 99.0, 99.9)
 """Percentiles the read phase reports.
@@ -298,6 +355,7 @@ class BenchConfig:
     seed: int = 0
     directory: Path | None = None
     drain_flushes: bool = True
+    read_amplification: bool = False
 
     def __post_init__(self) -> None:
         """Reject a configuration that cannot produce a meaningful measurement.
@@ -366,6 +424,7 @@ class BenchConfig:
             "memtable_threshold_bytes": self.memtable_threshold_bytes,
             "seed": self.seed,
             "drain_flushes": self.drain_flushes,
+            "read_amplification": self.read_amplification,
         }
 
     def command_line(self) -> str:
@@ -392,6 +451,8 @@ class BenchConfig:
             parts.append(f"--fsync-interval {self.fsync_interval_seconds}")
         if not self.drain_flushes:
             parts.append("--no-drain-flushes")
+        if self.read_amplification:
+            parts.append("--read-amplification")
         return " ".join(parts)
 
 
@@ -519,8 +580,9 @@ class ReadPhaseResult:
     wrong thing, would be worse than no bench at all.
 
     ``sstables_at_read_time`` and ``memtable_bytes_at_read_time`` describe the
-    tree the phase started against. They are context for the latency, not a
-    count of tables any read consulted: that is read amplification, story M10.2.
+    tree the phase started against. They are context for the latency and not a
+    count of the tables any read searched, which is what read amplification
+    means and what :class:`AmplificationPhaseResult` reports.
     """
 
     reads: int
@@ -555,6 +617,229 @@ class ReadPhaseResult:
 
 
 @dataclass(frozen=True)
+class AmplificationSummary:
+    """How many SSTables the reads of one phase searched, as a distribution.
+
+    A mean alone would hide the shape this phase exists to show. Before a
+    compaction the counts spread out, because a key written early sits under
+    every table written after it while a key written late is found in the first
+    table tried, and the reads worth worrying about are the ones at the top of
+    that spread rather than the average of it. So the percentiles and the
+    histogram are reported next to the mean, and the histogram is exact: there
+    are at most as many distinct values as there are tables, so nothing has to
+    be bucketed and no row is an approximation.
+
+    Counts are tables searched, which is tables whose data block was read. A
+    table a bloom filter rejected is not one of them, and that is the point:
+    the filter exists to keep those out of this number.
+    """
+
+    count: int
+    min_tables: int
+    mean_tables: float
+    max_tables: int
+    percentiles: dict[str, int]
+    histogram: tuple[tuple[int, int], ...]
+    """Pairs of (tables searched, reads that searched that many), ascending."""
+
+    @classmethod
+    def from_samples(cls, samples: Sequence[int]) -> AmplificationSummary:
+        """Summarize per-read table counts, which need not be sorted."""
+        if not samples:
+            raise ValueError("cannot summarize an empty read-amplification sample")
+
+        ordered = sorted(samples)
+        return cls(
+            count=len(ordered),
+            min_tables=ordered[0],
+            mean_tables=statistics.fmean(ordered),
+            max_tables=ordered[-1],
+            percentiles={
+                _percentile_label(percentile): nearest_rank_percentile(ordered, percentile)
+                for percentile in PERCENTILES
+            },
+            histogram=tuple(sorted(Counter(ordered).items())),
+        )
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the summary as plain JSON-safe values."""
+        return {
+            "count": self.count,
+            "min_tables": self.min_tables,
+            "mean_tables": self.mean_tables,
+            "max_tables": self.max_tables,
+            "percentiles": dict(self.percentiles),
+            "histogram": [
+                {"tables_searched": tables, "reads": reads} for tables, reads in self.histogram
+            ],
+        }
+
+    def format_histogram(self, max_rows: int = MAX_HISTOGRAM_ROWS) -> str:
+        """Return the histogram on one line, as ``tables searched x reads`` pairs."""
+        shown = self.histogram[:max_rows]
+        parts = [f"{tables}x{reads}" for tables, reads in shown]
+        remaining = len(self.histogram) - len(shown)
+        if remaining > 0:
+            parts.append(f"(+{remaining} more)")
+        return " ".join(parts)
+
+
+@dataclass(frozen=True)
+class AmplificationPhaseResult:
+    """One side of the read-amplification comparison, before or after compaction.
+
+    ``records_on_disk`` is how many records the tables held, which is also how
+    many distinct keys the phase could draw from: the write phase writes each
+    key exactly once, so a table's record count is a key count, and the two
+    sides must agree on it or they are not measuring one dataset.
+
+    ``served_from_memory`` should be zero on both sides, since both run against
+    an engine with nothing to replay. It is counted rather than assumed because
+    a read memory answered searches no table, so any of them would pull the
+    figure down while looking like a good result.
+    """
+
+    label: str
+    sstables: int
+    table_bytes: int
+    records_on_disk: int
+    reads: int
+    hits: int
+    misses: int
+    wrong_values: int
+    served_from_memory: int
+    tables_skipped_by_bloom: int
+    bloom_false_positives: int
+    elapsed_seconds: float
+    searched: AmplificationSummary
+
+    @property
+    def mean_tables_per_read(self) -> float:
+        """Mean number of SSTables searched per read: the read-amplification figure."""
+        return self.searched.mean_tables
+
+    @property
+    def bloom_false_positive_rate(self) -> float:
+        """Share of the probes for a key a table did not hold that the filter admitted.
+
+        The denominator is every table this phase asked about a key the table
+        turned out not to have, which is the tables the filters rejected plus
+        the ones they admitted and that then held nothing. That is the rate a
+        bloom filter is configured for, so this figure can be read against
+        :data:`~ledgerlog.sstable.DEFAULT_BLOOM_FALSE_POSITIVE_RATE` directly.
+
+        Dividing by the tables searched instead would answer a different
+        question (how much of a read's work the filter failed to prevent) and
+        would come out an order of magnitude higher, since most of what a filter
+        does is keep tables out of that number entirely.
+
+        Zero when no probe missed, which is the honest answer for a phase run
+        against a single table that holds every key.
+        """
+        absent_probes = self.tables_skipped_by_bloom + self.bloom_false_positives
+        if absent_probes <= 0:
+            return 0.0
+        return self.bloom_false_positives / absent_probes
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the phase result as plain JSON-safe values."""
+        return {
+            "label": self.label,
+            "sstables": self.sstables,
+            "table_bytes": self.table_bytes,
+            "records_on_disk": self.records_on_disk,
+            "reads": self.reads,
+            "hits": self.hits,
+            "misses": self.misses,
+            "wrong_values": self.wrong_values,
+            "served_from_memory": self.served_from_memory,
+            "tables_skipped_by_bloom": self.tables_skipped_by_bloom,
+            "bloom_false_positives": self.bloom_false_positives,
+            "bloom_false_positive_rate": self.bloom_false_positive_rate,
+            "elapsed_seconds": self.elapsed_seconds,
+            "mean_tables_per_read": self.mean_tables_per_read,
+            "searched": self.searched.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class CompactionSummary:
+    """What the compaction between the two measurements did.
+
+    ``passes`` is how many tiers were merged. Zero means no tier was ready, so
+    the two sides describe the same tables and the comparison, while still true,
+    shows nothing: the report says so rather than letting an unchanged figure
+    read as a result.
+    """
+
+    passes: int
+    tables_before: int
+    tables_after: int
+    bytes_before: int
+    bytes_after: int
+    elapsed_seconds: float
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the summary as plain JSON-safe values."""
+        return {
+            "passes": self.passes,
+            "tables_before": self.tables_before,
+            "tables_after": self.tables_after,
+            "bytes_before": self.bytes_before,
+            "bytes_after": self.bytes_after,
+            "elapsed_seconds": self.elapsed_seconds,
+        }
+
+
+@dataclass(frozen=True)
+class AmplificationComparison:
+    """The before and after measurements, and the compaction that separates them."""
+
+    before: AmplificationPhaseResult
+    after: AmplificationPhaseResult
+    compaction: CompactionSummary
+
+    @property
+    def ran_a_compaction(self) -> bool:
+        """True if at least one tier was merged between the two measurements."""
+        return self.compaction.passes > 0
+
+    @property
+    def reduced(self) -> bool:
+        """True if the compaction did not increase the mean tables searched per read.
+
+        "Did not increase" rather than "decreased" because a compaction that
+        found no ready tier leaves the two sides identical, and because one that
+        merged every table into one cannot do better than the single table a
+        read already had to search.
+        """
+        return self.after.mean_tables_per_read <= self.before.mean_tables_per_read
+
+    @property
+    def reduction_factor(self) -> float:
+        """How many times fewer tables a read searches after the compaction.
+
+        ``inf`` when the after side searched nothing at all, which cannot happen
+        for a dataset whose keys are all on disk but is defined rather than left
+        to raise.
+        """
+        after = self.after.mean_tables_per_read
+        if after <= 0.0:
+            return float("inf")
+        return self.before.mean_tables_per_read / after
+
+    def to_dict(self) -> dict[str, object]:
+        """Return the comparison as plain JSON-safe values."""
+        return {
+            "before": self.before.to_dict(),
+            "after": self.after.to_dict(),
+            "compaction": self.compaction.to_dict(),
+            "reduced": self.reduced,
+            "reduction_factor": self.reduction_factor,
+        }
+
+
+@dataclass(frozen=True)
 class BenchResult:
     """A complete run: the configuration it ran under and both phases' figures."""
 
@@ -563,6 +848,9 @@ class BenchResult:
     read: ReadPhaseResult
     filesystem: str | None = None
     """Type of the filesystem the run directory sat on, or ``None`` if unknown."""
+
+    amplification: AmplificationComparison | None = None
+    """The read-amplification comparison, or ``None`` if the phase did not run."""
 
     @property
     def ram_backed(self) -> bool:
@@ -578,6 +866,9 @@ class BenchResult:
             "ram_backed_filesystem": self.ram_backed,
             "write": self.write.to_dict(),
             "read": self.read.to_dict(),
+            "amplification": (
+                self.amplification.to_dict() if self.amplification is not None else None
+            ),
         }
 
     def format_report(self) -> str:
@@ -615,7 +906,7 @@ class BenchResult:
             f"  hits / misses:      {self.read.hits} / {self.read.misses}",
             f"  wrong values:       {self.read.wrong_values}",
             f"  sstables at read:   {self.read.sstables_at_read_time}"
-            " (context only, read amplification is story M10.2)",
+            " (tables held, not tables searched; see --read-amplification)",
             f"  memtable at read:   {self.read.memtable_bytes_at_read_time / (1024 * 1024):.2f} MiB"
             " (records not yet frozen, served from memory)",
             f"  elapsed:            {self.read.elapsed_seconds:.3f} s",
@@ -628,7 +919,63 @@ class BenchResult:
             for label, value in latency.percentiles_ns.items()
         )
         lines.append(f"  latency max:        {latency.max_ns / 1e6:.4f} ms")
+        if self.amplification is not None:
+            lines.extend(_format_amplification(self.amplification))
         return "\n".join(lines)
+
+
+def _format_amplification(comparison: AmplificationComparison) -> list[str]:
+    """Return the read-amplification block of the report, as lines.
+
+    A function rather than a method on the comparison because it is the report's
+    layout rather than the measurement's meaning, and :meth:`BenchResult.format_report`
+    is where the rest of that layout lives.
+    """
+    compaction = comparison.compaction
+    lines = [
+        "",
+        "Read amplification (SSTables searched per get, measured in the read path)",
+        f"  compaction:         {compaction.passes} tier merge(s) in"
+        f" {compaction.elapsed_seconds:.3f} s,"
+        f" {compaction.tables_before} tables -> {compaction.tables_after},"
+        f" {compaction.bytes_before / (1024 * 1024):.2f} MiB ->"
+        f" {compaction.bytes_after / (1024 * 1024):.2f} MiB",
+    ]
+    if not comparison.ran_a_compaction:
+        lines.append(
+            "  note:               no tier was ready to merge, so both sides below describe"
+            " the same tables; lower --memtable-threshold-bytes or raise --records"
+        )
+    for phase in (comparison.before, comparison.after):
+        searched = phase.searched
+        lines += [
+            "",
+            f"  {phase.label}",
+            f"    sstables:         {phase.sstables}"
+            f" ({phase.records_on_disk} records, served from memory: {phase.served_from_memory})",
+            f"    reads:            {phase.reads}"
+            f" (hits {phase.hits}, misses {phase.misses}, wrong values {phase.wrong_values})",
+            f"    searched mean:    {phase.mean_tables_per_read:.3f} tables/read",
+            f"    searched min:     {searched.min_tables}",
+        ]
+        lines.extend(
+            f"    searched {label + ':':<9}{value}" for label, value in searched.percentiles.items()
+        )
+        lines += [
+            f"    searched max:     {searched.max_tables}",
+            f"    distribution:     {searched.format_histogram()}",
+            f"    bloom skipped:    {phase.tables_skipped_by_bloom} tables"
+            f" (false positives {phase.bloom_false_positives},"
+            f" {phase.bloom_false_positive_rate * 100:.2f}% of absent-key probes)",
+        ]
+    lines += [
+        "",
+        f"  before -> after:    {comparison.before.mean_tables_per_read:.3f} ->"
+        f" {comparison.after.mean_tables_per_read:.3f} tables/read"
+        f" ({comparison.reduction_factor:.2f}x"
+        f" {'fewer' if comparison.reduced else 'MORE'})",
+    ]
+    return lines
 
 
 class BenchError(RuntimeError):
@@ -761,6 +1108,241 @@ def _run_read_phase(engine: LedgerLog, config: BenchConfig) -> ReadPhaseResult:
     )
 
 
+def _snapshot_committed_tables(engine: LedgerLog, destination: Path) -> tuple[int, int]:
+    """Put a copy of ``engine``'s committed tables in ``destination``. Returns count and bytes.
+
+    Hard links first, a byte copy only where the filesystem refuses one. A link
+    costs no space and no time, and the compacted side needs to be free to
+    delete its sources, which it can do to a link without touching the run's own
+    table. The fallback exists because a hard link is not available everywhere
+    (a filesystem may simply refuse, and the destination is under the run
+    directory precisely so that the two are never on different devices).
+
+    The tables are immutable once committed (ARCHITECTURE.md section 3) so there
+    is nothing to tear here: a flush landing mid-snapshot can add a table this
+    misses, never change one it took. What it does mean is that the snapshot is
+    the table list as it was read, which is why that list is read once into a
+    tuple rather than walked twice.
+
+    A file that disappears between the listing and the link is reported rather
+    than skipped: it would mean something retired a committed table underneath a
+    running engine, and a snapshot quietly short of a table would make the
+    amplification figure describe a dataset the run never wrote.
+
+    ``destination`` must not already exist. A run that snapshotted into a
+    directory holding tables could not tell its own from whatever was there, and
+    would compact and measure both.
+    """
+    try:
+        destination.mkdir(parents=True, exist_ok=False)
+    except OSError as error:
+        raise BenchError(
+            f"could not create the read-amplification workspace {str(destination)!r},"
+            f" so this run cannot tell its own tables from another run's: {error!r}"
+        ) from error
+    handles = engine.sstables
+    total_bytes = 0
+    for handle in handles:
+        target = destination / handle.path.name
+        try:
+            os.link(handle.path, target)
+        except OSError:
+            try:
+                shutil.copy2(handle.path, target)
+            except OSError as error:
+                raise BenchError(
+                    f"could not snapshot table {str(handle.path)!r} for the"
+                    f" read-amplification phase: {error!r}"
+                ) from error
+        total_bytes += handle.size_bytes
+    return len(handles), total_bytes
+
+
+def _compact_until_settled(directory: Path, policy: CompactionPolicy) -> CompactionSummary:
+    """Merge ready tiers in ``directory`` until none is ready, and report what happened.
+
+    The engine does not run compactions of its own: ``engine.py`` leaves that to
+    a caller and publishes a plan describing which tiers are worth merging, and
+    this harness is such a caller. So the loop here is the whole policy: ask
+    :func:`~ledgerlog.compaction.plan_compaction` for the next ready tier, merge
+    it with :func:`~ledgerlog.compaction.compact_tier`, and look again. The
+    directory is rescanned each time rather than the plan being adjusted in
+    place, because a merge changes which tier every remaining table belongs to.
+
+    No engine may be open on ``directory`` while this runs. A merge deletes the
+    tables it consumed, and an engine holds a reader open on each one.
+
+    ``other_tables`` gets the whole scan, tier included, which is what
+    :func:`~ledgerlog.compaction.merge_tier` documents as the expected call: it
+    picks the tables older than the tier out of that list itself, and those are
+    what decide whether a tombstone can be dropped. No clock is passed, so no
+    record is dropped for having expired. This harness writes no TTLs, and
+    handing a merge a clock to drop records that cannot exist would put a line
+    in the report describing work that never happened.
+
+    The pass count is bounded by the number of tables the directory started
+    with. Each merge replaces at least two tables with one, so the loop
+    terminates on its own; the bound is there so that a policy that somehow made
+    a merge a no-op would raise instead of spinning on the disk forever.
+    """
+    start = time.perf_counter_ns()
+    initial = discover_sstables(directory).tables
+    tables_before = len(initial)
+    bytes_before = sum(table.size_bytes for table in initial)
+
+    passes = 0
+    while True:
+        tables = discover_sstables(directory).tables
+        plan = plan_compaction(tables, policy)
+        tier = plan.next_tier
+        if tier is None:
+            break
+        if passes >= tables_before:
+            raise BenchError(
+                f"compaction made {passes} passes over {tables_before} tables without"
+                " settling, which should be impossible: each merge replaces at least two"
+                " tables with one"
+            )
+        destination = directory / sstable_filename(max(table.sequence for table in tables) + 1)
+        compact_tier(tier, destination, other_tables=tables)
+        passes += 1
+
+    final = discover_sstables(directory).tables
+    return CompactionSummary(
+        passes=passes,
+        tables_before=tables_before,
+        tables_after=len(final),
+        bytes_before=bytes_before,
+        bytes_after=sum(table.size_bytes for table in final),
+        elapsed_seconds=(time.perf_counter_ns() - start) / 1e9,
+    )
+
+
+def _measure_amplification(
+    directory: Path,
+    config: BenchConfig,
+    label: str,
+    indices: Sequence[int] | None = None,
+) -> tuple[AmplificationPhaseResult, Sequence[int]]:
+    """Measure tables searched per read against the tables in ``directory``.
+
+    Opens an engine of its own over ``directory``. There is no log there to
+    replay on the first call and nothing writes to the one the engine creates,
+    so the memtable stays empty and every read reaches the tables, which is what
+    makes the two sides of the comparison differ only by the compaction between
+    them. The count of reads memory answered is returned with the rest so that
+    the claim is checked rather than stated.
+
+    ``indices`` is the read pattern, and it is handed straight back so that the
+    second call can be given the one the first used. Drawing twice from the same
+    seed would produce the same pattern only as long as both sides agreed on the
+    key range, and passing the sequence across means that agreement is something
+    the comparison does not have to rely on. It is returned rather than copied
+    because a copy into a narrower array type would be one more place for a
+    large run's indices to have to fit.
+
+    The probe is reset before each read and its counts taken after, which is how
+    a per-read figure comes out of a cumulative object. That is an attribute
+    write per read inside the loop, which is why this phase reports no latency:
+    it measures what a read did, and the other read phase measures what it cost.
+    """
+    with LedgerLog(
+        directory,
+        fsync_policy=config.fsync_policy,
+        fsync_interval_seconds=config.fsync_interval_seconds,
+        memtable_threshold_bytes=config.memtable_threshold_bytes,
+    ) as engine:
+        handles = engine.sstables
+        records_on_disk = sum(handle.record_count for handle in handles)
+        if records_on_disk < 1:
+            raise BenchError(
+                f"the read-amplification phase found no records on disk {label}: the run"
+                " wrote no SSTable, so lower --memtable-threshold-bytes or raise --records"
+            )
+        if indices is None:
+            indices = draw_read_indices(records_on_disk, config.read_count, config.seed)
+
+        expected = _value_for(config)
+        probe = ReadProbe()
+        samples = array("i")
+        hits = 0
+        wrong_values = 0
+        skipped_by_bloom = 0
+        false_positives = 0
+        served_from_memory = 0
+
+        start = time.perf_counter_ns()
+        for index in indices:
+            probe.reset()
+            value = engine.get(key_for_index(index), probe=probe)
+            samples.append(probe.sstables_consulted)
+            skipped_by_bloom += probe.sstables_skipped_by_bloom
+            false_positives += probe.sstables_without_match
+            served_from_memory += probe.found_in_memory
+            if value is not None:
+                hits += 1
+                if value != expected:
+                    wrong_values += 1
+        elapsed_ns = time.perf_counter_ns() - start
+
+    result = AmplificationPhaseResult(
+        label=label,
+        sstables=len(handles),
+        table_bytes=sum(handle.size_bytes for handle in handles),
+        records_on_disk=records_on_disk,
+        reads=len(samples),
+        hits=hits,
+        misses=len(samples) - hits,
+        wrong_values=wrong_values,
+        served_from_memory=served_from_memory,
+        tables_skipped_by_bloom=skipped_by_bloom,
+        bloom_false_positives=false_positives,
+        elapsed_seconds=elapsed_ns / 1e9,
+        searched=AmplificationSummary.from_samples(samples),
+    )
+    return result, indices
+
+
+def _run_amplification_phase(
+    engine: LedgerLog, config: BenchConfig, run_directory: Path
+) -> AmplificationComparison:
+    """Measure read amplification over the run's tables, before and after a compaction.
+
+    Story M10.2's two halves, in the only order they can happen in: snapshot the
+    run's committed tables into a workspace, measure there, compact there,
+    measure again. The workspace is a directory of its own so that the run's own
+    engine keeps serving its own tables, and so the compaction deletes links
+    rather than the tables the run wrote.
+
+    The engine opened for the first measurement is closed before the compaction
+    starts, because a merge deletes the files it consumed and that engine holds
+    a reader open on each of them.
+
+    Both measurements have to describe one dataset or the comparison means
+    nothing. The read pattern is the same sequence on both sides by
+    construction, so the one thing left that could differ is how many records
+    the tables hold, and that is checked. A merge of tables holding no
+    tombstones and no expiries reproduces every record it read, so a
+    disagreement there is a defect rather than a property of the workload, and
+    it is raised rather than printed under a heading that says the two are
+    comparable.
+    """
+    workspace = run_directory / AMPLIFICATION_DIRNAME
+    _snapshot_committed_tables(engine, workspace)
+
+    before, indices = _measure_amplification(workspace, config, "before compaction")
+    compaction = _compact_until_settled(workspace, CompactionPolicy())
+    after, _ = _measure_amplification(workspace, config, "after compaction", indices)
+
+    if after.records_on_disk != before.records_on_disk:
+        raise BenchError(
+            f"compaction changed the record count from {before.records_on_disk} to"
+            f" {after.records_on_disk}: the two sides of the comparison no longer"
+            " describe one dataset"
+        )
+    return AmplificationComparison(before=before, after=after, compaction=compaction)
+
+
 def run_bench(config: BenchConfig) -> BenchResult:
     """Run both phases against a fresh engine and return the measured figures.
 
@@ -777,6 +1359,11 @@ def run_bench(config: BenchConfig) -> BenchResult:
     for why reusing a directory would make the printed invocation lie. When no
     directory is given, the run happens in a temporary directory that is removed
     on the way out.
+
+    The read-amplification phase, when it is asked for, runs last and inside the
+    same directory, in a subdirectory of its own. It runs while the engine above
+    is still open, which costs a descriptor per table and nothing else: it works
+    on its own copies and never writes through this engine.
     """
     with ExitStack() as stack:
         if config.directory is None:
@@ -801,9 +1388,20 @@ def run_bench(config: BenchConfig) -> BenchResult:
 
         write = _run_write_phase(engine, config)
         read = _run_read_phase(engine, config)
+        amplification = (
+            _run_amplification_phase(engine, config, directory)
+            if config.read_amplification
+            else None
+        )
         filesystem = filesystem_type(directory.resolve())
 
-    return BenchResult(config=config, write=write, read=read, filesystem=filesystem)
+    return BenchResult(
+        config=config,
+        write=write,
+        read=read,
+        filesystem=filesystem,
+        amplification=amplification,
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -887,6 +1485,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="start the read phase without waiting for pending flushes to finish",
     )
     parser.add_argument(
+        "--read-amplification",
+        action="store_true",
+        dest="read_amplification",
+        help=(
+            "after the read phase, measure how many SSTables a read searches before and"
+            " after compacting the run's tables (needs a memtable threshold low enough"
+            " to produce several tables)"
+        ),
+    )
+    parser.add_argument(
         "--json",
         action="store_true",
         dest="emit_json",
@@ -912,6 +1520,7 @@ def config_from_args(args: argparse.Namespace) -> BenchConfig:
         seed=args.seed,
         directory=args.directory,
         drain_flushes=args.drain_flushes,
+        read_amplification=args.read_amplification,
     )
 
 
@@ -970,6 +1579,53 @@ def main(argv: Sequence[str] | None = None) -> int:
             file=sys.stderr,
         )
         status = 1
+    if result.amplification is not None:
+        status = max(status, _report_amplification_problems(result.amplification))
+    return status
+
+
+def _report_amplification_problems(comparison: AmplificationComparison) -> int:
+    """Print whatever makes the amplification figures untrustworthy. Returns an exit code.
+
+    The same rule the read phase follows: a read that found nothing, or found
+    the wrong value, is a correctness failure rather than a slow read, and a
+    harness that printed a tidy figure over it would be worse than one that
+    printed none. A read memory answered is added to that list here, because it
+    searched no table and so pulls the mean down while looking like a result.
+
+    A compaction that found no ready tier is a warning and not a failure: the
+    figures are true, they just describe the same tables twice.
+    """
+    status = 0
+    for phase in (comparison.before, comparison.after):
+        if phase.misses:
+            print(
+                f"error: {phase.misses} of {phase.reads} read-amplification reads"
+                f" {phase.label} found no value for a key this run wrote",
+                file=sys.stderr,
+            )
+            status = 1
+        if phase.wrong_values:
+            print(
+                f"error: {phase.wrong_values} of {phase.reads} read-amplification reads"
+                f" {phase.label} returned a value other than the one this run wrote",
+                file=sys.stderr,
+            )
+            status = 1
+        if phase.served_from_memory:
+            print(
+                f"error: {phase.served_from_memory} of {phase.reads} read-amplification"
+                f" reads {phase.label} were answered from memory, so they searched no"
+                " table and the reported figure understates the real one",
+                file=sys.stderr,
+            )
+            status = 1
+    if not comparison.ran_a_compaction:
+        print(
+            "warning: no tier was ready to merge, so the before and after figures describe"
+            " the same tables; lower --memtable-threshold-bytes or raise --records",
+            file=sys.stderr,
+        )
     return status
 
 
