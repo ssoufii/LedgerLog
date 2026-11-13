@@ -61,7 +61,7 @@ This milestone is a complete, durable, in-memory-only KV store. It's a good chec
 
 ## Milestone 10: benchmarking and polish
 - [x] `ledgerlog.bench`: sequential write throughput, random read latency, read amplification (how many SSTables touched per read) before/after compaction
-- [ ] Tune default sparse index interval, bloom filter false-positive rate, and size-tier thresholds based on bench results
+- [x] Tune default sparse index interval, bloom filter false-positive rate, and size-tier thresholds based on bench results
 - [ ] README numbers reflect actual measured results, not estimates (measured after tuning, so they describe the final defaults)
 
 ## Stretch goals (not required for a complete v1)

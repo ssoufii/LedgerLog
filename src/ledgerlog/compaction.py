@@ -138,19 +138,28 @@ sources' worth of bytes) lands in a tier above the sources it came from rather
 than back among them. A larger ratio makes tiers fewer and wider, which means
 more tables merged at once and more bytes rewritten per pass; a ratio just above
 one makes a tier of almost exactly equal files, which flushes do produce but
-merged outputs do not, so tiers above the first would rarely fill. A starting
-point rather than a measured optimum: ROADMAP.md milestone 10 (story M10.4) is
-where this is chosen against benchmark results.
+merged outputs do not, so tiers above the first would rarely fill.
+
+Confirmed by the M10.4 tuning spike (docs/TUNING.md), which measured size-tier
+settings under the incremental compaction schedule a running engine actually
+follows, where tables of several sizes coexist. Widening the ratio to four left
+more tables standing for a read to search at the same write cost, and narrowing
+it to one and a half changed neither the read figure nor the write cost enough
+to matter. Two is kept because the measurement put the balance there.
 """
 
 DEFAULT_MIN_TIER_TABLES = 4
 """How many tables a tier must hold before it is worth merging, by default.
 
-Four is the usual size-tiered starting point. It is the point where a merge pays:
-four tables become one, so a read that had to check four files checks one, for
-one rewrite of the data. Two would rewrite the same bytes to remove one file,
-and a much larger number would leave a read checking many tables while the tier
-waits to fill.
+Four is the usual size-tiered starting point, and the M10.4 tuning spike
+(docs/TUNING.md) kept it after measuring the alternatives under the incremental
+compaction schedule. It is the point where a merge pays: four tables become one,
+so a read that had to check four files checks one, for one rewrite of the data.
+Dropping the threshold to two roughly doubled the bytes rewritten (write
+amplification about 6.8 against about 3.0 at four) for no improvement in the
+tables a read searched, and raising it to eight cut the rewriting further but
+left a read searching more tables and reacted more slowly to a growing dataset.
+Four sat at the balance the spike was looking for.
 """
 
 MIN_MIN_TIER_TABLES = 2

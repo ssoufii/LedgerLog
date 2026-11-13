@@ -1,15 +1,27 @@
 """Benchmark harness: what this engine actually does, measured rather than claimed.
 
-Scope of this module today (stories M10.1 and M10.2): a sequential write phase
-that reports throughput, a randomized read phase that reports a latency
+Scope of this module today (stories M10.1, M10.2 and M10.4): a sequential write
+phase that reports throughput, a randomized read phase that reports a latency
 distribution, an optional read-amplification phase that reports how many
 SSTables a ``get`` searches before and after a compaction, and the CLI arguments
-that make the record count, the value size and the fsync policy part of the
-measurement instead of baked into it. Run it with::
+that make the record count, the value size, the fsync policy and the four
+tunables M10.4 chooses part of the measurement instead of baked into it. Run it
+with::
 
     python -m ledgerlog.bench --records 100000
     python -m ledgerlog.bench --records 100000 --read-amplification \\
         --memtable-threshold-bytes 65536
+    python -m ledgerlog.bench --records 100000 --read-amplification \\
+        --memtable-threshold-bytes 65536 --index-interval 128 --bloom-fp-rate 0.01
+
+Why the sparse index interval, the bloom target and the two size-tier knobs are
+command line arguments rather than constants the engine reads at the point it
+uses them: story M10.4 picks their defaults from measurements, and a sweep that
+had to monkey-patch another module's globals to vary them would be measuring a
+configuration no caller of this library could ask for. They reach the engine the
+way any caller's would, through its constructor, and the merged tables the
+amplification phase writes get the same two table settings the run's flushes
+did, so the two sides of that comparison differ by the merge alone.
 
 Read amplification is measured from inside the read path, through
 :class:`~ledgerlog.engine.ReadProbe`, and not inferred from how many tables the
@@ -123,7 +135,13 @@ from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
-from ledgerlog.compaction import CompactionPolicy, compact_tier, plan_compaction
+from ledgerlog.compaction import (
+    DEFAULT_MIN_TIER_TABLES,
+    DEFAULT_SIZE_RATIO,
+    CompactionPolicy,
+    compact_tier,
+    plan_compaction,
+)
 from ledgerlog.engine import (
     DEFAULT_MEMTABLE_THRESHOLD_BYTES,
     LedgerLog,
@@ -131,7 +149,14 @@ from ledgerlog.engine import (
     discover_sstables,
     sstable_filename,
 )
-from ledgerlog.sstable import MAX_RECORD_PAYLOAD_SIZE, RECORD_PAYLOAD_HEADER_SIZE
+from ledgerlog.sstable import (
+    DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
+    DEFAULT_INDEX_INTERVAL,
+    MAX_RECORD_PAYLOAD_SIZE,
+    RECORD_PAYLOAD_HEADER_SIZE,
+    validate_bloom_false_positive_rate,
+    validate_index_interval,
+)
 from ledgerlog.wal import (
     DEFAULT_FSYNC_INTERVAL_SECONDS,
     MAX_PAYLOAD_SIZE,
@@ -215,6 +240,43 @@ disk the rest of the run measured. It is not a name
 :func:`~ledgerlog.engine.sstable_filename` could produce and it is a directory
 rather than a file, so the run's own engine passes over it.
 """
+
+INCREMENTAL_DIRNAME = "read-amplification-incremental"
+"""Subdirectory the incremental compaction schedule rebuilds the dataset in.
+
+A second directory rather than the snapshot itself, because the incremental
+schedule consumes its tables as it goes and the snapshot has to survive the
+measurement taken against it. Both hold hard links into the run directory where
+the filesystem allows them, so the second copy costs no bytes either.
+"""
+
+COMPACTION_SCHEDULE_BULK = "bulk"
+"""Compact once, at the end, over every table the run flushed.
+
+The cheapest schedule and the one that answers story M10.2's question: it is the
+floor on tables searched per read, since every tier that can merge does, and it
+is what the harness did before the schedules were named.
+"""
+
+COMPACTION_SCHEDULE_INCREMENTAL = "incremental"
+"""Add the run's tables one flush at a time, merging whenever a tier fills.
+
+The schedule a running engine would follow, and the only one under which the
+size-tier knobs change anything. Compacting a finished directory in bulk puts
+every equally sized flush in one tier and merges the lot in a single pass, so
+:attr:`~ledgerlog.compaction.CompactionPolicy.min_tier_tables` and
+:attr:`~ledgerlog.compaction.CompactionPolicy.size_ratio` land on the same
+answer whatever they are set to. Rebuilding the directory flush by flush is what
+produces tables of several sizes, which is the situation the two knobs exist to
+describe, so story M10.4 measures them here.
+
+It costs what it measures: the merges a real engine would have run spread over
+the run's lifetime all happen inside this phase, so a run asking for it pays for
+every one of them.
+"""
+
+COMPACTION_SCHEDULES = (COMPACTION_SCHEDULE_BULK, COMPACTION_SCHEDULE_INCREMENTAL)
+"""Every schedule ``--compaction-schedule`` accepts."""
 
 MAX_HISTOGRAM_ROWS = 10
 """How many distinct per-read table counts the text report lists in full.
@@ -352,6 +414,11 @@ class BenchConfig:
     fsync_policy: FsyncPolicy = FsyncPolicy.ALWAYS
     fsync_interval_seconds: float = DEFAULT_FSYNC_INTERVAL_SECONDS
     memtable_threshold_bytes: int = DEFAULT_MEMTABLE_THRESHOLD_BYTES
+    index_interval: int = DEFAULT_INDEX_INTERVAL
+    bloom_false_positive_rate: float = DEFAULT_BLOOM_FALSE_POSITIVE_RATE
+    size_ratio: float = DEFAULT_SIZE_RATIO
+    min_tier_tables: int = DEFAULT_MIN_TIER_TABLES
+    compaction_schedule: str = COMPACTION_SCHEDULE_BULK
     seed: int = 0
     directory: Path | None = None
     drain_flushes: bool = True
@@ -397,6 +464,30 @@ class BenchConfig:
             raise ValueError(
                 f"memtable_threshold_bytes must be at least 1, got {self.memtable_threshold_bytes}"
             )
+        # Delegated to the engine's own validators rather than restated, so a
+        # value this harness accepts is exactly a value an engine accepts and a
+        # sweep cannot report a figure for a setting no caller could have used.
+        # The compaction knobs are checked by building the policy the run would
+        # have used, which is where their rules live.
+        validate_index_interval(self.index_interval)
+        validate_bloom_false_positive_rate(self.bloom_false_positive_rate)
+        self.compaction_policy()
+        if self.compaction_schedule not in COMPACTION_SCHEDULES:
+            raise ValueError(
+                f"compaction_schedule must be one of {', '.join(COMPACTION_SCHEDULES)},"
+                f" got {self.compaction_schedule!r}"
+            )
+
+    def compaction_policy(self) -> CompactionPolicy:
+        """Return the size-tier policy this run compacts under.
+
+        Built on demand rather than stored on the configuration, because
+        :class:`~ledgerlog.compaction.CompactionPolicy` validates in its own
+        constructor and a configuration holding a pre-built one would have to
+        either duplicate those rules or accept a policy that disagreed with the
+        two numbers printed in the invocation.
+        """
+        return CompactionPolicy(size_ratio=self.size_ratio, min_tier_tables=self.min_tier_tables)
 
     @property
     def read_count(self) -> int:
@@ -422,6 +513,11 @@ class BenchConfig:
             "fsync_policy": self.fsync_policy.value,
             "fsync_interval_seconds": self.fsync_interval_seconds,
             "memtable_threshold_bytes": self.memtable_threshold_bytes,
+            "index_interval": self.index_interval,
+            "bloom_false_positive_rate": self.bloom_false_positive_rate,
+            "size_ratio": self.size_ratio,
+            "min_tier_tables": self.min_tier_tables,
+            "compaction_schedule": self.compaction_schedule,
             "seed": self.seed,
             "drain_flushes": self.drain_flushes,
             "read_amplification": self.read_amplification,
@@ -437,6 +533,13 @@ class BenchConfig:
         different, empty directory on the same disk measures the same thing. The
         directory must be empty for that to hold, which :func:`run_bench`
         enforces, and the filesystem it sits on is printed in the report.
+
+        The four tuning knobs are printed even when they hold the module
+        defaults, unlike ``--fsync-interval``, which is printed only when the
+        policy reads it. They are the defaults story M10.4 changes, so a figure
+        that named them only when they were overridden would stop describing its
+        own run the moment a later commit moved a default, and the matrix in
+        docs/TUNING.md is exactly a set of runs that differ in nothing else.
         """
         parts = [
             "python -m ledgerlog.bench",
@@ -445,6 +548,11 @@ class BenchConfig:
             f"--reads {self.read_count}",
             f"--fsync-policy {self.fsync_policy.value}",
             f"--memtable-threshold-bytes {self.memtable_threshold_bytes}",
+            f"--index-interval {self.index_interval}",
+            f"--bloom-fp-rate {self.bloom_false_positive_rate}",
+            f"--size-ratio {self.size_ratio}",
+            f"--min-tier-tables {self.min_tier_tables}",
+            f"--compaction-schedule {self.compaction_schedule}",
             f"--seed {self.seed}",
         ]
         if self.fsync_policy is FsyncPolicy.INTERVAL:
@@ -778,15 +886,35 @@ class CompactionSummary:
     bytes_before: int
     bytes_after: int
     elapsed_seconds: float
+    schedule: str = COMPACTION_SCHEDULE_BULK
+    bytes_rewritten: int = 0
+    """Bytes of merged table this compaction wrote, summed over its passes.
+
+    The write-amplification side of the size-tier trade-off, and the reason the
+    two knobs are not free: a policy that merges sooner leaves fewer tables for
+    a read to search and rewrites more bytes to get there. It is the sum over
+    passes rather than the final table's size, so a record merged through three
+    tiers is counted three times, which is what it cost.
+    """
+
+    @property
+    def write_amplification(self) -> float:
+        """Merged bytes written per byte the run flushed, or zero if nothing was flushed."""
+        if self.bytes_before <= 0:
+            return 0.0
+        return self.bytes_rewritten / self.bytes_before
 
     def to_dict(self) -> dict[str, object]:
         """Return the summary as plain JSON-safe values."""
         return {
+            "schedule": self.schedule,
             "passes": self.passes,
             "tables_before": self.tables_before,
             "tables_after": self.tables_after,
             "bytes_before": self.bytes_before,
             "bytes_after": self.bytes_after,
+            "bytes_rewritten": self.bytes_rewritten,
+            "write_amplification": self.write_amplification,
             "elapsed_seconds": self.elapsed_seconds,
         }
 
@@ -935,11 +1063,14 @@ def _format_amplification(comparison: AmplificationComparison) -> list[str]:
     lines = [
         "",
         "Read amplification (SSTables searched per get, measured in the read path)",
+        f"  schedule:           {compaction.schedule}",
         f"  compaction:         {compaction.passes} tier merge(s) in"
         f" {compaction.elapsed_seconds:.3f} s,"
         f" {compaction.tables_before} tables -> {compaction.tables_after},"
         f" {compaction.bytes_before / (1024 * 1024):.2f} MiB ->"
         f" {compaction.bytes_after / (1024 * 1024):.2f} MiB",
+        f"  bytes rewritten:    {compaction.bytes_rewritten / (1024 * 1024):.2f} MiB"
+        f" ({compaction.write_amplification:.2f}x the bytes flushed)",
     ]
     if not comparison.ran_a_compaction:
         lines.append(
@@ -1158,7 +1289,13 @@ def _snapshot_committed_tables(engine: LedgerLog, destination: Path) -> tuple[in
     return len(handles), total_bytes
 
 
-def _compact_until_settled(directory: Path, policy: CompactionPolicy) -> CompactionSummary:
+def _compact_until_settled(
+    directory: Path,
+    policy: CompactionPolicy,
+    *,
+    index_interval: int = DEFAULT_INDEX_INTERVAL,
+    bloom_false_positive_rate: float = DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
+) -> CompactionSummary:
     """Merge ready tiers in ``directory`` until none is ready, and report what happened.
 
     The engine does not run compactions of its own: ``engine.py`` leaves that to
@@ -1180,6 +1317,13 @@ def _compact_until_settled(directory: Path, policy: CompactionPolicy) -> Compact
     handing a merge a clock to drop records that cannot exist would put a line
     in the report describing work that never happened.
 
+    The merged tables are written with the same index cadence and bloom target
+    the run's flushes used, so that the after side of the comparison differs
+    from the before side by the merge and not by a table layout the sweep did
+    not ask for. Leaving them at the module defaults would quietly make every
+    "after" figure in the M10.4 matrix describe the default layout, whatever
+    setting the run was measuring.
+
     The pass count is bounded by the number of tables the directory started
     with. Each merge replaces at least two tables with one, so the loop
     terminates on its own; the bound is there so that a policy that somehow made
@@ -1190,22 +1334,13 @@ def _compact_until_settled(directory: Path, policy: CompactionPolicy) -> Compact
     tables_before = len(initial)
     bytes_before = sum(table.size_bytes for table in initial)
 
-    passes = 0
-    while True:
-        tables = discover_sstables(directory).tables
-        plan = plan_compaction(tables, policy)
-        tier = plan.next_tier
-        if tier is None:
-            break
-        if passes >= tables_before:
-            raise BenchError(
-                f"compaction made {passes} passes over {tables_before} tables without"
-                " settling, which should be impossible: each merge replaces at least two"
-                " tables with one"
-            )
-        destination = directory / sstable_filename(max(table.sequence for table in tables) + 1)
-        compact_tier(tier, destination, other_tables=tables)
-        passes += 1
+    passes, rewritten = _merge_ready_tiers(
+        directory,
+        policy,
+        pass_limit=tables_before,
+        index_interval=index_interval,
+        bloom_false_positive_rate=bloom_false_positive_rate,
+    )
 
     final = discover_sstables(directory).tables
     return CompactionSummary(
@@ -1215,6 +1350,149 @@ def _compact_until_settled(directory: Path, policy: CompactionPolicy) -> Compact
         bytes_before=bytes_before,
         bytes_after=sum(table.size_bytes for table in final),
         elapsed_seconds=(time.perf_counter_ns() - start) / 1e9,
+        schedule=COMPACTION_SCHEDULE_BULK,
+        bytes_rewritten=rewritten,
+    )
+
+
+def _merge_ready_tiers(
+    directory: Path,
+    policy: CompactionPolicy,
+    *,
+    pass_limit: int,
+    index_interval: int,
+    bloom_false_positive_rate: float,
+) -> tuple[int, int]:
+    """Merge ready tiers in ``directory`` until none is ready. Returns passes and bytes written.
+
+    The loop both schedules share, factored out so that the incremental schedule
+    runs the same merges the bulk one does and the two can only differ in when
+    they are asked to. The directory is rescanned on every iteration rather than
+    the plan adjusted in place, because a merge changes which tier every
+    remaining table belongs to.
+
+    ``pass_limit`` bounds the loop. Each merge replaces at least two tables with
+    one, so it terminates on its own and the bound only catches a policy that
+    somehow made a merge a no-op, which would otherwise spin on the disk.
+
+    The merged size is read from the swap's own file rather than summed from the
+    sources, since dropped tombstones and expired records make those two
+    different numbers and the one worth reporting is what was actually written.
+    """
+    passes = 0
+    rewritten = 0
+    while True:
+        tables = discover_sstables(directory).tables
+        plan = plan_compaction(tables, policy)
+        tier = plan.next_tier
+        if tier is None:
+            return passes, rewritten
+        if passes >= pass_limit:
+            raise BenchError(
+                f"compaction made {passes} passes without settling, which should be"
+                " impossible: each merge replaces at least two tables with one"
+            )
+        destination = directory / sstable_filename(max(table.sequence for table in tables) + 1)
+        swap = compact_tier(
+            tier,
+            destination,
+            other_tables=tables,
+            index_interval=index_interval,
+            bloom_false_positive_rate=bloom_false_positive_rate,
+        )
+        rewritten += swap.merged.stat().st_size
+        passes += 1
+
+
+def _compact_incrementally(
+    source: Path,
+    destination: Path,
+    policy: CompactionPolicy,
+    *,
+    index_interval: int,
+    bloom_false_positive_rate: float,
+) -> CompactionSummary:
+    """Rebuild ``source``'s tables in ``destination`` flush by flush, merging as tiers fill.
+
+    The schedule a running engine follows, reconstructed after the fact: add one
+    flushed table, ask whether any tier is now ready, merge the ones that are,
+    then add the next. What comes out is the table-size distribution the policy
+    settles at rather than the single table a bulk compaction of a finished
+    directory always produces, and that distribution is the thing the two
+    size-tier knobs decide. See :data:`COMPACTION_SCHEDULE_INCREMENTAL`.
+
+    Tables are added oldest first, renumbered so that each one is newer than
+    everything already in ``destination``, including the merges. Keeping their
+    original sequence numbers would make a table added after a merge look older
+    than that merge, which would invert newest-wins for any key the two shared.
+    This harness writes each key exactly once so no key is shared, and the
+    renumbering is here so that the reconstruction does not depend on that.
+
+    ``destination`` must not already exist, for the reason the snapshot's own
+    directory must not: tables already there would be merged and measured as if
+    this run had written them.
+
+    The links are made from ``source`` rather than from the engine, so this never
+    touches the run's own tables: the merges here unlink names in
+    ``destination`` and the snapshot's links keep the inodes alive.
+    """
+    start = time.perf_counter_ns()
+    try:
+        destination.mkdir(parents=True, exist_ok=False)
+    except OSError as error:
+        raise BenchError(
+            f"could not create the incremental compaction workspace {str(destination)!r}: {error!r}"
+        ) from error
+
+    flushed = sorted(discover_sstables(source).tables, key=lambda table: table.sequence)
+    tables_before = len(flushed)
+    bytes_before = sum(table.size_bytes for table in flushed)
+
+    passes = 0
+    rewritten = 0
+    next_sequence = 0
+    for table in flushed:
+        target = destination / sstable_filename(next_sequence)
+        next_sequence += 1
+        try:
+            os.link(table.path, target)
+        except OSError:
+            try:
+                shutil.copy2(table.path, target)
+            except OSError as error:
+                raise BenchError(
+                    f"could not stage table {str(table.path)!r} for the incremental"
+                    f" compaction schedule: {error!r}"
+                ) from error
+        # Bounded by the tables staged so far, which is the most merges that
+        # could possibly be outstanding: every one of them removes at least two.
+        merged, merged_bytes = _merge_ready_tiers(
+            destination,
+            policy,
+            pass_limit=next_sequence,
+            index_interval=index_interval,
+            bloom_false_positive_rate=bloom_false_positive_rate,
+        )
+        passes += merged
+        rewritten += merged_bytes
+        if merged:
+            # A merge names its output above every sequence present, so the next
+            # staged table has to clear that too or it would reuse a name.
+            next_sequence = max(
+                next_sequence,
+                max(existing.sequence for existing in discover_sstables(destination).tables) + 1,
+            )
+
+    final = discover_sstables(destination).tables
+    return CompactionSummary(
+        passes=passes,
+        tables_before=tables_before,
+        tables_after=len(final),
+        bytes_before=bytes_before,
+        bytes_after=sum(table.size_bytes for table in final),
+        elapsed_seconds=(time.perf_counter_ns() - start) / 1e9,
+        schedule=COMPACTION_SCHEDULE_INCREMENTAL,
+        bytes_rewritten=rewritten,
     )
 
 
@@ -1251,6 +1529,9 @@ def _measure_amplification(
         fsync_policy=config.fsync_policy,
         fsync_interval_seconds=config.fsync_interval_seconds,
         memtable_threshold_bytes=config.memtable_threshold_bytes,
+        index_interval=config.index_interval,
+        bloom_false_positive_rate=config.bloom_false_positive_rate,
+        compaction_policy=config.compaction_policy(),
     ) as engine:
         handles = engine.sstables
         records_on_disk = sum(handle.record_count for handle in handles)
@@ -1318,6 +1599,12 @@ def _run_amplification_phase(
     starts, because a merge deletes the files it consumed and that engine holds
     a reader open on each of them.
 
+    Under the incremental schedule the second measurement runs in a directory of
+    its own, since that schedule rebuilds the dataset table by table rather than
+    compacting the snapshot in place. Both directories hold links to the same
+    inodes, so the two sides still describe one dataset, which the record count
+    check below confirms rather than assumes.
+
     Both measurements have to describe one dataset or the comparison means
     nothing. The read pattern is the same sequence on both sides by
     construction, so the one thing left that could differ is how many records
@@ -1331,8 +1618,25 @@ def _run_amplification_phase(
     _snapshot_committed_tables(engine, workspace)
 
     before, indices = _measure_amplification(workspace, config, "before compaction")
-    compaction = _compact_until_settled(workspace, CompactionPolicy())
-    after, _ = _measure_amplification(workspace, config, "after compaction", indices)
+    policy = config.compaction_policy()
+    if config.compaction_schedule == COMPACTION_SCHEDULE_INCREMENTAL:
+        measured_in = run_directory / INCREMENTAL_DIRNAME
+        compaction = _compact_incrementally(
+            workspace,
+            measured_in,
+            policy,
+            index_interval=config.index_interval,
+            bloom_false_positive_rate=config.bloom_false_positive_rate,
+        )
+    else:
+        measured_in = workspace
+        compaction = _compact_until_settled(
+            workspace,
+            policy,
+            index_interval=config.index_interval,
+            bloom_false_positive_rate=config.bloom_false_positive_rate,
+        )
+    after, _ = _measure_amplification(measured_in, config, "after compaction", indices)
 
     if after.records_on_disk != before.records_on_disk:
         raise BenchError(
@@ -1383,6 +1687,9 @@ def run_bench(config: BenchConfig) -> BenchResult:
                 fsync_policy=config.fsync_policy,
                 fsync_interval_seconds=config.fsync_interval_seconds,
                 memtable_threshold_bytes=config.memtable_threshold_bytes,
+                index_interval=config.index_interval,
+                bloom_false_positive_rate=config.bloom_false_positive_rate,
+                compaction_policy=config.compaction_policy(),
             )
         )
 
@@ -1464,6 +1771,53 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--index-interval",
+        type=int,
+        default=DEFAULT_INDEX_INTERVAL,
+        help=(
+            "records between two sparse index entries in the tables this run writes "
+            f"(default: {DEFAULT_INDEX_INTERVAL})"
+        ),
+    )
+    parser.add_argument(
+        "--bloom-fp-rate",
+        type=float,
+        default=DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
+        dest="bloom_false_positive_rate",
+        help=(
+            "target bloom filter false-positive rate for the tables this run writes "
+            f"(default: {DEFAULT_BLOOM_FALSE_POSITIVE_RATE})"
+        ),
+    )
+    parser.add_argument(
+        "--size-ratio",
+        type=float,
+        default=DEFAULT_SIZE_RATIO,
+        help=(
+            "how far the largest table in a size tier may exceed the smallest "
+            f"(default: {DEFAULT_SIZE_RATIO})"
+        ),
+    )
+    parser.add_argument(
+        "--min-tier-tables",
+        type=int,
+        default=DEFAULT_MIN_TIER_TABLES,
+        help=(
+            f"tables a size tier must hold before it is merged (default: {DEFAULT_MIN_TIER_TABLES})"
+        ),
+    )
+    parser.add_argument(
+        "--compaction-schedule",
+        choices=COMPACTION_SCHEDULES,
+        default=COMPACTION_SCHEDULE_BULK,
+        help=(
+            "when the read-amplification phase compacts: once over every table"
+            " (bulk), or flush by flush as a running engine would (incremental,"
+            " the only schedule the size-tier options change)"
+            f" (default: {COMPACTION_SCHEDULE_BULK})"
+        ),
+    )
+    parser.add_argument(
         "--seed",
         type=int,
         default=0,
@@ -1517,6 +1871,11 @@ def config_from_args(args: argparse.Namespace) -> BenchConfig:
         fsync_policy=args.fsync_policy,
         fsync_interval_seconds=args.fsync_interval_seconds,
         memtable_threshold_bytes=args.memtable_threshold_bytes,
+        index_interval=args.index_interval,
+        bloom_false_positive_rate=args.bloom_false_positive_rate,
+        size_ratio=args.size_ratio,
+        min_tier_tables=args.min_tier_tables,
+        compaction_schedule=args.compaction_schedule,
         seed=args.seed,
         directory=args.directory,
         drain_flushes=args.drain_flushes,

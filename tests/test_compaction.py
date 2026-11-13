@@ -209,6 +209,18 @@ def test_the_default_policy_is_the_documented_pair() -> None:
     assert policy.min_tier_tables == DEFAULT_MIN_TIER_TABLES
 
 
+def test_the_default_size_tier_knobs_are_the_values_the_m10_spike_kept() -> None:
+    """Pins the defaults the M10.4 sweep settled on (docs/TUNING.md) so their basis cannot rot.
+
+    Ratio two and four tables per tier: the spike measured the alternatives under
+    the incremental compaction schedule and found this the balance between tables
+    searched per read and bytes rewritten per merge. A change here should come
+    with a change to that writeup.
+    """
+    assert DEFAULT_SIZE_RATIO == 2.0
+    assert DEFAULT_MIN_TIER_TABLES == 4
+
+
 def test_the_default_ratio_stays_below_the_default_threshold() -> None:
     """The relationship the module's docstring rests on, asserted so it cannot drift.
 
