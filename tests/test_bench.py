@@ -37,21 +37,27 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+from pathlib import Path
 
 import pytest
 
 from ledgerlog.bench import (
+    DEFAULT_MAX_READS,
     DEFAULT_VALUE_SIZE_BYTES,
     KEY_INDEX_DIGITS,
     MAX_RECORDS,
+    MAX_VALUE_SIZE_BYTES,
     PERCENTILES,
     BenchConfig,
+    BenchError,
+    BenchResult,
     LatencySummary,
     ReadPhaseResult,
     WritePhaseResult,
     build_parser,
     config_from_args,
     draw_read_indices,
+    filesystem_type,
     key_for_index,
     main,
     nearest_rank_percentile,
@@ -217,7 +223,7 @@ def test_write_throughput_is_records_over_elapsed() -> None:
     )
 
     assert result.records_per_second == pytest.approx(500.0)
-    assert result.megabytes_per_second == pytest.approx(0.5)
+    assert result.mib_per_second == pytest.approx(0.5)
 
 
 def test_write_throughput_survives_an_unmeasurably_short_phase() -> None:
@@ -225,7 +231,7 @@ def test_write_throughput_survives_an_unmeasurably_short_phase() -> None:
     result = WritePhaseResult(records=1, value_size_bytes=0, payload_bytes=0, elapsed_seconds=0.0)
 
     assert result.records_per_second == float("inf")
-    assert result.megabytes_per_second == float("inf")
+    assert result.mib_per_second == float("inf")
 
 
 def test_read_throughput_is_reads_over_elapsed() -> None:
@@ -235,7 +241,7 @@ def test_read_throughput_is_reads_over_elapsed() -> None:
         hits=300,
         misses=0,
         elapsed_seconds=1.5,
-        sstables_consulted_from=3,
+        sstables_at_read_time=3,
         latency=LatencySummary.from_samples([1, 2, 3]),
     )
 
@@ -263,6 +269,31 @@ def test_config_rejects_values_that_cannot_be_measured() -> None:
         BenchConfig(records=10, reads=0)
     with pytest.raises(ValueError, match="memtable_threshold_bytes must be at least 1"):
         BenchConfig(records=10, memtable_threshold_bytes=0)
+
+
+@pytest.mark.parametrize("interval", [0.0, -1.0, float("nan"), float("inf")])
+def test_config_rejects_an_unusable_fsync_interval_under_every_policy(interval: float) -> None:
+    """The WAL checks the interval for every policy, so the config must as well.
+
+    Otherwise the value passes here and fails inside the engine as a traceback,
+    after a directory has been created.
+    """
+    for policy in FsyncPolicy:
+        with pytest.raises(ValueError, match="fsync_interval_seconds"):
+            BenchConfig(records=10, fsync_policy=policy, fsync_interval_seconds=interval)
+
+
+def test_config_rejects_a_value_too_large_for_the_record_formats() -> None:
+    """An oversized value is refused up front rather than on the first put."""
+    assert BenchConfig(records=1, value_size_bytes=MAX_VALUE_SIZE_BYTES).value_size_bytes > 0
+    with pytest.raises(ValueError, match="fit the record formats"):
+        BenchConfig(records=1, value_size_bytes=MAX_VALUE_SIZE_BYTES + 1)
+
+
+def test_default_read_count_is_capped_so_the_sample_fits_in_memory() -> None:
+    """One read per record by default, but never more than the cap unless asked."""
+    assert BenchConfig(records=DEFAULT_MAX_READS * 3).read_count == DEFAULT_MAX_READS
+    assert BenchConfig(records=10, reads=DEFAULT_MAX_READS * 2).read_count == DEFAULT_MAX_READS * 2
 
 
 def test_config_rejects_a_record_count_wider_than_the_key_padding() -> None:
@@ -500,27 +531,23 @@ def test_run_bench_reads_across_several_sstables_when_the_memtable_is_small() ->
         _fast_config(records=600, value_size_bytes=64, memtable_threshold_bytes=2048)
     )
 
-    assert result.read.sstables_consulted_from >= 2
+    assert result.read.sstables_at_read_time >= 2
     assert result.read.misses == 0
 
 
-class _NeverDrainingEngine:
-    """Stands in for an engine whose flush never completes, which no real run reaches.
+class _StubEngine:
+    """Minimal stand-in for ``LedgerLog``, for failure paths a healthy engine never takes.
 
-    The path under test is the one a flush that keeps failing produces: the
-    frozen table never goes away, so ``wait_for_flush`` reports a timeout rather
-    than raising, and a harness that waited without a bound would hang with
-    nothing printed. A stub is the only way to reach that, since a healthy engine
-    always drains and an engine made to fail for real would be a test of the
-    engine rather than of the harness's response to it.
+    Subclasses override one behavior each. A stub rather than a real engine made
+    to fail, because what is under test is the harness's response to the
+    failure, not the engine's.
     """
-
-    flush_error = RuntimeError("disk on fire")
 
     def __init__(self, *args: object, **kwargs: object) -> None:
         self.sstables: tuple[object, ...] = ()
+        self.memtable_nbytes = 0
 
-    def __enter__(self) -> _NeverDrainingEngine:
+    def __enter__(self) -> _StubEngine:
         return self
 
     def __exit__(self, *exc_info: object) -> bool:
@@ -530,21 +557,141 @@ class _NeverDrainingEngine:
         return None
 
     def get(self, key: bytes) -> bytes | None:
-        return b""
+        return b"v" * 32
 
     def flush_pending(self) -> tuple[object, ...]:
         return ()
 
-    def wait_for_flush(self, timeout: float | None = None) -> bool:
-        return False
+
+class _FailingFlushEngine(_StubEngine):
+    """An engine whose flush raises, which is how a real failing flush surfaces.
+
+    ``flush_pending`` retries a table the background thread failed on and raises
+    that failure on the calling thread, so this is the path the drain has to
+    handle, rather than a wait that never returns.
+    """
+
+    def flush_pending(self) -> tuple[object, ...]:
+        raise OSError("disk on fire")
 
 
-def test_run_bench_gives_up_on_a_flush_that_never_drains(monkeypatch) -> None:  # type: ignore[no-untyped-def]
-    """A failing flush must end the run with a reason, not hang the command forever."""
-    monkeypatch.setattr("ledgerlog.bench.LedgerLog", _NeverDrainingEngine)
+class _WrongValueEngine(_StubEngine):
+    """An engine that finds every key but returns the wrong bytes for it."""
 
-    with pytest.raises(RuntimeError, match="timed out"):
+    def get(self, key: bytes) -> bytes | None:
+        return b"stale"
+
+
+def test_run_bench_reports_a_failing_flush_as_a_bench_error(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A flush that fails during the drain ends the run with the reason, not a hang."""
+    monkeypatch.setattr("ledgerlog.bench.LedgerLog", _FailingFlushEngine)
+
+    with pytest.raises(BenchError, match="disk on fire"):
         run_bench(_fast_config(records=5))
+
+
+def test_main_exits_one_with_a_message_when_the_drain_fails(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """The failure reaches the shell as one line and a non-zero code, not a traceback."""
+    monkeypatch.setattr("ledgerlog.bench.LedgerLog", _FailingFlushEngine)
+
+    assert main(["--records", "5", "--fsync-policy", "never"]) == 1
+    assert "disk on fire" in capsys.readouterr().err
+
+
+def test_run_bench_counts_reads_that_return_the_wrong_value(monkeypatch) -> None:  # type: ignore[no-untyped-def]
+    """A stale or wrong value is a correctness failure, not a hit."""
+    monkeypatch.setattr("ledgerlog.bench.LedgerLog", _WrongValueEngine)
+
+    result = run_bench(_fast_config(records=20, reads=20))
+
+    assert result.read.misses == 0
+    assert result.read.wrong_values == 20
+
+
+def test_main_exits_one_when_a_read_returns_the_wrong_value(monkeypatch, capsys) -> None:  # type: ignore[no-untyped-def]
+    """The exit code carries the failure, so a script cannot quote a wrong-value run."""
+    monkeypatch.setattr("ledgerlog.bench.LedgerLog", _WrongValueEngine)
+
+    assert main(["--records", "5", "--value-size", "32", "--fsync-policy", "never"]) == 1
+    assert "value other than the one this run wrote" in capsys.readouterr().err
+
+
+def test_run_bench_drains_every_frozen_table_and_times_the_drain() -> None:
+    """After the drain nothing is frozen, and the drain is part of the write elapsed time."""
+    result = run_bench(
+        _fast_config(records=600, value_size_bytes=64, memtable_threshold_bytes=2048)
+    )
+
+    assert 0.0 <= result.write.drain_seconds <= result.write.elapsed_seconds
+    # Everything still in memory is the active memtable's remainder, which is
+    # always under one threshold's worth: anything more would have been frozen.
+    assert result.read.memtable_bytes_at_read_time < 2048
+    assert result.read.wrong_values == 0
+
+
+def test_run_bench_refuses_a_directory_that_already_holds_data(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """A reused directory replays an old run, so the printed invocation would not reproduce it."""
+    directory = tmp_path / "used"
+    run_bench(_fast_config(records=10, directory=directory))
+
+    with pytest.raises(ValueError, match="must be empty"):
+        run_bench(_fast_config(records=10, directory=directory))
+
+
+def test_run_bench_accepts_an_existing_empty_directory(tmp_path) -> None:  # type: ignore[no-untyped-def]
+    """Empty is as good as new: nothing in it can be replayed."""
+    directory = tmp_path / "empty"
+    directory.mkdir()
+
+    assert run_bench(_fast_config(records=10, directory=directory)).read.misses == 0
+
+
+def test_main_exits_two_on_a_non_empty_directory(tmp_path, capsys) -> None:  # type: ignore[no-untyped-def]
+    """Refused like any other bad configuration: one line, exit 2."""
+    (tmp_path / "leftover").write_bytes(b"x")
+
+    assert main(["--records", "5", "--directory", str(tmp_path)]) == 2
+    assert "must be empty" in capsys.readouterr().err
+
+
+def test_main_exits_two_on_an_unusable_fsync_interval(capsys) -> None:  # type: ignore[no-untyped-def]
+    """Previously this escaped as a traceback from inside the WAL."""
+    assert main(["--records", "5", "--fsync-interval", "0"]) == 2
+    assert "fsync_interval_seconds" in capsys.readouterr().err
+
+
+_MOUNTS = """\
+/dev/sda1 / ext4 rw,relatime 0 0
+tmpfs /tmp tmpfs rw,nosuid,nodev 0 0
+/dev/sdb1 /tmp/disk xfs rw 0 0
+/dev/sdc1 /mnt/my\\040drive ext4 rw 0 0
+"""
+
+
+def test_filesystem_type_picks_the_longest_containing_mount() -> None:
+    """The kernel resolves a path through its deepest mount, so that is the one reported."""
+    assert filesystem_type(Path("/tmp/ledgerlog-abc"), _MOUNTS) == "tmpfs"
+    assert filesystem_type(Path("/tmp/disk/run"), _MOUNTS) == "xfs"
+    assert filesystem_type(Path("/home/user"), _MOUNTS) == "ext4"
+    assert filesystem_type(Path("/tmpfoo"), _MOUNTS) == "ext4"
+    assert filesystem_type(Path("/mnt/my drive/run"), _MOUNTS) == "ext4"
+    assert filesystem_type(Path("/anything"), "") is None
+
+
+def test_report_warns_when_the_run_was_on_a_ram_backed_filesystem() -> None:
+    """An fsync-always figure from tmpfs measures memory, and the report has to say so."""
+    measured = run_bench(_fast_config(records=10))
+    on_tmpfs = BenchResult(
+        config=measured.config, write=measured.write, read=measured.read, filesystem="tmpfs"
+    )
+    on_disk = BenchResult(
+        config=measured.config, write=measured.write, read=measured.read, filesystem="ext4"
+    )
+
+    assert on_tmpfs.ram_backed and "RAM-backed" in on_tmpfs.format_report()
+    assert on_tmpfs.to_dict()["ram_backed_filesystem"] is True
+    assert not on_disk.ram_backed and "RAM-backed" not in on_disk.format_report()
+    assert "filesystem: ext4" in on_disk.format_report()
 
 
 def test_run_bench_without_draining_still_reads_every_key() -> None:

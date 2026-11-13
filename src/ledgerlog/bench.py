@@ -42,13 +42,31 @@ that fixed, tiny cost is inside the timed region and reported as part of it. The
 alternative, materializing every key in a list first, would make the harness's
 memory rather than the engine's the thing that caps ``--records``.
 
-Why the read phase drains pending flushes first, unless told not to: a read
-phase run while the background flusher is still working measures a tree that is
-changing underneath it, so the same command would report a different latency
-depending on how the thread happened to be scheduled. Draining first makes the
-run repeatable and makes the reported figure attributable to a settled set of
-tables. ``--no-drain-flushes`` keeps the other case available, since reading
-against an in-flight flush is a real workload and worth being able to measure.
+Why the write phase drains pending flushes before its timer stops, unless told
+not to: a read phase run while the background flusher is still working measures
+a tree that is changing underneath it, so the same command would report a
+different latency depending on how the thread happened to be scheduled. Draining
+first makes the run repeatable. The drain is charged to the write phase, and its
+share is reported on its own line, because the flushes it waits for are work the
+writes caused: stopping the clock before them would make the throughput depend
+on whether the last flush happened to finish inside the loop or just after it.
+Only frozen memtables are drained. The active memtable keeps whatever was written
+after the last freeze, as it would in any running engine, so the report prints
+how many bytes the read phase found there next to the table count.
+``--no-drain-flushes`` keeps the other case available, since reading against an
+in-flight flush is a real workload and worth being able to measure.
+
+Why a named ``--directory`` must be empty: the engine adopts whatever log and
+tables it finds there, so a second run in the same directory overwrites the
+first run's keys and reads across its tables too. That run measures a different
+workload while printing the same invocation, which is exactly the untraceable
+figure story M10.3 rules out. Refusing is cheaper than explaining.
+
+Why the storage under the run directory is reported: ``fsync`` on a RAM-backed
+filesystem (tmpfs, which is where ``/tmp`` lives on many Linux systems) returns
+at once, so an fsync-always run there measures memory while calling itself
+durable. The harness cannot pick a better disk for the caller, but it can say
+which filesystem it ran on and warn when that filesystem cannot honor an fsync.
 
 Why keys are derived from their index by a pure function rather than drawn at
 random: the read phase has to ask for keys the write phase wrote, and a formula
@@ -64,18 +82,26 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import statistics
 import sys
 import tempfile
 import time
+from array import array
 from collections.abc import Sequence
 from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 
 from ledgerlog.engine import DEFAULT_MEMTABLE_THRESHOLD_BYTES, LedgerLog
-from ledgerlog.wal import DEFAULT_FSYNC_INTERVAL_SECONDS, FsyncPolicy
+from ledgerlog.sstable import MAX_RECORD_PAYLOAD_SIZE, RECORD_PAYLOAD_HEADER_SIZE
+from ledgerlog.wal import (
+    DEFAULT_FSYNC_INTERVAL_SECONDS,
+    MAX_PAYLOAD_SIZE,
+    PAYLOAD_HEADER_SIZE,
+    FsyncPolicy,
+)
 
 KEY_PREFIX = b"bench/key/"
 """Namespace every benchmark key sits under.
@@ -112,14 +138,36 @@ behind the payload, which is the regime where this engine's design choices show
 up at all.
 """
 
-FLUSH_DRAIN_TIMEOUT_SECONDS = 300.0
-"""How long the read phase waits for pending flushes before giving up.
+KEY_LENGTH = len(KEY_PREFIX) + KEY_INDEX_DIGITS
+"""Length in bytes of every benchmark key, which is fixed by construction."""
 
-Generous, since a drain at a large record count has real SSTables to write, and
-bounded all the same: the one state that never clears on its own is a flush that
-keeps failing, and against that an unbounded wait is a command that hangs with
-nothing printed instead of a command that says what went wrong.
+MAX_VALUE_SIZE_BYTES = (
+    min(
+        MAX_PAYLOAD_SIZE - PAYLOAD_HEADER_SIZE,
+        MAX_RECORD_PAYLOAD_SIZE - RECORD_PAYLOAD_HEADER_SIZE,
+    )
+    - KEY_LENGTH
+)
+"""Largest value a benchmark record can carry and still fit both record formats.
+
+Derived from the WAL and SSTable payload limits rather than restated, so the
+bench refuses an oversized value up front with one line instead of failing on
+the first ``put`` with a traceback after it has already created a directory.
 """
+
+DEFAULT_MAX_READS = 1_000_000
+"""Ceiling on the default read count when ``--reads`` is not given.
+
+The read phase keeps one latency sample per read and sorts them once to take
+percentiles, so its memory grows with the read count. A million samples is
+enough to resolve p99.9 to a thousand observations and costs tens of megabytes;
+tying the default to ``--records`` without a ceiling would make the harness's
+own memory, not the engine, the thing that limits a large run. An explicit
+``--reads`` is honored as given.
+"""
+
+RAM_BACKED_FILESYSTEMS = frozenset({"tmpfs", "ramfs"})
+"""Filesystem types on which ``fsync`` does not reach durable storage."""
 
 PERCENTILES: tuple[float, ...] = (50.0, 90.0, 99.0, 99.9)
 """Percentiles the read phase reports.
@@ -142,10 +190,10 @@ def key_for_index(index: int) -> bytes:
     return KEY_PREFIX + str(index).rjust(KEY_INDEX_DIGITS, "0").encode("ascii")
 
 
-def draw_read_indices(records: int, read_count: int, seed: int) -> list[int]:
+def draw_read_indices(records: int, read_count: int, seed: int) -> array[int]:
     """Return the record indices the read phase will visit, in visit order.
 
-    Drawn up front and returned as a list so that the read phase's timed region
+    Drawn up front so that the read phase's timed region
     contains no random number generation, and so the draw itself is testable:
     "the same seed replays the same read pattern" is what makes two runs
     comparable, and that claim is only worth something if something checks it.
@@ -158,9 +206,49 @@ def draw_read_indices(records: int, read_count: int, seed: int) -> list[int]:
     ``random.Random`` is instantiated here rather than the module-level generator
     being used, so that a run's read pattern depends only on ``seed`` and not on
     whatever else in the process has drawn from the global one.
+
+    Returned as a packed ``array`` of 64 bit integers rather than a list, which
+    holds the same indices in a fraction of the memory: a list of Python ints
+    costs several times as much per entry, and at a large read count that
+    difference is the harness, not the engine, running out of room.
     """
     rng = random.Random(seed)
-    return [rng.randrange(records) for _ in range(read_count)]
+    return array("q", (rng.randrange(records) for _ in range(read_count)))
+
+
+def filesystem_type(path: Path, mounts_text: str | None = None) -> str | None:
+    """Return the type of the filesystem ``path`` lives on, or ``None`` if unknown.
+
+    Read from ``/proc/mounts``, choosing the longest mount point that contains
+    ``path``, because that is the mount the kernel resolves the path through.
+    Linux only: elsewhere there is no portable way to ask without a dependency,
+    and ``None`` (reported as "unknown") is the honest answer. ``mounts_text``
+    lets a test supply a mount table instead of the machine's. The path is taken
+    as given rather than resolved, so a caller should pass a resolved path when
+    symlinks could lead to a different mount.
+    """
+    if mounts_text is None:
+        try:
+            mounts_text = Path("/proc/mounts").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return None
+
+    resolved = path.absolute()
+    best_length = -1
+    best_type: str | None = None
+    for line in mounts_text.splitlines():
+        fields = line.split()
+        if len(fields) < 3:
+            continue
+        # /proc/mounts escapes spaces in mount points as \040.
+        mount_point = Path(fields[1].replace("\\040", " "))
+        if resolved != mount_point and mount_point not in resolved.parents:
+            continue
+        length = len(mount_point.parts)
+        if length > best_length:
+            best_length = length
+            best_type = fields[2]
+    return best_type
 
 
 def nearest_rank_percentile(sorted_samples: Sequence[int], percentile: float) -> int:
@@ -232,6 +320,19 @@ class BenchConfig:
             )
         if self.value_size_bytes < 0:
             raise ValueError(f"value_size_bytes cannot be negative, got {self.value_size_bytes}")
+        if self.value_size_bytes > MAX_VALUE_SIZE_BYTES:
+            raise ValueError(
+                f"value_size_bytes must be at most {MAX_VALUE_SIZE_BYTES} to fit the record"
+                f" formats, got {self.value_size_bytes}"
+            )
+        # Checked for every policy, not only interval, because the WAL checks it
+        # for every policy too: an unchecked value here would pass this method
+        # and then fail inside the engine with a traceback.
+        interval = self.fsync_interval_seconds
+        if not math.isfinite(interval) or interval <= 0:
+            raise ValueError(
+                f"fsync_interval_seconds must be a finite positive number, got {interval!r}"
+            )
         if self.reads is not None and self.reads < 1:
             raise ValueError(f"reads must be at least 1 when given, got {self.reads}")
         if self.memtable_threshold_bytes < 1:
@@ -246,9 +347,13 @@ class BenchConfig:
         One per record by default because that is the sample size the write phase
         already paid for, and a default that scaled differently from ``--records``
         would make two runs at different record counts report tails measured from
-        different numbers of samples.
+        different numbers of samples. Capped at :data:`DEFAULT_MAX_READS` so that
+        the sample list cannot outgrow memory on a very large run; the printed
+        invocation always states the read count, so the cap never hides itself.
         """
-        return self.records if self.reads is None else self.reads
+        if self.reads is None:
+            return min(self.records, DEFAULT_MAX_READS)
+        return self.reads
 
     def to_dict(self) -> dict[str, object]:
         """Return the configuration as plain JSON-safe values."""
@@ -270,7 +375,9 @@ class BenchConfig:
         traced back to the invocation that produced it, which is what story M10.3
         needs from this harness. Only the settings that change what is measured
         are included: the output directory is not one of them, since a run in a
-        different directory on the same disk measures the same thing.
+        different, empty directory on the same disk measures the same thing. The
+        directory must be empty for that to hold, which :func:`run_bench`
+        enforces, and the filesystem it sits on is printed in the report.
         """
         parts = [
             "python -m ledgerlog.bench",
@@ -358,6 +465,8 @@ class WritePhaseResult:
     value_size_bytes: int
     payload_bytes: int
     elapsed_seconds: float
+    drain_seconds: float = 0.0
+    """Share of ``elapsed_seconds`` spent draining flushes after the last put."""
 
     @property
     def records_per_second(self) -> float:
@@ -373,7 +482,7 @@ class WritePhaseResult:
         return self.records / self.elapsed_seconds
 
     @property
-    def megabytes_per_second(self) -> float:
+    def mib_per_second(self) -> float:
         """Key and value bytes written per second, in MiB/s, excluding engine framing.
 
         Payload only, because framing overhead is the engine's choice rather than
@@ -391,8 +500,9 @@ class WritePhaseResult:
             "value_size_bytes": self.value_size_bytes,
             "payload_bytes": self.payload_bytes,
             "elapsed_seconds": self.elapsed_seconds,
+            "drain_seconds": self.drain_seconds,
             "records_per_second": self.records_per_second,
-            "mib_per_second": self.megabytes_per_second,
+            "mib_per_second": self.mib_per_second,
         }
 
 
@@ -400,19 +510,27 @@ class WritePhaseResult:
 class ReadPhaseResult:
     """What the randomized read phase measured.
 
-    ``misses`` counts reads that came back absent. It is reported rather than
-    merely asserted because every key the read phase asks for was written by the
-    write phase, so a miss is a correctness failure in the engine and not a
-    property of the workload. A bench run that quietly reported a fast latency
-    over reads that found nothing would be worse than no bench at all.
+    ``misses`` counts reads that came back absent and ``wrong_values`` reads that
+    came back with something other than what the write phase wrote. Both are
+    reported rather than merely asserted because every key the read phase asks
+    for was written by this run with one known value, so either is a correctness
+    failure in the engine and not a property of the workload. A bench run that
+    quietly reported a fast latency over reads that found nothing, or found the
+    wrong thing, would be worse than no bench at all.
+
+    ``sstables_at_read_time`` and ``memtable_bytes_at_read_time`` describe the
+    tree the phase started against. They are context for the latency, not a
+    count of tables any read consulted: that is read amplification, story M10.2.
     """
 
     reads: int
     hits: int
     misses: int
     elapsed_seconds: float
-    sstables_consulted_from: int
+    sstables_at_read_time: int
     latency: LatencySummary
+    wrong_values: int = 0
+    memtable_bytes_at_read_time: int = 0
 
     @property
     def reads_per_second(self) -> float:
@@ -429,7 +547,9 @@ class ReadPhaseResult:
             "misses": self.misses,
             "elapsed_seconds": self.elapsed_seconds,
             "reads_per_second": self.reads_per_second,
-            "sstables_at_read_time": self.sstables_consulted_from,
+            "wrong_values": self.wrong_values,
+            "sstables_at_read_time": self.sstables_at_read_time,
+            "memtable_bytes_at_read_time": self.memtable_bytes_at_read_time,
             "latency": self.latency.to_dict(),
         }
 
@@ -441,12 +561,21 @@ class BenchResult:
     config: BenchConfig
     write: WritePhaseResult
     read: ReadPhaseResult
+    filesystem: str | None = None
+    """Type of the filesystem the run directory sat on, or ``None`` if unknown."""
+
+    @property
+    def ram_backed(self) -> bool:
+        """True if the run directory was on a filesystem where fsync reaches no disk."""
+        return self.filesystem in RAM_BACKED_FILESYSTEMS
 
     def to_dict(self) -> dict[str, object]:
         """Return the whole run as plain JSON-safe values, for ``--json``."""
         return {
             "command": self.config.command_line(),
             "config": self.config.to_dict(),
+            "filesystem": self.filesystem,
+            "ram_backed_filesystem": self.ram_backed,
             "write": self.write.to_dict(),
             "read": self.read.to_dict(),
         }
@@ -463,20 +592,32 @@ class BenchResult:
         lines = [
             "LedgerLog benchmark",
             f"  invocation: {self.config.command_line()}",
+            f"  filesystem: {self.filesystem or 'unknown'}",
+        ]
+        if self.ram_backed:
+            lines.append(
+                "  warning:    RAM-backed filesystem, fsync does not reach a disk;"
+                " pass --directory on a real disk for durable-write figures"
+            )
+        lines += [
             "",
             "Sequential write phase",
             f"  records:            {self.write.records}",
             f"  value size:         {self.write.value_size_bytes} B",
             f"  payload written:    {self.write.payload_bytes / (1024 * 1024):.2f} MiB",
-            f"  elapsed:            {self.write.elapsed_seconds:.3f} s",
+            f"  elapsed:            {self.write.elapsed_seconds:.3f} s"
+            f" (of which flush drain {self.write.drain_seconds:.3f} s)",
             f"  throughput:         {self.write.records_per_second:,.0f} records/s"
-            f" ({self.write.megabytes_per_second:.2f} MiB/s payload)",
+            f" ({self.write.mib_per_second:.2f} MiB/s payload)",
             "",
             "Randomized read phase",
             f"  reads:              {self.read.reads}",
             f"  hits / misses:      {self.read.hits} / {self.read.misses}",
-            f"  sstables at read:   {self.read.sstables_consulted_from}"
+            f"  wrong values:       {self.read.wrong_values}",
+            f"  sstables at read:   {self.read.sstables_at_read_time}"
             " (context only, read amplification is story M10.2)",
+            f"  memtable at read:   {self.read.memtable_bytes_at_read_time / (1024 * 1024):.2f} MiB"
+            " (records not yet frozen, served from memory)",
             f"  elapsed:            {self.read.elapsed_seconds:.3f} s",
             f"  throughput:         {self.read.reads_per_second:,.0f} reads/s",
             f"  latency min:        {latency.min_ns / 1e6:.4f} ms",
@@ -490,6 +631,15 @@ class BenchResult:
         return "\n".join(lines)
 
 
+class BenchError(RuntimeError):
+    """Raised when a run cannot produce a trustworthy measurement.
+
+    Separate from ``ValueError``, which :func:`main` reports as a rejected
+    configuration with exit code 2: this is a run that was configured correctly
+    and could not complete, which exits 1.
+    """
+
+
 def _run_write_phase(engine: LedgerLog, config: BenchConfig) -> WritePhaseResult:
     """Write ``config.records`` records in ascending key order and time the whole phase.
 
@@ -498,27 +648,63 @@ def _run_write_phase(engine: LedgerLog, config: BenchConfig) -> WritePhaseResult
     it to the flush thread) and that work is part of what writing N records costs.
     A sum of per-call times would also pay for a timer call per record, which at
     this phase's rate is a measurable share of what is being measured.
+
+    When draining is on, the clock stops only after every frozen memtable is on
+    disk, and the drain's share is recorded separately. See this module's
+    docstring for why the drain belongs to the write phase.
     """
-    value = b"v" * config.value_size_bytes
+    value = _value_for(config)
     records = config.records
     # Computed rather than accumulated in the loop, so the timed region holds the
     # key formatting and the put and nothing else. It is exact rather than an
     # estimate because every key is the same length, which
     # BenchConfig.__post_init__ enforces by capping the record count at what the
     # padding width can hold.
-    payload_bytes = records * (len(KEY_PREFIX) + KEY_INDEX_DIGITS + config.value_size_bytes)
+    payload_bytes = records * (KEY_LENGTH + config.value_size_bytes)
 
     start = time.perf_counter_ns()
     for index in range(records):
         engine.put(key_for_index(index), value)
-    elapsed_ns = time.perf_counter_ns() - start
+    puts_done = time.perf_counter_ns()
+    if config.drain_flushes:
+        _drain_flushes(engine)
+    end = time.perf_counter_ns()
 
     return WritePhaseResult(
         records=records,
         value_size_bytes=config.value_size_bytes,
         payload_bytes=payload_bytes,
-        elapsed_seconds=elapsed_ns / 1e9,
+        elapsed_seconds=(end - start) / 1e9,
+        drain_seconds=(end - puts_done) / 1e9,
     )
+
+
+def _value_for(config: BenchConfig) -> bytes:
+    """Return the one value every record in a run carries.
+
+    A function rather than an inline expression because the read phase has to
+    compare against exactly what the write phase wrote, and two copies of the
+    expression are two places for them to drift apart.
+    """
+    return b"v" * config.value_size_bytes
+
+
+def _drain_flushes(engine: LedgerLog) -> None:
+    """Flush every frozen memtable on this thread, raising :class:`BenchError` on failure.
+
+    ``flush_pending`` takes the flush lock for each table and loops until nothing
+    is frozen, so when it returns a table the background thread was midway
+    through has been finished too, and no wait is needed afterwards. A table the
+    background thread failed to flush is still frozen, so this retries it here,
+    where a failure is raised rather than parked in ``flush_error``. That is the
+    failure path a real engine produces, and it is reported as a bench error
+    rather than measured around, because a read phase over an engine that cannot
+    flush is a measurement of a broken engine.
+    """
+    try:
+        engine.flush_pending()
+    except Exception as error:
+        raise BenchError(f"flush failed while draining before the read phase: {error!r}") from error
 
 
 def _run_read_phase(engine: LedgerLog, config: BenchConfig) -> ReadPhaseResult:
@@ -529,18 +715,27 @@ def _run_read_phase(engine: LedgerLog, config: BenchConfig) -> ReadPhaseResult:
     engine. See that function for why the draw is with replacement and why it
     carries its own generator.
 
-    The table count is sampled before the loop rather than after, so the figure
-    describes the tree the reads were served from. With the background flusher
-    drained (the default) the two are the same, but under
-    ``--no-drain-flushes`` a flush can land mid-phase, and the count that makes
-    the latency interpretable is the one the phase started against.
+    Each value is compared with what the write phase wrote, after that read's
+    latency sample is taken, so the comparison is outside every per-read figure.
+    It is inside the phase's overall elapsed time, which makes ``reads_per_second``
+    include one bytes comparison per read: a small, fixed cost that buys the
+    guarantee that a fast read is also a correct one.
+
+    The tree's shape is sampled before the loop rather than after, so the figures
+    describe what the reads were served from. With flushes drained (the default)
+    the two are the same, but under ``--no-drain-flushes`` a flush can land
+    mid-phase, and the shape that makes the latency interpretable is the one the
+    phase started against.
     """
     read_count = config.read_count
     indices = draw_read_indices(config.records, read_count, config.seed)
+    expected = _value_for(config)
 
-    latencies_ns: list[int] = []
+    latencies_ns = array("q")
     hits = 0
+    wrong_values = 0
     sstables_at_read_time = len(engine.sstables)
+    memtable_bytes_at_read_time = engine.memtable_nbytes
 
     phase_start = time.perf_counter_ns()
     for index in indices:
@@ -550,6 +745,8 @@ def _run_read_phase(engine: LedgerLog, config: BenchConfig) -> ReadPhaseResult:
         latencies_ns.append(time.perf_counter_ns() - start)
         if value is not None:
             hits += 1
+            if value != expected:
+                wrong_values += 1
     phase_elapsed_ns = time.perf_counter_ns() - phase_start
 
     return ReadPhaseResult(
@@ -557,8 +754,10 @@ def _run_read_phase(engine: LedgerLog, config: BenchConfig) -> ReadPhaseResult:
         hits=hits,
         misses=read_count - hits,
         elapsed_seconds=phase_elapsed_ns / 1e9,
-        sstables_consulted_from=sstables_at_read_time,
+        sstables_at_read_time=sstables_at_read_time,
         latency=LatencySummary.from_samples(latencies_ns),
+        wrong_values=wrong_values,
+        memtable_bytes_at_read_time=memtable_bytes_at_read_time,
     )
 
 
@@ -572,17 +771,23 @@ def run_bench(config: BenchConfig) -> BenchResult:
     per run, and a harness that leaked one per crash would fill a disk before
     anybody noticed.
 
-    When ``config.directory`` is given it is used as it stands and is not removed,
-    because a caller who names a directory wants the files afterwards. When it is
-    not, the run happens in a temporary directory that is removed on the way out:
-    a benchmark that left its data in the working tree would be measuring a
-    different disk each time depending on where it was started from.
+    When ``config.directory`` is given it is used and kept afterwards, because a
+    caller who names a directory wants the files. It must be empty or not yet
+    exist, and a ``ValueError`` is raised otherwise: see this module's docstring
+    for why reusing a directory would make the printed invocation lie. When no
+    directory is given, the run happens in a temporary directory that is removed
+    on the way out.
     """
     with ExitStack() as stack:
         if config.directory is None:
             directory = Path(stack.enter_context(tempfile.TemporaryDirectory(prefix="ledgerlog-")))
         else:
             directory = config.directory
+            if directory.exists() and (not directory.is_dir() or any(directory.iterdir())):
+                raise ValueError(
+                    f"directory {str(directory)!r} must be empty or not exist, so the run"
+                    " starts from no data and its invocation reproduces it"
+                )
             directory.mkdir(parents=True, exist_ok=True)
 
         engine = stack.enter_context(
@@ -595,30 +800,10 @@ def run_bench(config: BenchConfig) -> BenchResult:
         )
 
         write = _run_write_phase(engine, config)
-
-        if config.drain_flushes:
-            # Flush on this thread first so the drain cannot sit waiting on a
-            # background thread that is between wakeups, then wait for anything
-            # the flusher had already picked up. See the module docstring for why
-            # the read phase wants a settled set of tables.
-            engine.flush_pending()
-            if not engine.wait_for_flush(timeout=FLUSH_DRAIN_TIMEOUT_SECONDS):
-                # Bounded rather than an open-ended wait: a flush that keeps
-                # failing never clears the frozen table, and wait_for_flush
-                # reports that as a timeout rather than raising, so an unbounded
-                # wait here would hang the command with nothing printed. Raised
-                # rather than measured around, because a flush that cannot
-                # complete makes the read phase's figure a measurement of a
-                # broken engine.
-                raise RuntimeError(
-                    "timed out after "
-                    f"{FLUSH_DRAIN_TIMEOUT_SECONDS}s waiting for flushes to drain; "
-                    f"last flush error: {engine.flush_error!r}"
-                )
-
         read = _run_read_phase(engine, config)
+        filesystem = filesystem_type(directory.resolve())
 
-    return BenchResult(config=config, write=write, read=read)
+    return BenchResult(config=config, write=write, read=read, filesystem=filesystem)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -649,7 +834,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--reads",
         type=int,
         default=None,
-        help="number of randomized reads (default: one per record written)",
+        help=(
+            "number of randomized reads"
+            f" (default: one per record written, at most {DEFAULT_MAX_READS})"
+        ),
     )
     parser.add_argument(
         "--fsync-policy",
@@ -687,7 +875,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--directory",
         type=Path,
         default=None,
-        help="directory to run in and keep (default: a temporary directory, removed afterwards)",
+        help=(
+            "empty or new directory to run in and keep"
+            " (default: a temporary directory, removed afterwards)"
+        ),
     )
     parser.add_argument(
         "--no-drain-flushes",
@@ -733,33 +924,53 @@ def main(argv: Sequence[str] | None = None) -> int:
     ``--records 0`` would tell a caller less than one line saying the number has
     to be at least one.
 
-    A run whose read phase missed any key exits non-zero as well, because every
-    key it asks for was written in the same run. See :class:`ReadPhaseResult` for
-    why that is treated as a failure rather than a footnote: the alternative is a
-    harness that reports an excellent latency for reads that found nothing.
+    A run whose read phase missed any key, or read back a wrong value, exits 1,
+    as does a run that could not drain its flushes, because every key the read
+    phase asks for was written in the same run with one known value. A named
+    directory that is not empty is a rejected configuration and exits 2. See
+    :class:`ReadPhaseResult` for why a bad read is treated as a failure rather
+    than a footnote: the alternative is a harness that reports an excellent
+    latency for reads that found nothing.
     """
     args = build_parser().parse_args(argv)
     try:
         config = config_from_args(args)
+        result = run_bench(config)
     except ValueError as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
-
-    result = run_bench(config)
+    except BenchError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
 
     if args.emit_json:
         print(json.dumps(result.to_dict(), indent=2, sort_keys=True))
     else:
         print(result.format_report())
 
+    if result.ram_backed:
+        print(
+            f"warning: the run directory is on {result.filesystem}, where fsync reaches no"
+            " disk; write figures do not describe durable writes",
+            file=sys.stderr,
+        )
+
+    status = 0
     if result.read.misses:
         print(
             f"error: {result.read.misses} of {result.read.reads} reads found no value"
             " for a key this run wrote",
             file=sys.stderr,
         )
-        return 1
-    return 0
+        status = 1
+    if result.read.wrong_values:
+        print(
+            f"error: {result.read.wrong_values} of {result.read.reads} reads returned a"
+            " value other than the one this run wrote",
+            file=sys.stderr,
+        )
+        status = 1
+    return status
 
 
 if __name__ == "__main__":
