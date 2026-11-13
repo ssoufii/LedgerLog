@@ -609,7 +609,10 @@ As the engine/operator, I want the README's performance section to state numbers
 - [ ] No numeric performance claim in the README lacks a corresponding bench run backing it
 
 **Size**: S
-**Dependencies**: Depends on #32 (M10.1), #33 (M10.2)
+**Dependencies**: Depends on #32 (M10.1), #33 (M10.2), #35 (M10.4)
+
+**Notes**
+Done after the M10.4 tuning spike so the published figures describe the final defaults. Run on a real disk (the bench report prints the filesystem and warns on tmpfs) and with a memtable threshold low enough that reads hit SSTables.
 
 
 ### Spike: tune default sparse index interval, bloom FP rate, and size-tier thresholds (M10.4)
