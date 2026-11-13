@@ -6689,22 +6689,43 @@ def test_each_thread_sees_only_its_own_probe_under_concurrent_reads(tmp_path: Pa
     behind the counts, and the way it would show is a thread's totals coming out
     higher than the reads it performed. So each reader checks its own probe
     after every read and sums the whole run, while a writer keeps putting
-    through the same engine to make sure the walk is happening against a tree
-    that is moving.
+    through the same engine so that every one of those reads happens against a
+    tree another thread is mutating.
+
+    The writer overwrites a handful of keys rather than writing fresh ones, and
+    that detail is what keeps this test from being a race it can lose on a slow
+    machine. This engine does not flush on its own, so writing fresh keys at
+    this threshold freezes a memtable every few puts and nothing drains the
+    list, and :meth:`LedgerLog._lookup` walks that list on every read. Read cost
+    would then grow with how far the writer had got, while the writer's cost per
+    put stayed flat, so the slower the readers ran the slower they would get:
+    measured here, a read costs about 16 microseconds against no frozen tables
+    and about 4 milliseconds against four thousand of them. Overwriting a fixed
+    key set keeps the active memtable a constant size, so it never freezes, the
+    writer still takes the engine's write lock and appends to the log on every
+    put, and the reads stay a fixed cost however long the run takes.
     """
     engine, written = engine_with_several_tables(tmp_path / "data")
     reads_per_thread = 200
     thread_count = 4
+    recycled_keys = 8
+    # A bound no correct engine should reach, so that a future change which did
+    # make these puts grow the memtable fails the assertions below instead of
+    # hanging the suite.
+    max_writes = 200_000
     with engine:
         stop = threading.Event()
         failures: list[str] = []
         totals: list[int] = [0] * thread_count
+        writes_done = 0
 
         def write() -> None:
+            nonlocal writes_done
             index = 0
-            while not stop.is_set():
-                engine.put(f"concurrent/{index:06d}".encode(), b"value")
+            while not stop.is_set() and index < max_writes:
+                engine.put(f"concurrent/{index % recycled_keys:03d}".encode(), b"value")
                 index += 1
+            writes_done = index
 
         def read(slot: int) -> None:
             probe = ReadProbe()
@@ -6733,13 +6754,22 @@ def test_each_thread_sees_only_its_own_probe_under_concurrent_reads(tmp_path: Pa
         for reader in readers:
             reader.start()
         for reader in readers:
-            reader.join(timeout=60)
-            assert not reader.is_alive(), "a reader thread did not finish"
+            reader.join(timeout=120)
+        # Stopped and joined before anything is asserted, so that a failure
+        # cannot leave a thread reading through an engine the end of this block
+        # is about to close: the closed-handle error that follows would bury the
+        # assertion that actually explains the failure.
         stop.set()
-        writer.join(timeout=60)
-        assert not writer.is_alive(), "the writer thread did not finish"
+        writer.join(timeout=120)
 
+        still_running = [thread.name for thread in [*readers, writer] if thread.is_alive()]
+        assert still_running == [], f"threads did not finish: {still_running}"
         assert failures == []
+        assert writes_done > 0, "the writer never ran, so no read was concurrent with one"
+        assert engine.frozen_memtables == (), (
+            f"the writer froze {len(engine.frozen_memtables)} memtables, which makes every"
+            " read walk a growing list and turns this test into a race"
+        )
         for slot, searched in enumerate(totals):
             assert searched >= reads_per_thread, (
                 f"thread {slot} recorded {searched} searches over {reads_per_thread} reads"
