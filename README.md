@@ -48,7 +48,57 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design writeup, 
 
 ## Status
 
-Pre-build. Writing user stories for each milestone in [`docs/USER_STORIES.md`](docs/USER_STORIES.md) before touching code. Milestones tracked in [`docs/ROADMAP.md`](docs/ROADMAP.md).
+Milestones 0 through 10 of [`docs/ROADMAP.md`](docs/ROADMAP.md) are built and tested: WAL, concurrent skip-list memtable, SSTables with sparse index and bloom filter, memtable flush, multi-SSTable reads, size-tiered compaction with tombstone and TTL cleanup, full-stack crash recovery, and the bench harness. Stretch goals (leveled compaction, range scans, snapshot reads) are not started. User stories live in [`docs/USER_STORIES.md`](docs/USER_STORIES.md).
+
+## Performance
+
+Every number in this section was produced by `python -m ledgerlog.bench` against the default tuning chosen in [`docs/TUNING.md`](docs/TUNING.md) (index interval 32, bloom target 0.01, size ratio 2.0, min tier tables 4). The full invocation for each run is shown with its figures, so any of them can be reproduced.
+
+**Machine**: Apple M1 (8 cores), macOS 26.1, CPython 3.13.0, APFS on the internal SSD. The bench reports the filesystem as `unknown` on macOS because its detection reads Linux mount tables; it is a real disk, not a RAM-backed filesystem.
+
+All three runs share these parameters and differ only in `--fsync-policy`:
+
+```
+python -m ledgerlog.bench --records 100000 --value-size 100 --reads 20000 \
+  --fsync-policy {never|interval|always} --memtable-threshold-bytes 131072 \
+  --index-interval 32 --bloom-fp-rate 0.01 --size-ratio 2.0 --min-tier-tables 4 \
+  --compaction-schedule incremental --seed 0 --read-amplification
+```
+
+The 128 KiB memtable threshold is deliberately small: it produces 96 SSTables from 100k records, so reads are served from SSTables rather than from the memtable, and compaction has something to do.
+
+### Sequential write throughput
+
+| `--fsync-policy` | Throughput | Payload rate | Elapsed (incl. flush drain) |
+|---|---|---|---|
+| `never` | 64,466 records/s | 7.75 MiB/s | 1.551 s |
+| `interval` (`--fsync-interval 0.1`) | 67,053 records/s | 8.06 MiB/s | 1.491 s |
+| `always` | 23,419 records/s | 2.81 MiB/s | 4.270 s |
+
+`never` and `interval` are within run-to-run noise of each other; fsyncing every 100 ms costs nothing measurable at this rate. On macOS, `os.fsync` hands data to the drive but does not force the drive's own write cache to stable media (that takes `F_FULLFSYNC`, which the WAL does not issue), so the `always` figure is an upper bound on fully durable throughput on this platform.
+
+### Random read latency
+
+20,000 reads of randomly chosen written keys, every value checked against what was written (0 wrong values in every run). Before compaction, 96 SSTables on disk.
+
+| `--fsync-policy` | Reads/s | p50 | p99 |
+|---|---|---|---|
+| `never` | 9,755 | 0.0992 ms | 0.2185 ms |
+| `interval` | 10,204 | 0.0973 ms | 0.1797 ms |
+| `always` | 9,543 | 0.0958 ms | 0.2987 ms |
+
+Full distribution for the `never` run: min 0.0033 ms, mean 0.1021 ms, p90 0.1536 ms, p99.9 0.7665 ms, max 2.7992 ms. The fsync policy only affects the write path, so the read figures differ by noise only.
+
+### Read amplification (SSTables searched per `get`)
+
+Counted inside the read path, not inferred from the table count. The incremental schedule compacts flush by flush, as a running engine would. These figures were identical in all three runs.
+
+| | SSTables on disk | Mean searched per read | p99 | Max |
+|---|---|---|---|---|
+| Before compaction | 96 | 1.487 | 4 | 43 |
+| After compaction | 3 | 1.015 | 2 | 2 |
+
+Compaction ran 31 tier merges (1.804 s in the `never` run), took 96 tables down to 3, and rewrote 36.95 MiB, 2.66x the bytes flushed (write amplification). The bloom filters skipped 942,147 table probes before compaction at a measured 1.02% false-positive rate, which matches the 0.01 target.
 
 ## Install
 

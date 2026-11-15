@@ -62,7 +62,7 @@ This milestone is a complete, durable, in-memory-only KV store. It's a good chec
 ## Milestone 10: benchmarking and polish
 - [x] `ledgerlog.bench`: sequential write throughput, random read latency, read amplification (how many SSTables touched per read) before/after compaction
 - [x] Tune default sparse index interval, bloom filter false-positive rate, and size-tier thresholds based on bench results
-- [ ] README numbers reflect actual measured results, not estimates (measured after tuning, so they describe the final defaults)
+- [x] README numbers reflect actual measured results, not estimates (measured after tuning, so they describe the final defaults)
 
 ## Stretch goals (not required for a complete v1)
 - TTL/retention as a first-class `put(key, value, ttl=...)` parameter: promoted into Milestone 8 (stories M8.6 to M8.8), since "compaction drops old stuff" needs a per-record expiry before it can drop anything
