@@ -366,6 +366,8 @@ from ledgerlog.bloom import BloomFilter
 from ledgerlog.compaction import CompactionPlan, CompactionPolicy, plan_compaction
 from ledgerlog.memtable import Memtable, MemtableEntry
 from ledgerlog.sstable import (
+    DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
+    DEFAULT_INDEX_INTERVAL,
     SSTableFooter,
     SSTableInspection,
     SSTableLayout,
@@ -373,6 +375,8 @@ from ledgerlog.sstable import (
     SSTableRecord,
     inspect_sstable,
     read_bloom_filter,
+    validate_bloom_false_positive_rate,
+    validate_index_interval,
     write_sstable,
 )
 from ledgerlog.wal import (
@@ -990,6 +994,8 @@ class LedgerLog:
         fsync_interval_seconds: float = DEFAULT_FSYNC_INTERVAL_SECONDS,
         memtable_threshold_bytes: int = DEFAULT_MEMTABLE_THRESHOLD_BYTES,
         flush_in_background: bool = True,
+        index_interval: int = DEFAULT_INDEX_INTERVAL,
+        bloom_false_positive_rate: float = DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
         compaction_policy: CompactionPolicy | None = None,
         clock: Callable[[], float] = DEFAULT_CLOCK,
     ) -> None:
@@ -1034,6 +1040,20 @@ class LedgerLog:
         caller's thread, and an engine that neither runs the thread nor calls
         those accumulates frozen memtables for as long as it stays open.
 
+        ``index_interval`` and ``bloom_false_positive_rate`` are handed to every
+        table this engine flushes, and default to the module defaults those two
+        names come from. They are constructor arguments rather than constants
+        read at the point of the flush because story M10.4 has to measure the
+        engine at several values of each before choosing the defaults, and a
+        benchmark that had to reach into another module's globals to vary them
+        would be measuring a thing no caller can configure.
+
+        Both are validated here, against the same functions the SSTable writer
+        validates them with, rather than left for the writer to reject. A flush
+        runs on a background thread, so a bad value would otherwise be stored as
+        a flush error and surface on whichever later call happened to look, long
+        after the constructor that was given it returned.
+
         ``compaction_policy`` sets how tables are grouped into size tiers and how
         many tables a tier needs before it is worth merging, and defaults to
         :class:`~ledgerlog.compaction.CompactionPolicy`'s own defaults. It changes
@@ -1065,6 +1085,10 @@ class LedgerLog:
         if not callable(clock):
             raise TypeError(f"clock must be callable, got {type(clock).__name__}")
 
+        self._index_interval = validate_index_interval(index_interval)
+        self._bloom_false_positive_rate = validate_bloom_false_positive_rate(
+            bloom_false_positive_rate
+        )
         self._clock = clock
         self._directory = Path(directory)
         self._directory.mkdir(parents=True, exist_ok=True)
@@ -1155,6 +1179,21 @@ class LedgerLog:
     def memtable_threshold_bytes(self) -> int:
         """Payload size at which the active memtable is frozen and replaced."""
         return self._memtable_threshold_bytes
+
+    @property
+    def index_interval(self) -> int:
+        """Records between two sparse index entries in the tables this engine writes."""
+        return self._index_interval
+
+    @property
+    def bloom_false_positive_rate(self) -> float:
+        """Target false-positive rate of the bloom filter in the tables this engine writes.
+
+        Readable so that a benchmark sweeping this value can report the setting a
+        table was written under alongside the rate it went on to measure, which
+        is the comparison story M10.4 is made of.
+        """
+        return self._bloom_false_positive_rate
 
     @property
     def memtable_nbytes(self) -> int:
@@ -2056,6 +2095,11 @@ class LedgerLog:
         holding every key until the end. A frozen memtable is one of the few
         callers that knows this number exactly.
 
+        The index cadence and the bloom target come from the engine rather than
+        from the writer's own defaults, so that every table a given engine writes
+        is laid out the way that engine was opened and a run measuring one
+        setting cannot end up holding tables written under another.
+
         This is the one place a table is written, and it is a method rather than a
         call inline above so that the whole flush path can be exercised against a
         write that blocks or fails.
@@ -2064,6 +2108,8 @@ class LedgerLog:
             path,
             ((entry.key, entry.value, entry.expires_at_ms) for entry in memtable.entries()),
             expected_keys=len(memtable),
+            index_interval=self._index_interval,
+            bloom_false_positive_rate=self._bloom_false_positive_rate,
         )
 
     def _record_flush_error(self, error: BaseException) -> None:
