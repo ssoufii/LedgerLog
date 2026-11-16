@@ -64,6 +64,15 @@ This milestone is a complete, durable, in-memory-only KV store. It's a good chec
 - [x] Tune default sparse index interval, bloom filter false-positive rate, and size-tier thresholds based on bench results
 - [x] README numbers reflect actual measured results, not estimates (measured after tuning, so they describe the final defaults)
 
+## Milestone 11: web demo
+The real engine running in the browser (Pyodide, in a Web Worker), with no server, designed per `docs/FRONTEND_DESIGN.md` and deployable as a static site on Render. This adds no networking layer: the engine stays an embedded library, and the page embeds it.
+- [ ] Read-only introspection snapshot and a synchronous single compaction step, so a UI never touches private state
+- [ ] `web/` app (Vite, React, TypeScript) booting the engine in a worker behind a typed bridge, with Playwright tests in CI
+- [ ] Design system, frame, hero stage and footer that pass the house rules at 1440, 768 and 390 wide
+- [ ] Live console (memtable towers, WAL tail, flush, compact), the four-stage write strip, the durability dial and numbers slider from measured data, crash recovery tiles, and the start dialog
+- [ ] Motion layer per the spec, with reduced-motion support
+- [ ] `render.yaml` static site config and a README "Live demo" section
+
 ## Stretch goals (not required for a complete v1)
 - TTL/retention as a first-class `put(key, value, ttl=...)` parameter: promoted into Milestone 8 (stories M8.6 to M8.8), since "compaction drops old stuff" needs a per-record expiry before it can drop anything
 - Leveled compaction as an alternative strategy, benchmarked against size-tiered

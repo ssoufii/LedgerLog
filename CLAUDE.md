@@ -30,6 +30,10 @@ src/ledgerlog/
   compaction.py      # size-tiered compaction, tombstone/TTL cleanup
   engine.py          # wires the above into put/get/delete/flush
   bench.py           # throughput/latency benchmark harness
+  introspect.py      # read-only JSON snapshot of engine internals for tools and the web demo (M11)
+web/                 # M11: Vite + React + TypeScript demo running the engine in the browser via Pyodide
+  src/engine/        # Web Worker that hosts Pyodide, and the typed bridge to it
+  tests/             # Playwright specs, including house-rules.spec.ts
 tests/
   test_wal.py
   test_memtable.py
@@ -40,6 +44,7 @@ tests/
 docs/
   ARCHITECTURE.md
   ROADMAP.md
+  FRONTEND_DESIGN.md # authoritative art direction, tokens, house rules and motion rules for web/
 ```
 
 ## Build order
@@ -55,9 +60,15 @@ pytest --cov=ledgerlog --cov-report=term-missing
 python -m ledgerlog.bench --records 100000
 ruff check src tests          # lint
 ruff format src tests         # format
+
+# web demo (from web/, once M11.2 exists)
+npm ci
+npm run lint && npm run typecheck && npm run build
+npx playwright install --with-deps chromium
+npx playwright test           # runs against vite preview of the production build
 ```
 
-Run `pytest` and `ruff check` before considering any change finished.
+Run `pytest` and `ruff check` before considering any change finished, plus the web commands above when `web/` changed.
 
 ## Style
 
@@ -67,8 +78,15 @@ Run `pytest` and `ruff check` before considering any change finished.
 - No em dashes in comments, docstrings, or commit messages.
 - Commit messages: imperative mood, one line summary, e.g. `Add checksum validation to WAL replay`.
 
+## Web demo (Milestone 11)
+
+- `docs/FRONTEND_DESIGN.md` is authoritative for every visual, copy and motion decision under `web/`. Read it in full before any frontend story.
+- The demo runs the repo's own `src/ledgerlog` source in Pyodide. Never reimplement engine behaviour in TypeScript; everything shown comes from the engine through the bridge.
+- Frontend claims must be testable the same way engine claims are: each acceptance criterion gets a Playwright test that runs against the production build.
+- No em dashes in UI copy either.
+
 ## Known non-goals
 
 - No SQL layer, no query planner, no secondary indexes. This is a KV engine.
-- No networking/RPC layer. It's an embedded library, not a server, unless a later milestone in the roadmap explicitly adds one.
+- No networking/RPC layer. It's an embedded library, not a server, unless a later milestone in the roadmap explicitly adds one. The M11 web demo is not an exception: it embeds the engine in the browser and has no backend.
 - No multi-process concurrency (single process, multiple threads only) unless the roadmap says otherwise.

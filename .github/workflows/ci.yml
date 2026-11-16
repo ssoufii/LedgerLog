@@ -11,6 +11,7 @@ permissions:
 jobs:
   lint:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -22,6 +23,9 @@ jobs:
 
   test:
     runs-on: ${{ matrix.os }}
+    # A healthy run takes about 2 minutes. The limit turns a hung runner into a
+    # fast failure that can be re-run, instead of an hour-long stall.
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -34,3 +38,51 @@ jobs:
           python-version: ${{ matrix.python-version }}
       - run: pip install -e ".[dev]"
       - run: pytest --cov=ledgerlog --cov-report=term-missing
+
+  web:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Detect web app
+        id: detect
+        run: |
+          if [ -f web/package.json ]; then echo "present=true" >> "$GITHUB_OUTPUT"; else echo "present=false" >> "$GITHUB_OUTPUT"; fi
+      - if: steps.detect.outputs.present == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - if: steps.detect.outputs.present == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - if: steps.detect.outputs.present == 'true'
+        working-directory: web
+        run: |
+          npm ci
+          npm run lint
+          npm run typecheck
+          npm run build
+          npx playwright install --with-deps chromium
+          npx playwright test
+      - if: always() && steps.detect.outputs.present == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: web-test-results
+          path: web/test-results/
+          if-no-files-found: ignore
+
+  # The one check branch protection requires. It passes only when every job
+  # above passed, so auto-merge waits for the whole matrix and the web job.
+  ci-ok:
+    if: always()
+    needs: [lint, test, web]
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          if [ "${{ needs.lint.result }}" != "success" ] || [ "${{ needs.test.result }}" != "success" ] || [ "${{ needs.web.result }}" != "success" ]; then
+            echo "lint=${{ needs.lint.result }} test=${{ needs.test.result }} web=${{ needs.web.result }}"
+            exit 1
+          fi
