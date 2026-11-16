@@ -629,3 +629,154 @@ As the engine/operator, I want the default sparse index interval, bloom filter f
 **Notes**
 Genuinely exploratory: the right defaults cannot be known until measured across configs, so this is a spike rather than an estimated story.
 
+
+
+## M11: Web demo
+
+### Engine introspection snapshot and single compaction step (M11.1)
+As a caller building tools on LedgerLog (the web demo first), I want a read-only, JSON-serialisable snapshot of the engine's internals and a synchronous single compaction step, so that a UI can show the real WAL, memtable, SSTables and compaction without reaching into private attributes.
+
+**Acceptance criteria**
+- [ ] `ledgerlog.introspect.snapshot(engine)` returns plain JSON types (dict, list, str, int, float, bool, None) describing: WAL records (offset, length, checksum, kind put or delete, key, value byte length, expiry); active and frozen memtable entries in key order with each node's tower level and a tombstone flag; every SSTable (sequence, record count, size in bytes, min and max key, sparse index entry count, bloom filter bit count and bits set); and the current compaction plan's tiers
+- [ ] `ledgerlog.introspect.compact_once(engine)` runs at most one tier merge synchronously using the existing compaction code and returns what it did (source sequences, output sequence, records dropped), or `None` when the plan is empty
+- [ ] `tests/test_introspect.py` asserts the snapshot matches the engine's state after puts, deletes, a flush and a compaction, and that `json.loads(json.dumps(snapshot(engine)))` round-trips unchanged
+- [ ] A test proves that an engine built with `flush_in_background=False`, driven through put, delete, flush, `snapshot` and `compact_once`, never starts a thread (monkeypatch `threading.Thread.start` to raise), because Pyodide cannot start threads
+- [ ] Taking a snapshot does not change engine state: two snapshots in a row are equal and every `get` returns the same result before and after
+
+**Size**: M
+**Dependencies**: None
+
+**Notes**
+Keys and values are bytes; encode them for JSON as UTF-8 with `errors="backslashreplace"` and say so in the docstring. No on-disk format changes. Docstrings explain why this API exists (a UI must not depend on private attributes) and why compaction is exposed as one synchronous step (the browser has no background threads).
+
+
+### Web app scaffold and Pyodide worker bridge (M11.2)
+As a visitor to the demo, I want the real LedgerLog engine to boot in my browser, so that what I drive is the actual Python code, not a JavaScript imitation of it.
+
+**Acceptance criteria**
+- [ ] `web/` holds a Vite + React + TypeScript app with npm scripts `dev`, `build`, `preview`, `lint` (eslint), `typecheck` (`tsc --noEmit`) and `test` (Playwright), with exact pinned dependency versions and a committed `package-lock.json`
+- [ ] Pyodide comes from the `pyodide` npm package and is served from the app's own build output (no CDN at runtime); a build step copies `src/ledgerlog/*.py` into the bundle so the browser runs exactly the repo's engine source
+- [ ] Pyodide runs in a Web Worker; a typed bridge in `web/src/engine/bridge.ts` exposes `put`, `get`, `delete`, `flush`, `compactOnce`, `snapshot` and `reset` with typed results; the engine is built with `flush_in_background=False` and `fsync_policy="never"` on Pyodide's in-memory filesystem
+- [ ] A Playwright test against `vite preview` (the production build) shows the engine boots within 30 seconds, a put then get round-trips a value, and the snapshot lists the key in the memtable
+- [ ] The `web` job in `.github/workflows/ci.yml` runs `npm ci`, lint, typecheck, build, `npx playwright install --with-deps chromium` and `npx playwright test`, and uploads `web/test-results/` as an artifact
+- [ ] `CLAUDE.md`'s Commands section lists the web commands
+
+**Size**: L
+**Dependencies**: Depends on #79 (M11.1)
+
+**Notes**
+The page can be bare in this story; the design arrives in M11.3. Read `docs/FRONTEND_DESIGN.md` in full anyway so the structure (worker, bridge, data files) suits what comes next.
+
+
+### Design system, page frame, hero stage and footer (M11.3)
+As a visitor, I want a page that looks deliberate and reads easily at any width, so that the engine is presented with the same care it was built with.
+
+**Acceptance criteria**
+- [ ] The palette, type steps and motion tokens in `docs/FRONTEND_DESIGN.md` sections 3, 4 and 8 exist as CSS custom properties, and components reference tokens only (no raw colours or font sizes outside the token file)
+- [ ] The navigation, the hero (h1, supporting sentence, one button, the maroon stage with the three-step notch, and the console area showing the boot status with the tower loader) and the footer (the block-built wordmark and links) are built as section 6 describes, at desktop and phone widths
+- [ ] `web/tests/house-rules.spec.ts` implements every check in section 7 at 1440, 768 and 390 pixels wide, passes, and also passes with `reducedMotion: 'reduce'`
+- [ ] The house-rules spec saves a full-page screenshot per width to `web/test-results/screenshots/`, and the PR description says the screenshots were opened and checked against the spec
+- [ ] With font requests blocked, the page falls back cleanly and still passes the house rules
+
+**Size**: M
+**Dependencies**: Depends on #80 (M11.2)
+
+**Notes**
+`docs/FRONTEND_DESIGN.md` is authoritative for every visual decision. No gradients, no shadows at rest, no monospace outside code, no eyebrows, one motif (the tower).
+
+
+### Hero live console: memtable towers and WAL tail (M11.4)
+As a visitor, I want to put, get and delete keys from the hero and watch the memtable and the write-ahead log change, so that I can see how the engine handles each write.
+
+**Acceptance criteria**
+- [ ] The console fragment (section 6, hero) has key and value inputs and put, get, delete and flush controls, all keyboard operable (Enter in the value field puts)
+- [ ] The memtable is drawn as towers, one per key in key order, each tower's height equal to that node's level in the snapshot; tombstones are visibly distinct; values come from the engine
+- [ ] The WAL tail shows the last six records from the snapshot: offset, kind, key, byte length and checksum
+- [ ] Flush turns the memtable into a new SSTable shown as a tile with its record count and key range; a compact control appears when the compaction plan is not empty and runs `compactOnce`
+- [ ] An empty key is rejected with a message tied to the field by `aria-describedby`; long keys are truncated visually, never in the data
+- [ ] Playwright: after three puts there are three towers whose heights match the snapshot; get shows the stored value; delete shows a tombstone; flush shows an SSTable tile; the whole flow works by keyboard alone
+
+**Size**: L
+**Dependencies**: Depends on #81 (M11.3)
+
+
+### How a write travels: the four-stage strip (M11.5)
+As a visitor, I want to follow one of my own records through the log, the memtable, an SSTable and compaction, so that I understand the write path from real data rather than a diagram.
+
+**Acceptance criteria**
+- [ ] The four-field strip is built as section 6 describes, with the same record card in each field
+- [ ] The card shows the visitor's most recent key at each stage with data read from the snapshot: WAL offset, length and checksum; tower level; SSTable sequence, whether the sparse index points at it and bloom bits set; and the compaction result (merged table, dropped versions or tombstones)
+- [ ] Before the visitor writes anything, the strip uses a demo key the engine writes at boot; a stage the record has not reached yet says so and offers the action that gets it there (for example flush), and never shows invented data
+- [ ] Playwright: after a put, card 1's offset equals the snapshot's WAL offset for that key; after a flush, card 3 shows the SSTable sequence; after a compaction, card 4 shows the merged table
+
+**Size**: M
+**Dependencies**: Depends on #82 (M11.4)
+
+
+### Durability dial and numbers slider from measured bench data (M11.6)
+As a visitor, I want to see what each fsync policy really costs and work out the write time for my own record count, so that the performance claims are concrete and traceable.
+
+**Acceptance criteria**
+- [ ] A script generates `web/src/data/bench.json` (policy, records per second, MiB per second, read latency, invocation, machine) from the README's Performance section, runs as part of the build, and a test fails if the JSON and the README disagree
+- [ ] The durability section (section 6) has the enlarged, working segmented control (arrow keys move between options), swaps the field colour and the heading word, and shows the measured figure and bench invocation for the chosen policy
+- [ ] The numbers section (section 6) has a logarithmic slider and a figure equal to records divided by the measured `fsync=never` rate, with the formula in words and the invocation beside it
+- [ ] Playwright: choosing each policy shows the README figure for that policy; the slider at 1,000,000 shows 15.5 s; arrow keys move the slider
+
+**Size**: M
+**Dependencies**: Depends on #81 (M11.3)
+
+
+### Crash proof tiles that run real recovery in the browser (M11.7)
+As a visitor, I want to pull the plug on my own database in different ways and see what recovery keeps, so that the durability claims are demonstrated, not asserted.
+
+**Acceptance criteria**
+- [ ] The tile board is built as section 6 describes, one tile per scenario: torn write (WAL truncated mid-record), flipped byte (one WAL byte corrupted), crash mid-flush (SSTable without footer), crash mid-compaction (merged output without footer while its sources remain), missing footer, and expired record
+- [ ] Each scenario damages a copy of the visitor's database directory in the worker, opens a fresh `LedgerLog` on the copy, and reports the keys before, the keys after recovery and what was dropped, using the engine's own recovery and discovery reports; the visitor's own database is untouched
+- [ ] The scenario code is Python, has pytest tests in `tests/`, and each tile names the existing pytest test that covers the same failure; a pytest checks that every test named in `web/src/data/crash-scenarios.json` exists
+- [ ] Playwright: after three puts, running "torn write" shows recovery keeping the complete records and dropping the torn one
+
+**Size**: M
+**Dependencies**: Depends on #82 (M11.4)
+
+
+### Start dialog that writes the snippet (M11.8)
+As a visitor who wants to use LedgerLog, I want the page to end with the code I need already written for my choices, so that getting started takes one copy.
+
+**Acceptance criteria**
+- [ ] The start section is built as section 6 describes: the "new database" dialog with an editable directory field, a segmented fsync choice and the "copy the code" button, beside the closing line
+- [ ] The generated snippet uses the real constructor and parameter names from `src/ledgerlog`, and a test proves it runs: pytest executes the snippet the page generates for each fsync choice (exported to `web/src/data/snippets.json` or generated from one shared template)
+- [ ] Copying shows "copied" for 1.5 seconds and works by keyboard; a link goes to the GitHub repository
+- [ ] Playwright: changing the directory and the fsync choice changes the snippet; the copy button writes the snippet to the clipboard
+
+**Size**: S
+**Dependencies**: Depends on #81 (M11.3)
+
+
+### Motion layer (M11.9)
+As a visitor, I want the page to respond to me and to explain changes through motion, so that it feels alive without ever getting in the way.
+
+**Acceptance criteria**
+- [ ] The motion tokens and every move in section 8 are built: the shutter on the hero stage (once), staggered section entrances, tower build and flush moves, the sliding segment indicator, and `scale(0.97)` press feedback on every pressable element
+- [ ] Hover styles live only under `@media (hover: hover) and (pointer: fine)`, and keyboard-initiated actions do not animate travel
+- [ ] Under `reducedMotion: 'reduce'` all content is visible immediately and nothing travels or scales (Playwright)
+- [ ] A Playwright check walks the CSSOM and fails on `transition: all`, on `ease-in`, and on keyframes or transitions that animate width, height, top, left, margin or padding
+- [ ] At least eight elements animate while the page loads and is scrolled (counted with `document.getAnimations()` in Playwright), and no content stays hidden if the motion script fails
+
+**Size**: M
+**Dependencies**: Depends on #83 (M11.5), #84 (M11.6), #85 (M11.7), #86 (M11.8)
+
+
+### Render static site deploy (M11.10)
+As the project owner, I want the demo ready to deploy on Render as a static site, so that it can go live by connecting the repository.
+
+**Acceptance criteria**
+- [ ] `render.yaml` at the repo root defines a static site: root directory `web`, build command `npm ci && npm run build`, publish path `dist`, long cache headers for hashed assets and no-cache for `index.html`
+- [ ] The full Playwright suite passes against `vite preview` of the production build, and a Playwright test asserts the page makes no requests to other origins apart from the font provider
+- [ ] The README gains a "Live demo" section explaining how to deploy on Render (connect the repo, Render reads `render.yaml`) and how to run the demo locally
+- [ ] `docs/ROADMAP.md` ticks Milestone 11
+
+**Size**: S
+**Dependencies**: Depends on #87 (M11.9)
+
+**Notes**
+Connecting the Render account is done by the owner and is not part of this story.
