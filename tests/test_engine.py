@@ -6830,3 +6830,137 @@ def test_each_thread_sees_only_its_own_probe_under_concurrent_reads(tmp_path: Pa
             assert searched >= reads_per_thread, (
                 f"thread {slot} recorded {searched} searches over {reads_per_thread} reads"
             )
+
+
+# ---------------------------------------------------------------------------
+# flush(): the flush a caller asks for, added for the web demo (story M11.2)
+# ---------------------------------------------------------------------------
+
+
+def test_flush_writes_the_active_memtable_out_below_the_threshold(tmp_path: Path) -> None:
+    with LedgerLog(tmp_path / "data", fsync_policy="never", flush_in_background=False) as engine:
+        engine.put(b"alpha", b"one")
+        engine.put(b"beta", b"two")
+        # Nothing has reached the threshold, so the flush a full table causes has
+        # nothing to do and only an explicit flush can produce a table.
+        assert engine.frozen_memtables == ()
+        assert engine.flush_pending() == ()
+
+        written = engine.flush()
+
+        assert len(written) == 1
+        assert len(engine.sstables) == 1
+        assert engine.sstables[0].record_count == 2
+        assert engine.frozen_memtables == ()
+        assert engine.memtable_nbytes == 0
+        assert engine.get(b"alpha") == b"one"
+        assert engine.get(b"beta") == b"two"
+
+
+def test_flush_carries_tombstones_and_expiries_into_the_table(tmp_path: Path) -> None:
+    with LedgerLog(tmp_path / "data", fsync_policy="never", flush_in_background=False) as engine:
+        engine.put(b"gone", b"one")
+        engine.delete(b"gone")
+        engine.put(b"timed", b"two", ttl=3600)
+
+        engine.flush()
+
+        assert engine.sstables[0].record_count == 2
+        assert engine.get(b"gone") is None
+        assert engine.get(b"timed") == b"two"
+
+
+def test_flush_on_an_empty_engine_writes_no_table(tmp_path: Path) -> None:
+    with LedgerLog(tmp_path / "data", fsync_policy="never", flush_in_background=False) as engine:
+        assert engine.flush() == ()
+        assert engine.sstables == ()
+
+        engine.put(b"alpha", b"one")
+        engine.flush()
+        # The second flush has an empty active table again, so it adds nothing:
+        # a table of no records is a file every later read has to open and skip.
+        assert engine.flush() == ()
+        assert len(engine.sstables) == 1
+
+
+def test_flush_after_a_flush_writes_only_the_new_records(tmp_path: Path) -> None:
+    with LedgerLog(tmp_path / "data", fsync_policy="never", flush_in_background=False) as engine:
+        engine.put(b"alpha", b"one")
+        engine.flush()
+        engine.put(b"beta", b"two")
+
+        engine.flush()
+
+        assert [handle.record_count for handle in engine.sstables] == [1, 1]
+        assert [handle.sequence for handle in engine.sstables] == [1, 0]
+
+
+def test_flushed_records_survive_a_reopen(tmp_path: Path) -> None:
+    directory = tmp_path / "data"
+    with LedgerLog(directory, fsync_policy="never", flush_in_background=False) as engine:
+        engine.put(b"alpha", b"one")
+        engine.put(b"beta", b"two")
+        engine.flush()
+
+    with LedgerLog(directory, fsync_policy="never", flush_in_background=False) as reopened:
+        assert len(reopened.sstables) == 1
+        assert reopened.get(b"alpha") == b"one"
+        assert reopened.get(b"beta") == b"two"
+
+
+def test_flush_is_refused_on_a_closed_engine(tmp_path: Path) -> None:
+    engine = LedgerLog(tmp_path / "data", fsync_policy="never", flush_in_background=False)
+    engine.close()
+
+    with pytest.raises(ValueError, match="closed"):
+        engine.flush()
+
+
+def test_writes_during_an_explicit_flush_are_neither_lost_nor_duplicated(
+    tmp_path: Path,
+) -> None:
+    """One writer thread, flushes from another, as story M6.2 tests the threshold flush.
+
+    The flush here is the explicit one, so the freeze happens on the flushing
+    thread rather than on the writer's. That is the ordering the single-threaded
+    tests above cannot reach: a writer holding the write lock between its log
+    append and its memtable update while a freeze asks for the same lock.
+    """
+    total = 600
+    with LedgerLog(tmp_path / "data", fsync_policy="never", flush_in_background=False) as engine:
+        failures: list[str] = []
+        done = threading.Event()
+
+        def write() -> None:
+            try:
+                for index in range(total):
+                    engine.put(f"key-{index:04d}".encode(), b"value")
+            except BaseException as error:  # noqa: BLE001
+                failures.append(f"writer raised {error!r}")
+            finally:
+                done.set()
+
+        def flush() -> None:
+            try:
+                while not done.is_set():
+                    engine.flush()
+            except BaseException as error:  # noqa: BLE001
+                failures.append(f"flusher raised {error!r}")
+
+        writer = threading.Thread(target=write, daemon=True)
+        flusher = threading.Thread(target=flush, daemon=True)
+        writer.start()
+        flusher.start()
+        writer.join(timeout=120)
+        flusher.join(timeout=120)
+
+        assert not writer.is_alive() and not flusher.is_alive()
+        assert failures == []
+        engine.flush()
+        assert engine.frozen_memtables == ()
+        for index in range(total):
+            key = f"key-{index:04d}".encode()
+            assert engine.get(key) == b"value", f"{key!r} went missing across a flush"
+        # Every record landed in exactly one table, so the tables hold as many
+        # records between them as the writer wrote.
+        assert sum(handle.record_count for handle in engine.sstables) == total

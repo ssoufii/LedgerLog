@@ -1729,6 +1729,35 @@ class LedgerLog:
                 return tuple(written)
             written.append(layout)
 
+    def flush(self) -> tuple[SSTableLayout, ...]:
+        """Retire the active memtable and write every frozen one out as an SSTable.
+
+        The flush a caller asks for, as opposed to the flush a full memtable
+        causes. :meth:`flush_pending` writes out the tables that have already
+        been frozen by reaching the threshold, which means an engine under the
+        threshold has nothing to flush and no way to ask for one. This freezes
+        the active table first, so what the caller holds in memory becomes a file
+        on disk, and returns every table written, newest last.
+
+        Returns an empty tuple for an engine holding nothing: an empty memtable
+        is not frozen, because a table of no records is a file every later read
+        has to open and skip.
+
+        Here because a tool driving the engine by hand needs it. The web demo
+        (milestone 11) is one: a visitor who has written three keys and presses
+        flush is asking to see those three records become a table, and the engine
+        of a browser demo never reaches a size threshold. It is also the shape a
+        caller wants before copying a data directory, since a flushed engine's
+        directory holds every record in its tables and its log.
+
+        Runs on the calling thread, like :meth:`flush_pending`, and takes the
+        write lock only to freeze.
+        """
+        self._check_open()
+        with self._write_lock:
+            self._freeze_active()
+        return self.flush_pending()
+
     def wait_for_flush(self, timeout: float | None = None) -> bool:
         """Block until no frozen memtable is left, and report whether that happened.
 
@@ -2141,6 +2170,35 @@ class LedgerLog:
             reason=result.reason,
         )
 
+    def _freeze_active(self) -> Memtable | None:
+        """Freeze and replace the active memtable, whatever its size, and return it.
+
+        Returns ``None`` for an empty table, which is the one case where there is
+        nothing to freeze: a frozen empty memtable would be flushed to a table
+        holding no records, and a table with no records is a file that every read
+        has to open and skip for as long as it exists.
+
+        Call holding the write lock. The ordering below is
+        :meth:`_freeze_if_full`'s and is the same in both for the same reason:
+        freeze, publish the frozen tuple, then swap the active table, so a
+        :meth:`get` taking no lock cannot look between the two and miss a record
+        that was never lost.
+        """
+        full = self._memtable
+        if len(full) == 0:
+            return None
+
+        full.freeze()
+        self._frozen_memtables = (full, *self._frozen_memtables)
+        self._memtable = Memtable()
+        self._frozen_changed.notify_all()
+        # One store, and the whole of what a write pays for a flush. The flush
+        # thread does the file, the fsync and the drop; the writer that filled the
+        # table only says that there is now something to do, which is what
+        # "writes are never blocked on flush" comes down to in one line.
+        self._flush_wakeup.set()
+        return full
+
     def _freeze_if_full(self) -> None:
         """Freeze and replace the active memtable if it has reached the threshold.
 
@@ -2164,17 +2222,7 @@ class LedgerLog:
         """
         if self._memtable.nbytes < self._memtable_threshold_bytes:
             return
-
-        full = self._memtable
-        full.freeze()
-        self._frozen_memtables = (full, *self._frozen_memtables)
-        self._memtable = Memtable()
-        self._frozen_changed.notify_all()
-        # One store, and the whole of what a write pays for a flush. The flush
-        # thread does the file, the fsync and the drop; the writer that filled the
-        # table only says that there is now something to do, which is what
-        # "writes are never blocked on flush" comes down to in one line.
-        self._flush_wakeup.set()
+        self._freeze_active()
 
     def _next_free_sstable_sequence(self) -> int:
         """Return the sequence number the next table flushed here should carry.
