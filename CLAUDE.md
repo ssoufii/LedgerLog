@@ -61,11 +61,13 @@ python -m ledgerlog.bench --records 100000
 ruff check src tests          # lint
 ruff format src tests         # format
 
-# web demo (from web/, once M11.2 exists)
+# web demo (from web/)
 npm ci
 npm run lint && npm run typecheck && npm run build
 npx playwright install --with-deps chromium
 npx playwright test           # runs against vite preview of the production build
+npm run sync-assets           # copy Pyodide and src/ledgerlog into web/public (dev and build do this)
+npm run dev                   # vite dev server
 ```
 
 Run `pytest` and `ruff check` before considering any change finished, plus the web commands above when `web/` changed.

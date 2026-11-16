@@ -1,0 +1,10 @@
+node_modules/
+dist/
+test-results/
+playwright-report/
+
+# Copied in by scripts/sync-assets.mjs: the Pyodide runtime from the pinned npm
+# package, and the engine's Python source from src/ledgerlog. Generated, so the
+# build is what keeps them in step with the repo rather than a commit.
+public/pyodide/
+public/engine/
