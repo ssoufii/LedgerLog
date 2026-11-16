@@ -430,12 +430,20 @@ class WalRecord:
     Hiding an expired record is the read path's job (story M8.8), and replay in
     particular needs the expired record back: it still has to shadow an older
     value for the same key, which it cannot do if recovery drops it on the way in.
+
+    ``checksum`` is the CRC32 the record's framing carries, as it was read out of
+    the file, not a value recomputed from the fields above. It is reported rather
+    than discarded once it has been verified because a tool showing the log has
+    nothing else to show for the integrity check the format rests on (story
+    M11.1), and recomputing it later would show what these bytes hash to now
+    rather than what the writer committed.
     """
 
     op: WalOp
     key: bytes
     value: bytes
     expires_at_ms: int
+    checksum: int
     offset: int
     end_offset: int
 
@@ -851,6 +859,10 @@ def _iter_records(stream: BinaryIO, file_size: int) -> Iterator[WalRecord]:
             key=key,
             value=value,
             expires_at_ms=expires_at_ms,
+            # The header's value, which the comparison above has just shown the
+            # payload agrees with, rather than the one computed from it: this is
+            # the number the writer framed the record with.
+            checksum=checksum,
             offset=offset,
             end_offset=offset + RECORD_HEADER_SIZE + payload_length,
         )

@@ -340,14 +340,13 @@ What is deliberately not here yet:
   same records in two places. It is also why startup replaying a flushed record
   on top of the table holding it is harmless rather than a duplicate: both layers
   hold the same record for the key, and a read stops at the first.
-* Running a compaction. Story M8.1 gives the engine a
+* Choosing when to compact. Story M8.1 gives the engine a
   :class:`~ledgerlog.compaction.CompactionPlan`, republished whenever a table is
   added, which says which tables are grouped together and which group has enough
-  tables to be worth merging. Nothing acts on it. The merge and the swap that
-  retires its sources both exist now, as
-  :func:`~ledgerlog.compaction.compact_tier`, but the engine calls neither, so a
-  compaction here is something a caller drives and the plan is a report about the
-  tables the engine holds rather than a thing the engine does.
+  tables to be worth merging. Nothing here decides to act on it:
+  :meth:`LedgerLog.compact_once` merges one ready tier when a caller asks for it
+  (story M11.1), on the caller's thread, and no thread of the engine's own ever
+  calls it. So the engine can compact, but it does not schedule compaction.
 """
 
 from __future__ import annotations
@@ -363,7 +362,14 @@ from pathlib import Path
 from types import TracebackType
 
 from ledgerlog.bloom import BloomFilter
-from ledgerlog.compaction import CompactionPlan, CompactionPolicy, plan_compaction
+from ledgerlog.compaction import (
+    CompactionPlan,
+    CompactionPolicy,
+    CompactionTier,
+    merge_tier,
+    plan_compaction,
+    swap_in_merged_table,
+)
 from ledgerlog.memtable import Memtable, MemtableEntry
 from ledgerlog.sstable import (
     DEFAULT_BLOOM_FALSE_POSITIVE_RATE,
@@ -906,6 +912,39 @@ class RecoveryReport:
         return self.stopped_at is None
 
 
+@dataclass(frozen=True)
+class CompactionRun:
+    """What one call to :meth:`LedgerLog.compact_once` merged, and what it dropped.
+
+    Reported rather than logged because the caller asking for a single
+    compaction step is the caller that wants to know what the step did: a tool
+    showing the engine's internals (story M11.1) has to be able to say which
+    tables went away and which one replaced them, and a return value of ``None``
+    for "nothing was ready" only tells it that a merge happened, not what.
+
+    ``source_sequences`` is newest first, the order the tier listed its tables
+    in and so the order the merge resolved a repeated key in.
+
+    The two record counts are counted from footers, the sources' before the
+    merge and the output's after it, which is why :attr:`records_dropped` is a
+    subtraction rather than a tally kept during the merge. Those footers are the
+    only account of a table's contents that survives the table, and the
+    difference between them is exactly what compaction reclaimed: the older
+    copies of a repeated key, the tombstones nothing older needed, and the
+    records whose deadline had passed (ARCHITECTURE.md section 4).
+    """
+
+    source_sequences: tuple[int, ...]
+    output_sequence: int
+    source_record_count: int
+    output_record_count: int
+
+    @property
+    def records_dropped(self) -> int:
+        """How many records the merge did not carry into the output table."""
+        return self.source_record_count - self.output_record_count
+
+
 @dataclass
 class ReadProbe:
     """Counts collected from inside one walk of the read path.
@@ -1205,6 +1244,24 @@ class LedgerLog:
         would make it stop meaning that.
         """
         return self._memtable.nbytes
+
+    @property
+    def active_memtable(self) -> Memtable:
+        """The memtable writes are currently landing in.
+
+        Readable so that a tool can describe what the engine holds in memory
+        (story M11.1) without reaching for a private attribute: the records, and
+        the height of the skip list node each one sits in, are only there.
+        :attr:`frozen_memtables` is the same thing for the tables that have
+        stopped taking writes, and a reader of the two together sees every record
+        the log covers and no table has yet.
+
+        It is the live table, not a copy, so a caller holding it after a freeze is
+        holding a table the engine no longer writes to. Read it, do not write to
+        it: a put applied here would never reach the log, which is the one
+        ordering this module exists to keep (see the module docstring).
+        """
+        return self._memtable
 
     @property
     def frozen_memtables(self) -> tuple[Memtable, ...]:
@@ -1689,6 +1746,199 @@ class LedgerLog:
         """
         with self._frozen_changed:
             return self._frozen_changed.wait_for(lambda: not self._frozen_memtables, timeout)
+
+    def compact_once(self) -> CompactionRun | None:
+        """Merge one ready size tier, on this thread, and return what it did.
+
+        Returns ``None`` when no tier can be merged, and otherwise a
+        :class:`CompactionRun` describing the merge. The tier is the one
+        :attr:`~ledgerlog.compaction.CompactionPlan.next_tier` names, the merge
+        is :func:`~ledgerlog.compaction.merge_tier`'s and the retirement of its
+        sources is :func:`~ledgerlog.compaction.swap_in_merged_table`'s, and the
+        clock handed to the merge is this engine's, so a record a :meth:`get` has
+        started hiding for having expired is a record this merge is allowed to
+        drop (story M8.4).
+
+        One tier per call, synchronously, rather than a loop or a thread. A
+        caller that wants the plan emptied can call this until it returns
+        ``None``, and a caller that wants to show each step as it happens, which
+        is what the web demo does in a browser that cannot start threads at all
+        (story M11.1), needs each step to be one call that has finished when it
+        returns.
+
+        Takes the flush lock for the whole merge, so a compaction and a flush
+        cannot run at once. They both allocate a table name and both change the
+        table list, and two of them interleaving could hand the same name to two
+        files or publish a list missing a table. Writes are not blocked by it:
+        the write lock is taken only to publish the new table list.
+
+        The output's sequence number is chosen so that the age ordering of
+        :attr:`sstables` survives the merge, which is the one thing
+        :func:`~ledgerlog.compaction.swap_in_merged_table` cannot check for
+        itself. See :meth:`_merged_sequence_for` for what that costs: a tier
+        whose output has nowhere to go is skipped, and if every ready tier is in
+        that position this returns ``None`` without having merged anything.
+
+        Raises whatever the merge raises, having retired nothing: a merge writes
+        to a temporary file and the sources are only unlinked once the output's
+        footer has been read back off the disk (ARCHITECTURE.md section 6), so a
+        failure here leaves every record where it was. What it can leave behind
+        is a committed merged table the engine is not yet serving from, which the
+        next startup adopts from its name like any other table, and whose
+        sequence number no flush will reuse.
+
+        One thing this does not promise, and it is the reason it is a method a
+        caller drives rather than something the engine does on its own: a
+        :meth:`get` that started walking the table list before the swap and is
+        still inside one of the retired tables when this closes it will raise
+        rather than answer. A get that starts after the swap never touches those
+        handles, since the published list no longer holds them. Raising is the
+        failure to prefer here: the alternative, a read that quietly skipped a
+        table it could not open, would answer "not found" for a key that is in
+        the merged table it cannot see.
+        """
+        self._check_open()
+        with self._flush_lock:
+            step = self._next_compaction_step()
+            if step is None:
+                return None
+            tier, sequence = step
+            tier_sequences = {table.sequence for table in tier.tables}
+            # Everything else the engine holds, from which merge_tier picks out
+            # the tables older than the tier so a tombstone none of them needs
+            # can be dropped (story M8.3).
+            others = tuple(
+                table for table in self._sstables if table.sequence not in tier_sequences
+            )
+            source_record_count = sum(table.record_count for table in tier.tables)
+
+            # Taken out of the pool before the merge writes anything and not
+            # given back if it fails, for the reason a flush does the same: a
+            # retry under the same name would be a rename over whatever the
+            # failed attempt left there.
+            if sequence >= self._next_sstable_sequence:
+                self._next_sstable_sequence = sequence + 1
+
+            # The two halves of a compaction, in the only order they can happen
+            # in, rather than compact_tier's one call: the handle for the merged
+            # table is built from the merge's layout, before a source is
+            # unlinked, so there is no window where the sources are gone and the
+            # table that replaced them could still fail to be published. The
+            # swap re-reads the footer off the disk before it deletes anything
+            # either way, which is the check that matters here (story M8.5).
+            layout = merge_tier(
+                tier,
+                self._directory / sstable_filename(sequence),
+                other_tables=others,
+                clock=self._clock,
+                index_interval=self._index_interval,
+                bloom_false_positive_rate=self._bloom_false_positive_rate,
+            )
+            merged = SSTableHandle.from_layout(sequence, layout)
+            swap_in_merged_table(layout.path, [table.path for table in tier.tables])
+            retired = self._commit_compaction(tier, merged)
+
+        # Outside the lock, and after the published list no longer mentions them,
+        # so no read that starts from here on can reach one of these handles.
+        for handle in retired:
+            handle.close()
+
+        return CompactionRun(
+            source_sequences=tier.sequences,
+            output_sequence=sequence,
+            source_record_count=source_record_count,
+            output_record_count=merged.record_count,
+        )
+
+    def _next_compaction_step(self) -> tuple[CompactionTier[SSTableHandle], int] | None:
+        """Pick the tier to merge next and the sequence its output has to carry.
+
+        The plan's ready tiers in its own order, smallest first, and the first
+        one a sequence number can be found for. Call holding the flush lock,
+        which is what makes the plan this reads and the tables it names the same
+        set the merge will run against.
+        """
+        for tier in self._compaction_plan.ready_tiers:
+            sequence = self._merged_sequence_for(tier)
+            if sequence is not None:
+                return tier, sequence
+        return None
+
+    def _merged_sequence_for(self, tier: CompactionTier[SSTableHandle]) -> int | None:
+        """Return the sequence a merge of ``tier`` must output under, or ``None``.
+
+        Position in :attr:`sstables` is age and age decides which copy of a key
+        wins (ARCHITECTURE.md section 5), so a merged table has to land in the
+        slot the tier occupied: newer than every table the merge read, because it
+        holds the newest copy of each of their keys, and older than every table
+        the merge did not read, because any of those may hold a newer copy still.
+        A sequence number is the only thing that says so, which is why it is
+        chosen here and not inside the compaction code: nothing in ``compaction.py``
+        knows what else the engine holds.
+
+        That is one slot, and it is not always free. Two things can take it away.
+
+        A tier groups tables by size, not by age, so a table outside the tier can
+        sit between the tier's oldest and newest members. There is then no slot at
+        all: above the tier's newest means above that table too, and a merged
+        table above it would shadow the newer copies of keys it holds with the
+        older ones the merge took from the tier's tables. ``None``, and the caller
+        moves on to the next ready tier.
+
+        Otherwise the slot is the integers above the tier's newest table and below
+        the next table newer than it. With no table newer than the tier, that is
+        open above and the next free sequence is used, the same one a flush would
+        take. With one, the gap can be empty, since sequence numbers are allocated
+        one per table and the two may be adjacent, and then this returns ``None``
+        as well. Retiring a tier frees its numbers, so a gap usually opens up on
+        the next compaction; a tier skipped here is skipped for now, not forever.
+
+        A name already on disk is skipped too, because a merge finishes by
+        renaming over its destination and a file under that name is either a table
+        this engine is reading or the debris of a crash that has not been cleared.
+        """
+        tier_sequences = {table.sequence for table in tier.tables}
+        oldest_in_tier = min(tier_sequences)
+        newest_in_tier = max(tier_sequences)
+        outside = [
+            table.sequence for table in self._sstables if table.sequence not in tier_sequences
+        ]
+        if any(oldest_in_tier < sequence < newest_in_tier for sequence in outside):
+            return None
+
+        newer = [sequence for sequence in outside if sequence > newest_in_tier]
+        if not newer:
+            return self._next_sstable_sequence
+        for candidate in range(newest_in_tier + 1, min(newer)):
+            if not (self._directory / sstable_filename(candidate)).exists():
+                return candidate
+        return None
+
+    def _commit_compaction(
+        self, tier: CompactionTier[SSTableHandle], merged: SSTableHandle
+    ) -> tuple[SSTableHandle, ...]:
+        """Swap the tier's handles for ``merged`` in the table list, and re-tier.
+
+        Under the write lock, so the list a lock-free reader of :attr:`sstables`
+        sees is either the one with the tier in it or the one with the merged
+        table in it, never a list in between. Returns the handles that left the
+        list, for the caller to close once it has released the lock.
+
+        The list is rebuilt by sequence number rather than by splicing the merged
+        table into the tier's position, because the sequence is what age means
+        here and sorting by it is what makes the published list agree with the
+        names on disk. The plan is recomputed from that list under the same lock,
+        for the reason :meth:`_register_sstable` recomputes it there.
+        """
+        tier_sequences = {table.sequence for table in tier.tables}
+        with self._write_lock:
+            retired = tuple(table for table in self._sstables if table.sequence in tier_sequences)
+            kept = [table for table in self._sstables if table.sequence not in tier_sequences]
+            tracked = tuple(sorted([merged, *kept], key=lambda table: table.sequence, reverse=True))
+            plan = plan_compaction(tracked, self._compaction_policy)
+            self._sstables = tracked
+            self._compaction_plan = plan
+        return retired
 
     def close(self) -> None:
         """Close the log and stop accepting operations. Safe to call more than once.

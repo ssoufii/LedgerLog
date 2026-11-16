@@ -554,6 +554,25 @@ class SkipList:
             return iter(self._snapshot(self._walk_items))
         return self._walk_items()
 
+    def items_with_levels(self) -> Iterator[tuple[bytes, bytes, int]]:
+        """Return an iterator over ``(key, value, level)``, in ascending key order.
+
+        The level is the node's height: how many of the list's express lanes that
+        key was linked into when it was inserted, which is the one property of a
+        skip list that is drawn rather than derived. It is exposed because a tool
+        that wants to show what the structure actually looks like (story M11.1)
+        would otherwise have to reach into the nodes, and a caller reading private
+        attributes to find a height is a caller the structure can no longer
+        change.
+
+        Read-only, and it draws nothing: iterating never promotes or relinks a
+        node, so what comes back is the shape the inserts left behind. Safe to run
+        while a writer inserts, under the same promise :meth:`items` makes.
+        """
+        if self._locked_reads:
+            return iter(self._snapshot(self._walk_items_with_levels))
+        return self._walk_items_with_levels()
+
     def _walk_keys(self) -> Iterator[bytes]:
         """Walk level 0 lazily, yielding keys."""
         node = self._head.forward[0]
@@ -566,6 +585,13 @@ class SkipList:
         node = self._head.forward[0]
         while node is not None:
             yield node.key, node.value
+            node = node.forward[0]
+
+    def _walk_items_with_levels(self) -> Iterator[tuple[bytes, bytes, int]]:
+        """Walk level 0 lazily, yielding key, value and the node's height."""
+        node = self._head.forward[0]
+        while node is not None:
+            yield node.key, node.value, node.level
             node = node.forward[0]
 
     def _snapshot(self, walk: Callable[[], Iterator[_T]]) -> list[_T]:
@@ -1114,6 +1140,24 @@ class Memtable:
         """
         for key, stored in self._skiplist.items():
             yield _decode_stored(key, stored)
+
+    def entries_with_levels(self) -> Iterator[tuple[MemtableEntry, int]]:
+        """Yield every record with the height of the skip list node holding it.
+
+        Key order, tombstones included, exactly as :meth:`entries` yields them.
+        The height comes with the record because the two are read from one walk
+        of the structure: asking for the records and then asking for the heights
+        would walk a list that a writer may have changed in between, and the
+        caller would have to decide what to do about a key present in one answer
+        and not the other.
+
+        Here for the introspection snapshot of story M11.1, which draws the
+        memtable as one tower per key at the key's real height. A reader of this
+        is looking at the structure rather than at the data, which is why nothing
+        in the engine's own read or flush path uses it.
+        """
+        for key, stored, level in self._skiplist.items_with_levels():
+            yield _decode_stored(key, stored), level
 
     def keys(self) -> Iterator[bytes]:
         """Yield every key in ascending byte order, including tombstoned keys."""
