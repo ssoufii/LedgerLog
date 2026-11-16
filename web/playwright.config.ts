@@ -10,6 +10,11 @@ import { defineConfig, devices } from "@playwright/test";
  * their own timeout rather than raising it for every test.
  */
 const PORT = 4173;
+// Bound explicitly rather than left to vite's default of "localhost", which a
+// machine whose resolver answers ::1 first binds as IPv6 only. Playwright then
+// polls 127.0.0.1 and waits for a server that is listening somewhere else,
+// which is a two minute timeout rather than an error.
+const HOST = "127.0.0.1";
 
 export default defineConfig({
   testDir: "./tests",
@@ -21,7 +26,7 @@ export default defineConfig({
     ? [["list"], ["html", { outputFolder: "test-results/report", open: "never" }]]
     : [["list"]],
   use: {
-    baseURL: `http://127.0.0.1:${PORT}`,
+    baseURL: `http://${HOST}:${PORT}`,
     trace: "off",
     launchOptions: {
       // The CI container and the dev container both run the browser as root,
@@ -31,9 +36,13 @@ export default defineConfig({
   },
   projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
   webServer: {
-    command: `npm run preview -- --port ${PORT} --strictPort`,
-    url: `http://127.0.0.1:${PORT}`,
+    command: `npm run preview -- --host ${HOST} --port ${PORT} --strictPort`,
+    url: `http://${HOST}:${PORT}`,
     reuseExistingServer: !process.env.CI,
     timeout: 120_000,
+    // Piped so that a server that starts but does not serve says why in the CI
+    // log, instead of showing up only as the timeout above.
+    stdout: "pipe",
+    stderr: "pipe",
   },
 });
