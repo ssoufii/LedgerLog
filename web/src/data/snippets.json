@@ -1,0 +1,11 @@
+{
+  "about": "The one template the start dialog fills in, and the one tests/test_snippets.py runs. Placeholders are replaced with Python string literals (JSON string syntax, which Python reads unchanged).",
+  "template": "from ledgerlog import LedgerLog\n\nwith LedgerLog(\n    {{directory}},\n    fsync_policy={{fsync_policy}},\n) as db:\n    db.put(b\"user:1042\", b\"hello\")\n    print(db.get(b\"user:1042\"))\n",
+  "policies": [
+    "never",
+    "interval",
+    "always"
+  ],
+  "default_directory": "./data",
+  "default_policy": "always"
+}

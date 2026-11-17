@@ -8,14 +8,15 @@ import { Hero } from "./components/Hero";
 import { NumbersSlider } from "./components/NumbersSlider";
 import { SiteFooter } from "./components/SiteFooter";
 import { SiteNav } from "./components/SiteNav";
+import { StartSection } from "./components/StartSection";
 import { WriteStrip } from "./components/WriteStrip";
 
 /**
  * The page, in the order section 2 argues it.
  *
- * The sections still missing (durability, crash proof, numbers, start) each
- * prove one claim and arrive with the story that can prove it, because
- * section 2's rule is that a section without a claim does not go on the page.
+ * Every section proves one claim, in the order the table in section 2 gives
+ * them: drive it, follow a write, the durability dial, crash proof, the
+ * numbers, and the start. A section without a claim does not go on the page.
  *
  * The one effect here is the first read of the engine. The engine is the
  * external system the page renders, and until it reports itself ready there
@@ -42,6 +43,7 @@ export function App() {
         <DurabilityDial />
         <CrashTiles />
         <NumbersSlider />
+        <StartSection />
       </main>
       <SiteFooter />
     </>

@@ -363,3 +363,9 @@ The page can now be used to pull the plug. A board of tiles names six ways a sto
 The damage itself is not demo code. It lives in the store's own source, in a module whose only job is to break things on purpose, and the test suite drives the same functions to assert the same recoveries. That is the point of the arrangement: the demonstration on the page and the assertion in the tests cannot drift apart, because they are the same code. Each tile also names the test that covers its failure, and a test checks that every name on a tile is a test that really exists, so the page cannot claim a guarantee nobody wrote down.
 
 Two of the results are worth reading. A torn write loses exactly the record that was cut and nothing written before it. A flush killed before its end marker loses nothing at all: the file is passed over and every record comes back from the log, which is what makes that marker the moment a file counts as written.
+
+## Story M11.8: Start dialog that writes the snippet
+
+The page now ends with the first step already taken: an open "new database" window on a deep red field, beside the closing line "start writing." The window has a box for the folder the database should live in, a three-way choice of how carefully it saves to disk, and the few lines of Python that open that database, write one key and read it back. Changing either choice rewrites the code on the spot, and one button copies it, saying "copied" for a moment and working from the keyboard as well as the mouse.
+
+The code on the page comes from a single template file, and the Python test suite fills in that same template for every saving option and actually runs it against the real engine. So a renamed setting, or a folder name with quotes in it, fails a test before it can ever be shown to anyone as working code.

@@ -73,6 +73,11 @@
   /* The wordmark's letter blocks. A type size, so it lives here. */
   --wordmark-unit: clamp(30px, 7vw, 96px);
 
+  /* The one shadow on the page. Section 6 lets the start section's open
+     "new database" dialog cast its own shadow, and section 7 allows a shadow
+     nowhere else, so it is a token with one user rather than a literal. */
+  --shadow-dialog: 0 28px 72px rgb(13 11 12 / 0.55);
+
   /* Section 5. The frame: 12 columns, equal outer margins at every width. */
   --margin: clamp(16px, 3vw, 40px);
   --grid-gap: clamp(16px, 1.5vw, 24px);

@@ -1050,3 +1050,147 @@
     aspect-ratio: auto;
   }
 }
+
+/* Start: the first step, already open. A full bleed maroon field; the closing
+   line bottom-left over columns 1-5, the "new database" dialog vertically
+   centred over columns 7-11. On a narrow screen they stack, line first, so the
+   section still opens with the heading that names it. */
+.start {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  column-gap: var(--grid-gap);
+  row-gap: 56px;
+  min-height: 90svh;
+  padding: 120px var(--margin);
+  background: var(--maroon);
+}
+
+.start__copy {
+  grid-column: 1 / -1;
+  align-self: end;
+}
+
+.start__heading {
+  font-size: var(--step-hero);
+}
+
+.start__line {
+  display: block;
+}
+
+.start__sentence {
+  max-width: 40ch;
+  margin-top: 32px;
+  font-size: var(--step-body);
+}
+
+.start-dialog {
+  grid-column: 1 / -1;
+  align-self: center;
+  width: min(440px, 100%);
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+  padding: 28px;
+  background: var(--surface-1);
+  box-shadow: var(--shadow-dialog);
+}
+
+@media (min-width: 900px) {
+  .start__copy {
+    grid-column: 1 / span 5;
+    grid-row: 1;
+  }
+
+  .start-dialog {
+    grid-column: 7 / span 5;
+    grid-row: 1;
+  }
+}
+
+.start-dialog__title {
+  font-size: var(--step-lead);
+}
+
+.start-dialog__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.start-dialog__label {
+  font-size: var(--step-small);
+  color: var(--muted);
+}
+
+.start-dialog__input {
+  width: 100%;
+  border: 1px solid var(--surface-3);
+}
+
+.start-dialog__input[aria-invalid="true"] {
+  border-color: var(--maroon-text);
+}
+
+.start-dialog__hint {
+  font-size: var(--step-small);
+  color: var(--maroon-text);
+}
+
+.start-dialog__segments {
+  display: flex;
+  background: var(--surface-2);
+}
+
+.start-dialog__option {
+  flex: 1 1 0;
+  padding: 10px 0;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: var(--step-small);
+  transition:
+    background-color var(--t-ui) ease,
+    color var(--t-ui) ease,
+    transform var(--t-press) var(--ease-out);
+}
+
+.start-dialog__option[aria-checked="true"] {
+  background: var(--maroon-bright);
+  color: var(--ink);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .start-dialog__option:not([aria-checked="true"]):hover {
+    background: var(--surface-3);
+    color: var(--ink);
+  }
+}
+
+.start-dialog__code {
+  margin: 0;
+  padding: 16px;
+  background: var(--ground);
+  font-size: var(--step-small);
+  line-height: 1.6;
+  overflow-x: auto;
+  white-space: pre;
+}
+
+.start-dialog__actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px 16px;
+}
+
+.start-dialog__status {
+  font-size: var(--step-small);
+  color: var(--muted);
+}
+
+.start-dialog__link {
+  align-self: flex-start;
+  font-size: var(--step-nav);
+  text-decoration: underline;
+  text-underline-offset: 0.2em;
+}
