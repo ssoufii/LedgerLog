@@ -7,6 +7,7 @@ import { Hero } from "./components/Hero";
 import { NumbersSlider } from "./components/NumbersSlider";
 import { SiteFooter } from "./components/SiteFooter";
 import { SiteNav } from "./components/SiteNav";
+import { StartSection } from "./components/StartSection";
 import { WriteStrip } from "./components/WriteStrip";
 
 /**
@@ -40,6 +41,7 @@ export function App() {
         <WriteStrip />
         <DurabilityDial />
         <NumbersSlider />
+        <StartSection />
       </main>
       <SiteFooter />
     </>

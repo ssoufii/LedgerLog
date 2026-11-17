@@ -355,3 +355,9 @@ The page now says what durability costs, in figures that came from a real benchm
 The durability section is one control blown up until it fills the lower half of the screen: three choices for how often the log is forced to disk. Choosing one swaps a single word in the heading, from "fast and durable?" to "fast, not durable", "fast and durable" or "durable, not fast", changes the background between grey and deep red depending on whether the setting makes a durability promise at all, and shows that setting's measured write rate with the exact command that produced it. The three choices behave like a real set of radio buttons: one stop on the keyboard, arrow keys to move between them.
 
 Below it, a slider from ten thousand to a hundred million records, spaced logarithmically so the whole range is usable, and one very large number: how long it would take to write that many records at the measured rate. At a million records it reads 15.5 seconds, and beside it the page writes out the division in words and shows the command again, so anyone can check the arithmetic and reproduce the rate.
+
+## Story M11.8: Start dialog that writes the snippet
+
+The page now ends with the first step already taken: an open "new database" window on a deep red field, beside the closing line "start writing." The window has a box for the folder the database should live in, a three-way choice of how carefully it saves to disk, and the few lines of Python that open that database, write one key and read it back. Changing either choice rewrites the code on the spot, and one button copies it, saying "copied" for a moment and working from the keyboard as well as the mouse.
+
+The code on the page comes from a single template file, and the Python test suite fills in that same template for every saving option and actually runs it against the real engine. So a renamed setting, or a folder name with quotes in it, fails a test before it can ever be shown to anyone as working code.
