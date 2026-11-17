@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, type CSSProperties } from "react";
 
 import { BENCH, POLICIES, figuresFor, type FsyncPolicy } from "../data/bench";
 import { Invocation } from "./Invocation";
@@ -62,13 +62,13 @@ export function DurabilityDial() {
       data-ground={ground(policy)}
     >
       <div className="dial-section__copy">
-        <h2 className="dial-section__heading">
+        <h2 className="dial-section__heading" data-reveal="0">
           {heading.before}{" "}
           <span data-testid="durability-word">{heading.word}</span>{" "}
           {heading.after}
         </h2>
 
-        <p className="dial-section__sentence" data-testid="durability-sentence">
+        <p className="dial-section__sentence" data-testid="durability-sentence" data-reveal="1">
           {policy === null
             ? "LedgerLog syncs the write-ahead log on whichever of three policies you pick. Choose one to see what it measured."
             : SENTENCES[policy]}
@@ -103,6 +103,20 @@ export function DurabilityDial() {
         aria-label="write-ahead log fsync policy"
         data-testid="durability-dial"
       >
+        {/* The active segment is one block that slides between options
+            (section 8), drawn under the labels rather than as each option's
+            own fill, so a change of choice is a move and not a blink. */}
+        <span
+          className="segment-indicator"
+          aria-hidden="true"
+          data-active={policy === null ? "false" : "true"}
+          style={
+            {
+              "--segment-index": policy === null ? 0 : POLICIES.indexOf(policy),
+              "--segment-count": POLICIES.length,
+            } as CSSProperties
+          }
+        />
         {POLICIES.map((option) => (
           <button
             key={option}

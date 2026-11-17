@@ -37,7 +37,13 @@ export function RecordCard({
   action?: ReactNode;
 }) {
   return (
-    <div className="record-card" data-ui="record-card" data-stage={stage} data-present={rows.length > 0}>
+    <div
+      className="record-card"
+      data-ui="record-card"
+      data-stage={stage}
+      data-present={rows.length > 0}
+      data-reveal="2"
+    >
       <span className="record-card__stage">{stage}</span>
       <span className="record-card__key" title={recordKey ?? ""}>
         {recordKey ?? "no key yet"}

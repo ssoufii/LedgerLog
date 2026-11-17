@@ -103,11 +103,16 @@ test("a delete leaves a tombstone that is drawn differently", async ({ page }) =
 
   await expect(tower).toHaveAttribute("data-tombstone", "true");
   await expect(tower.locator(".tower__value")).toHaveText("deleted");
-  const deadColour = await tower
-    .locator(".tower__block")
-    .first()
-    .evaluate((node) => getComputedStyle(node).backgroundColor);
-  expect(deadColour).not.toBe(liveColour);
+  // Polled, because the tower fades to its tombstone colour (section 8) rather
+  // than switching in one frame; what matters is the colour it settles on.
+  await expect
+    .poll(() =>
+      tower
+        .locator(".tower__block")
+        .first()
+        .evaluate((node) => getComputedStyle(node).backgroundColor),
+    )
+    .not.toBe(liveColour);
   // The key is gone as far as a reader is concerned, which is what the
   // tombstone is for.
   await page.getByRole("button", { name: "get", exact: true }).click();
