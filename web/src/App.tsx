@@ -2,6 +2,7 @@ import { useEffect } from "react";
 
 import { DEMO_KEY, refresh } from "./engine/state";
 import { useEngineStatus } from "./engine/useEngine";
+import { CrashTiles } from "./components/CrashTiles";
 import { DurabilityDial } from "./components/DurabilityDial";
 import { Hero } from "./components/Hero";
 import { NumbersSlider } from "./components/NumbersSlider";
@@ -39,6 +40,7 @@ export function App() {
         <Hero />
         <WriteStrip />
         <DurabilityDial />
+        <CrashTiles />
         <NumbersSlider />
       </main>
       <SiteFooter />

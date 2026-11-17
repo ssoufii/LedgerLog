@@ -30,7 +30,7 @@ import shutil
 import sys
 from typing import Any
 
-from ledgerlog import LedgerLog, introspect
+from ledgerlog import LedgerLog, faults, introspect
 
 DATA_DIR = "/data"
 """Directory the demo's database lives in, inside Pyodide's in-memory filesystem."""
@@ -174,6 +174,25 @@ class DemoSession:
         """Everything the engine holds, as :mod:`ledgerlog.introspect` describes it."""
         return introspect.snapshot(self.engine)
 
+    def crash(self, scenario: str) -> dict[str, Any]:
+        """Stage one crash on a copy of this database and report what recovered.
+
+        The copy, the damage and the reopen are all
+        :func:`ledgerlog.faults.run_scenario`'s, which is the same code the
+        engine's own crash tests drive. This session does nothing but name the
+        directory, so the page cannot be shown a recovery the test suite does
+        not also assert.
+
+        A scenario the database has nothing for (a table damage on a database
+        with no tables) comes back as a refusal rather than as a result with
+        nothing in it, because "nothing was dropped" would read as the engine
+        surviving something that never happened.
+        """
+        try:
+            return {"ok": True, "report": faults.run_scenario(DATA_DIR, scenario)}
+        except faults.ScenarioNotPossible as refused:
+            return {"ok": False, "reason": str(refused)}
+
     def locate(self, key: str) -> dict[str, Any]:
         """Where one key is, layer by layer, as :mod:`ledgerlog.introspect` describes it.
 
@@ -212,6 +231,8 @@ def handle(name: str, payload_json: str) -> str:
         result = SESSION.snapshot()
     elif name == "locate":
         result = SESSION.locate(payload["key"])
+    elif name == "crash":
+        result = SESSION.crash(payload["scenario"])
     elif name == "reset":
         result = SESSION.reset()
     elif name == "info":
