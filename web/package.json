@@ -6,9 +6,10 @@
   "description": "In-browser demo of the LedgerLog storage engine, running the repo's own Python source in Pyodide.",
   "scripts": {
     "sync-assets": "node scripts/sync-assets.mjs",
-    "predev": "npm run sync-assets",
+    "bench-data": "node scripts/bench-data.mjs",
+    "predev": "npm run sync-assets && npm run bench-data",
     "dev": "vite",
-    "prebuild": "npm run sync-assets",
+    "prebuild": "npm run sync-assets && npm run bench-data",
     "build": "vite build",
     "preview": "vite preview",
     "lint": "eslint .",

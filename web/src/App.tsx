@@ -2,7 +2,9 @@ import { useEffect } from "react";
 
 import { DEMO_KEY, refresh } from "./engine/state";
 import { useEngineStatus } from "./engine/useEngine";
+import { DurabilityDial } from "./components/DurabilityDial";
 import { Hero } from "./components/Hero";
+import { NumbersSlider } from "./components/NumbersSlider";
 import { SiteFooter } from "./components/SiteFooter";
 import { SiteNav } from "./components/SiteNav";
 import { WriteStrip } from "./components/WriteStrip";
@@ -36,6 +38,8 @@ export function App() {
       <main>
         <Hero />
         <WriteStrip />
+        <DurabilityDial />
+        <NumbersSlider />
       </main>
       <SiteFooter />
     </>
