@@ -193,6 +193,12 @@
   width: 100%;
 }
 
+.console__form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
 .console__actions {
   display: flex;
   flex-wrap: wrap;
@@ -243,17 +249,143 @@
   margin-bottom: 6px;
 }
 
+/* The log tail: one row per record, in fixed columns so that offsets and
+   checksums line up down the panel and a long key is the only thing that
+   gives way. */
 .console__rows {
   display: flex;
   flex-direction: column;
   gap: 4px;
   font-size: var(--step-small);
+  color: var(--muted);
 }
 
 .console__rows li {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  gap: 4px 12px;
+  align-items: baseline;
+}
+
+.console__rows li > :last-child {
+  text-align: right;
+}
+
+.wal__cell {
+  white-space: nowrap;
+}
+
+.wal__cell--key {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--ink);
+}
+
+.console__error {
+  font-size: var(--step-body);
+  line-height: 1.4;
+  color: var(--maroon-text);
+}
+
+.console__input[aria-invalid="true"] {
+  border-color: var(--maroon-bright);
+}
+
+/* The memtable, drawn as the skip list it is: one tower per key in key order,
+   bottoms on one line, each one as many blocks tall as the level the engine
+   gave that node. The strip scrolls rather than wrapping, because a wrapped
+   row of towers is no longer one skip list seen from the side. */
+.towers {
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+}
+
+.tower {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  flex: 0 0 auto;
+  width: 84px;
+  font-size: var(--step-small);
+}
+
+.tower__stack {
+  display: flex;
+  flex-direction: column-reverse;
+  gap: var(--block-gap);
+}
+
+.tower__block {
+  width: var(--block);
+  height: var(--block);
+  background: var(--muted);
+}
+
+/* A tombstone is still a node in the list, so it keeps its tower and loses its
+   colour. The word under it says the same thing, so the distinction is not
+   carried by colour alone. */
+.tower__stack[data-tombstone="true"] .tower__block {
+  background: var(--surface-3);
+}
+
+.tower__key,
+.tower__value,
+.tower__level {
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.tower__key {
+  color: var(--ink);
+}
+
+.tower__value,
+.tower__level {
+  color: var(--muted);
+}
+
+/* One tile per table on disk: what it is called, how many records it holds and
+   the range of keys it answers for. */
+.tiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.tile {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  background: var(--surface-2);
+  padding: 12px 14px;
+  min-width: 150px;
+  font-size: var(--step-small);
+}
+
+.tile__name,
+.tile__range {
+  color: var(--muted);
+  max-width: 180px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.tile__figure {
+  font-size: var(--step-lead);
+  font-weight: 700;
+  line-height: 1.1;
+  color: var(--ink);
+}
+
+.tile__unit {
+  color: var(--muted);
 }
 
 .console__empty {
