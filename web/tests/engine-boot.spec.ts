@@ -17,6 +17,12 @@ const BOOT_TIMEOUT = 30_000;
 test.beforeEach(async ({ page }) => {
   await page.goto("/");
   await expect(page.getByTestId("boot-status")).toHaveText("ready", { timeout: BOOT_TIMEOUT });
+  // The session writes one demo record when it opens the database (see
+  // session.py), so the page is never empty and the write strip has a real
+  // record to follow. These tests are about the visitor's own writes, so they
+  // start from the empty database the reset control gives back.
+  await page.getByRole("button", { name: "reset", exact: true }).click();
+  await expect(page.getByTestId("wal-records").locator("li")).toHaveCount(0);
 });
 
 test("the engine boots and reports the Python it is running", async ({ page }) => {
@@ -33,7 +39,7 @@ test("the engine boots and reports the Python it is running", async ({ page }) =
 test("a put then a get round-trips a value through the engine", async ({ page }) => {
   await page.getByLabel("key").fill("user:1042:login");
   await page.getByLabel("value").fill("2026-11-16T05:00:00Z");
-  await page.getByRole("button", { name: "put" }).click();
+  await page.getByRole("button", { name: "put", exact: true }).click();
   await expect(page.getByTestId("last-action")).toContainText("logged at offset");
 
   await page.getByRole("button", { name: "get", exact: true }).click();
@@ -44,7 +50,7 @@ test("a put then a get round-trips a value through the engine", async ({ page })
 test("the snapshot lists the key in the memtable, with its tower level", async ({ page }) => {
   await page.getByLabel("key").fill("alpha");
   await page.getByLabel("value").fill("one");
-  await page.getByRole("button", { name: "put" }).click();
+  await page.getByRole("button", { name: "put", exact: true }).click();
   await expect(page.getByTestId("last-action")).toContainText("logged at offset");
 
   const entry = page.getByTestId("memtable-entries").locator("li[data-key='alpha']");
@@ -60,7 +66,7 @@ test("the snapshot lists the key in the memtable, with its tower level", async (
 test("the log shows the record the write went into first", async ({ page }) => {
   await page.getByLabel("key").fill("alpha");
   await page.getByLabel("value").fill("one");
-  await page.getByRole("button", { name: "put" }).click();
+  await page.getByRole("button", { name: "put", exact: true }).click();
 
   const records = page.getByTestId("wal-records").locator("li");
 
@@ -72,10 +78,10 @@ test("the log shows the record the write went into first", async ({ page }) => {
 test("a flush turns the memtable into a table on disk", async ({ page }) => {
   await page.getByLabel("key").fill("alpha");
   await page.getByLabel("value").fill("one");
-  await page.getByRole("button", { name: "put" }).click();
+  await page.getByRole("button", { name: "put", exact: true }).click();
   await expect(page.getByTestId("memtable-entries").locator("li")).toHaveCount(1);
 
-  await page.getByRole("button", { name: "flush" }).click();
+  await page.getByRole("button", { name: "flush", exact: true }).click();
 
   await expect(page.getByTestId("sstables").locator("li")).toHaveCount(1);
   await expect(page.getByTestId("sstables").locator("li").first()).toContainText("1 records");
@@ -88,10 +94,10 @@ test("a flush turns the memtable into a table on disk", async ({ page }) => {
 test("a reset gives the visitor an empty database back", async ({ page }) => {
   await page.getByLabel("key").fill("alpha");
   await page.getByLabel("value").fill("one");
-  await page.getByRole("button", { name: "put" }).click();
+  await page.getByRole("button", { name: "put", exact: true }).click();
   await expect(page.getByTestId("memtable-entries").locator("li")).toHaveCount(1);
 
-  await page.getByRole("button", { name: "reset" }).click();
+  await page.getByRole("button", { name: "reset", exact: true }).click();
 
   await expect(page.getByTestId("memtable-entries").locator("li")).toHaveCount(0);
   await expect(page.getByTestId("wal-records").locator("li")).toHaveCount(0);

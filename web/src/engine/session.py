@@ -35,6 +35,23 @@ from ledgerlog import LedgerLog, introspect
 DATA_DIR = "/data"
 """Directory the demo's database lives in, inside Pyodide's in-memory filesystem."""
 
+DEMO_KEY = "user:1042:login"
+"""The key the session writes once at boot, so the page has a real record to follow.
+
+Why a real write rather than a worked example in the markup: the four stage
+strip (story M11.5) shows where one record is at each stage of the write path,
+read from the engine. Before a visitor has typed anything there is nothing to
+read, and a card filled with plausible numbers would be the invented proof
+docs/FRONTEND_DESIGN.md section 9 rules out. One write at boot costs a few
+bytes of the log and makes every figure on the page true.
+
+Written at boot and not by :meth:`DemoSession.reset`, which is the visitor
+asking for an empty database and gets one.
+"""
+
+DEMO_VALUE = "2026-11-16T05:00:00Z"
+"""The value stored under :data:`DEMO_KEY`, chosen to look like a real session record."""
+
 
 def _decode(data: bytes) -> str:
     """Decode engine bytes for display, the way the snapshot does."""
@@ -47,6 +64,9 @@ class DemoSession:
     def __init__(self) -> None:
         self._engine: LedgerLog | None = None
         self.reset()
+        # The one write the visitor did not ask for. See DEMO_KEY: the strip
+        # has to have a real record to follow before anyone has typed one.
+        self.put(DEMO_KEY, DEMO_VALUE)
 
     @property
     def engine(self) -> LedgerLog:
@@ -154,6 +174,16 @@ class DemoSession:
         """Everything the engine holds, as :mod:`ledgerlog.introspect` describes it."""
         return introspect.snapshot(self.engine)
 
+    def locate(self, key: str) -> dict[str, Any]:
+        """Where one key is, layer by layer, as :mod:`ledgerlog.introspect` describes it.
+
+        Separate from :meth:`snapshot` because it answers a different question
+        and costs more: it may open every table whose filter accepts the key.
+        The page asks for it once per refresh, for the one key the strip is
+        following, not for every key on screen.
+        """
+        return introspect.locate(self.engine, key)
+
 
 SESSION = DemoSession()
 
@@ -180,6 +210,8 @@ def handle(name: str, payload_json: str) -> str:
         result = SESSION.compact_once()
     elif name == "snapshot":
         result = SESSION.snapshot()
+    elif name == "locate":
+        result = SESSION.locate(payload["key"])
     elif name == "reset":
         result = SESSION.reset()
     elif name == "info":

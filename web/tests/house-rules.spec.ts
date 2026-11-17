@@ -157,7 +157,7 @@ test("every control is named and reachable by keyboard", async ({ page }) => {
 test("the hero button sends focus to the console", async ({ page }) => {
   await openReady(page);
 
-  await page.getByRole("button", { name: "Write a key" }).click();
+  await page.getByRole("button", { name: "Write a key", exact: true }).click();
 
   await expect(page.getByLabel("key")).toBeFocused();
 });

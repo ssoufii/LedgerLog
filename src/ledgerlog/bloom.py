@@ -626,6 +626,33 @@ class BloomFilter:
         """
         return (self.set_bit_count / self._bit_count) ** self._hash_count
 
+    def bit_positions(self, key: bytes) -> tuple[int, ...]:
+        """Return the ``k`` bit positions ``key`` maps to, in probe order.
+
+        Public because a tool explaining a read has to show why a table was
+        opened or skipped, and "the filter said no" is not an explanation: the
+        positions, and whether each one is set, are. :meth:`might_contain` is
+        the same walk with the answer collapsed to a bool, so the two cannot
+        disagree about which bits a key lands on.
+
+        A tuple rather than the internal list, so a caller cannot reorder the
+        probe sequence a later call would report.
+        """
+        return tuple(self._indexes(key))
+
+    def bit_is_set(self, index: int) -> bool:
+        """Return whether the bit at ``index`` is set in the array.
+
+        Alongside :meth:`bit_positions`, this is what lets a caller show which
+        of a key's bits are already covered, which is the whole of why a
+        positive can be wrong.
+        """
+        if not isinstance(index, int) or isinstance(index, bool):
+            raise TypeError(f"index must be an int, got {type(index).__name__}")
+        if not 0 <= index < self._bit_count:
+            raise IndexError(f"bit index {index} is outside a filter of {self._bit_count} bits")
+        return bool(self._bits[index >> 3] & (1 << (index & 7)))
+
     def _indexes(self, key: bytes) -> list[int]:
         """Return the ``k`` bit positions ``key`` maps to.
 

@@ -24,12 +24,18 @@ async function openReady(page: Page): Promise<void> {
 async function write(page: Page, key: string, value: string): Promise<void> {
   await page.getByLabel("key").fill(key);
   await page.getByLabel("value").fill(value);
-  await page.getByRole("button", { name: "put" }).click();
+  await page.getByRole("button", { name: "put", exact: true }).click();
   await expect(page.getByTestId("last-action")).toContainText(`${key} logged at offset`);
 }
 
 test.beforeEach(async ({ page }) => {
   await openReady(page);
+  // The session writes one demo record when it opens the database (see
+  // session.py), so the page is never empty and the write strip has a real
+  // record to follow. These tests are about the visitor's own writes, so they
+  // start from the empty database the reset control gives back.
+  await page.getByRole("button", { name: "reset", exact: true }).click();
+  await expect(page.getByTestId("wal-records").locator("li")).toHaveCount(0);
 });
 
 test("three puts draw three towers, as tall as the levels the engine drew", async ({ page }) => {
@@ -92,7 +98,7 @@ test("a delete leaves a tombstone that is drawn differently", async ({ page }) =
     .first()
     .evaluate((node) => getComputedStyle(node).backgroundColor);
 
-  await page.getByRole("button", { name: "delete" }).click();
+  await page.getByRole("button", { name: "delete", exact: true }).click();
   await expect(page.getByTestId("last-action")).toContainText("tombstoned at offset");
 
   await expect(tower).toHaveAttribute("data-tombstone", "true");
@@ -133,7 +139,7 @@ test("a flush turns the memtable into a tile with its count and key range", asyn
   await write(page, "alpha", "one");
   await write(page, "charlie", "three");
 
-  await page.getByRole("button", { name: "flush" }).click();
+  await page.getByRole("button", { name: "flush", exact: true }).click();
 
   const tiles = page.getByTestId("sstables").locator("li.tile");
   await expect(tiles).toHaveCount(1);
@@ -143,14 +149,14 @@ test("a flush turns the memtable into a tile with its count and key range", asyn
 });
 
 test("the compact control appears only once a tier is ready to merge", async ({ page }) => {
-  const compact = page.getByRole("button", { name: "compact" });
+  const compact = page.getByRole("button", { name: "compact", exact: true });
   await expect(compact).toHaveCount(0);
 
   // The default policy merges a tier once it holds four comparable tables, so
   // four flushes of one record each is the first merge the engine will take.
   for (let index = 0; index < 4; index += 1) {
     await write(page, `key-${String(index)}`, "value");
-    await page.getByRole("button", { name: "flush" }).click();
+    await page.getByRole("button", { name: "flush", exact: true }).click();
     await expect(page.getByTestId("sstables").locator("li.tile")).toHaveCount(index + 1);
   }
 
@@ -165,7 +171,7 @@ test("the compact control appears only once a tier is ready to merge", async ({ 
 test("an empty key is refused, with the reason tied to the field", async ({ page }) => {
   await page.getByLabel("key").fill("");
 
-  await page.getByRole("button", { name: "put" }).click();
+  await page.getByRole("button", { name: "put", exact: true }).click();
 
   const field = page.getByLabel("key");
   await expect(field).toHaveAttribute("aria-invalid", "true");
@@ -206,7 +212,7 @@ test("the whole flow works by keyboard alone", async ({ page }) => {
   // Start from the key field as the hero's button leaves it, then reach every
   // control with Tab and operate it with Enter or Space. No pointer is used
   // anywhere in this test.
-  await page.getByRole("button", { name: "Write a key" }).focus();
+  await page.getByRole("button", { name: "Write a key", exact: true }).focus();
   await page.keyboard.press("Enter");
   await expect(page.getByLabel("key")).toBeFocused();
 
@@ -225,11 +231,11 @@ test("the whole flow works by keyboard alone", async ({ page }) => {
   await page.keyboard.press("Enter");
   await expect(page.getByTestId("get-result")).toHaveText("one");
 
-  await page.getByRole("button", { name: "flush" }).focus();
+  await page.getByRole("button", { name: "flush", exact: true }).focus();
   await page.keyboard.press("Enter");
   await expect(page.getByTestId("sstables").locator("li.tile")).toHaveCount(1);
 
-  await page.getByRole("button", { name: "delete" }).focus();
+  await page.getByRole("button", { name: "delete", exact: true }).focus();
   await page.keyboard.press("Enter");
   await expect(page.locator("li.tower[data-key='alpha']")).toHaveAttribute("data-tombstone", "true");
 });
@@ -241,7 +247,7 @@ test("the console holds together on a phone with real data in it", async ({ page
   await page.setViewportSize({ width: 390, height: 844 });
   await write(page, "user:1042:login", "2026-11-16T05:00:00Z");
   await write(page, "session:a91f", "open");
-  await page.getByRole("button", { name: "flush" }).click();
+  await page.getByRole("button", { name: "flush", exact: true }).click();
   await expect(page.getByTestId("sstables").locator("li.tile")).toHaveCount(1);
   await write(page, "user:1043:login", "2026-11-17T05:00:00Z");
 

@@ -1,19 +1,20 @@
-import { useCallback, useEffect, useState } from "react";
+import { useState } from "react";
 
-import type { Snapshot } from "../engine/protocol";
-import { engineBridge, useEngineStatus } from "../engine/useEngine";
+import { actions, useEngineState } from "../engine/state";
+import { useEngineStatus } from "../engine/useEngine";
 import { Tower } from "./Tower";
 import { TowerLoader } from "./TowerLoader";
 
 /**
  * The console fragment on the hero stage: the one live thing on the page.
  *
- * Every number, tower and row below comes from one snapshot of the engine,
- * taken after each call. Nothing here decides anything about storage: the
- * tower heights are the levels the skip list drew, the log rows are the bytes
- * the write-ahead log actually holds, and the tiles are the tables a flush
- * wrote. A panel that computed any of that would be the JavaScript imitation
- * the project exists not to be.
+ * Every number, tower and row below comes from the shared engine state, which
+ * is one snapshot of the engine taken after each call (see engine/state.ts).
+ * Nothing here decides anything about storage: the tower heights are the
+ * levels the skip list drew, the log rows are the bytes the write-ahead log
+ * actually holds, and the tiles are the tables a flush wrote. A panel that
+ * computed any of that would be the JavaScript imitation the project exists
+ * not to be.
  *
  * The root carries `data-ui`, which is what section 7 of
  * docs/FRONTEND_DESIGN.md keys its exceptions off: inside a fragment an input
@@ -30,51 +31,11 @@ export const CONSOLE_KEY_INPUT_ID = KEY_INPUT_ID;
 const WAL_TAIL = 6;
 
 export function Console() {
-  const bridge = engineBridge();
   const status = useEngineStatus();
+  const { snapshot, lastAction, lastGet } = useEngineState();
   const [key, setKey] = useState("user:1042:login");
   const [value, setValue] = useState("2026-11-16T05:00:00Z");
-  const [action, setAction] = useState("");
-  const [found, setFound] = useState("");
   const [keyError, setKeyError] = useState("");
-  const [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-
-  const refresh = useCallback(async () => {
-    setSnapshot(await bridge.snapshot());
-  }, [bridge]);
-
-  // The engine is the external system here: once it reports itself ready, the
-  // page reads one snapshot from it so that what is on screen is the engine's
-  // state and not an empty placeholder. Every later refresh is driven by a
-  // control the visitor pressed.
-  useEffect(() => {
-    if (status.phase !== "ready") {
-      return undefined;
-    }
-    let live = true;
-    void bridge.snapshot().then((next) => {
-      if (live) {
-        setSnapshot(next);
-      }
-    });
-    return () => {
-      live = false;
-    };
-  }, [status.phase, bridge]);
-
-  const run = useCallback(
-    (label: string, call: () => Promise<string>) => {
-      void (async () => {
-        try {
-          setAction(`${label}: ${await call()}`);
-          await refresh();
-        } catch (error) {
-          setAction(`${label} failed: ${error instanceof Error ? error.message : String(error)}`);
-        }
-      })();
-    },
-    [refresh],
-  );
 
   /**
    * The three calls that name a key refuse an empty one here rather than at
@@ -82,69 +43,39 @@ export function Console() {
    * cursor is still in it. The message is tied to the input with
    * `aria-describedby`, so it is read out with the field and not only seen.
    */
-  const withKey = (label: string, call: () => Promise<string>): void => {
+  const withKey = (call: (key: string) => Promise<void>): void => {
     if (key === "") {
       setKeyError("a key is needed: type one and try again");
       document.getElementById(KEY_INPUT_ID)?.focus();
       return;
     }
     setKeyError("");
-    run(label, call);
+    void call(key);
   };
 
   const onPut = () => {
-    withKey("put", async () => {
-      const result = await bridge.put(key, value);
-      return `${result.key} logged at offset ${String(result.wal_offset)}`;
-    });
+    withKey((named) => actions.put(named, value));
   };
 
   const onGet = () => {
-    withKey("get", async () => {
-      const result = await bridge.get(key);
-      setFound(result.found ? (result.value ?? "") : "not found");
-      return result.found ? `${result.key} is ${String(result.value_length)} bytes` : "not found";
-    });
+    withKey((named) => actions.get(named));
   };
 
   const onDelete = () => {
-    withKey("delete", async () => {
-      const result = await bridge.delete(key);
-      return `${result.key} tombstoned at offset ${String(result.wal_offset)}`;
-    });
+    withKey((named) => actions.delete(named));
   };
 
   const onFlush = () => {
-    run("flush", async () => {
-      const result = await bridge.flush();
-      if (result.tables.length === 0) {
-        return "nothing in memory to flush";
-      }
-      return result.tables
-        .map((table) => `${table.name} holds ${String(table.record_count)} records`)
-        .join(", ");
-    });
+    void actions.flush();
   };
 
   const onCompact = () => {
-    run("compact", async () => {
-      const result = await bridge.compactOnce();
-      if (result === null) {
-        return "no tier is ready to merge";
-      }
-      return `merged ${result.source_sequences.join(", ")} into ${String(
-        result.output_sequence,
-      )}, dropping ${String(result.records_dropped)} records`;
-    });
+    void actions.compact();
   };
 
   const onReset = () => {
-    run("reset", async () => {
-      const result = await bridge.reset();
-      setFound("");
-      setKeyError("");
-      return `new database at ${result.directory}`;
-    });
+    setKeyError("");
+    void actions.reset();
   };
 
   const busy = status.phase !== "ready";
@@ -250,8 +181,8 @@ export function Console() {
       </form>
 
       <div className="console__readout" data-numeric>
-        <span data-testid="last-action">{action}</span>
-        <span data-testid="get-result">{found}</span>
+        <span data-testid="last-action">{lastAction}</span>
+        <span data-testid="get-result">{lastGet}</span>
       </div>
 
       <div className="console__panels" data-numeric>

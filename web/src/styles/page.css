@@ -532,3 +532,147 @@
   flex-wrap: wrap;
   gap: 24px;
 }
+
+/* How it works: one card, four fields.
+ *
+ * Four full height colour fields side by side with no gaps, stepping in
+ * lightness from the ground to the accent, each holding the same card at true
+ * size and one clause at its foot (section 6).
+ *
+ * Two readings of section 6 are resolved here, both because section 7's house
+ * rules are the checked contract:
+ *
+ * 1. The heading runs across the top of the strip rather than wrapping inside
+ *    the first field. "how a write travels" sets about 570px at --step-head,
+ *    and a 25vw field is 360px at 1440, so inside the field it would be three
+ *    lines and fail the two line rule. It still starts top left in the first
+ *    field, which is where section 6 puts it; it simply does not stop there.
+ * 2. The fields stack below 1200px, not only on a phone. A 25vw field is
+ *    192px at 768 and the card is 260px at true size, so four columns below
+ *    1200 would mean a cropped fragment at every width in between.
+ */
+.strip {
+  position: relative;
+  display: grid;
+  grid-template-columns: 1fr;
+}
+
+.strip__heading {
+  position: absolute;
+  top: 28px;
+  left: var(--margin);
+  z-index: 1;
+  font-size: var(--step-head);
+  white-space: nowrap;
+}
+
+/* The card sits 38% down the field. Expressed against the viewport height
+   rather than as a percentage padding, which would resolve against the
+   field's width and put the card at 38% of the wrong axis. */
+.strip__field {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  min-height: 64svh;
+  /* Stacked, each field is the full width of the page, so its inset is the
+     page margin: the card and the heading above it line up on one edge. */
+  padding: 24svh var(--margin) 28px;
+  background: var(--ground);
+}
+
+.strip__field[data-field="memory"] {
+  background: var(--surface-3);
+}
+
+.strip__field[data-field="disk"] {
+  background: var(--maroon-deep);
+}
+
+.strip__field[data-field="merge"] {
+  background: var(--maroon);
+}
+
+.strip__clause {
+  max-width: 22ch;
+  font-size: var(--step-lead);
+  line-height: 1.5;
+  margin-top: 48px;
+}
+
+@media (min-width: 1200px) {
+  .strip {
+    grid-template-columns: repeat(4, 1fr);
+  }
+
+  .strip__field {
+    min-height: 84svh;
+    /* 38% of 84svh, which is where section 6 places the card. */
+    padding: 32svh 28px 28px;
+  }
+
+  /* The first field opens on the page margin, so its card lines up with the
+     heading above it and with the hero's headline further up. */
+  .strip__field[data-field="log"] {
+    padding-left: var(--margin);
+  }
+}
+
+/* The card that appears in all four fields, at true size. */
+.record-card {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  width: min(260px, 100%);
+  background: var(--surface-1);
+  padding: 18px;
+  font-size: var(--step-small);
+}
+
+.record-card__stage {
+  color: var(--muted);
+}
+
+.record-card__key {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+  font-weight: 500;
+}
+
+.record-card__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  margin: 0;
+}
+
+.record-card__row {
+  display: grid;
+  grid-template-columns: 7.5em minmax(0, 1fr);
+  gap: 8px;
+}
+
+.record-card__row dt {
+  color: var(--muted);
+}
+
+.record-card__row dd {
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.record-card__missing {
+  color: var(--muted);
+}
+
+.record-card button {
+  font-size: var(--step-small);
+  padding: 8px 12px;
+}

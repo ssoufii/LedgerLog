@@ -101,6 +101,36 @@ export interface Snapshot {
   compaction: CompactionView;
 }
 
+/** What one table on disk has to say about one key, in the order a read asks it. */
+export interface LocatedTable {
+  sequence: number;
+  name: string;
+  bloom_bit_count: number;
+  bloom_bit_positions: number[];
+  bloom_bits_set_for_key: boolean[];
+  bloom_might_contain: boolean;
+  searched: boolean;
+  indexed: boolean;
+  index_offset: number | null;
+  scan_from_key: string | null;
+  present: boolean;
+  record_offset: number | null;
+  record_end_offset: number | null;
+  tombstone: boolean;
+}
+
+/** Where one key is, layer by layer, in the order a `get` consults them. */
+export interface LocateResult {
+  locate_version: number;
+  key: string;
+  key_bytes: number;
+  wal: WalRecordView | null;
+  memtable: (MemtableEntryView & { frozen: boolean }) | null;
+  sstables: LocatedTable[];
+  answered_by: "memtable" | "frozen_memtable" | "sstable" | null;
+  answering_sequence: number | null;
+}
+
 /** What one `put` did. */
 export interface PutResult {
   key: string;
@@ -167,6 +197,7 @@ export interface EngineCalls {
   flush: { request: Record<string, never>; response: FlushResult };
   compactOnce: { request: Record<string, never>; response: CompactionResult | null };
   snapshot: { request: Record<string, never>; response: Snapshot };
+  locate: { request: { key: string }; response: LocateResult };
   reset: { request: Record<string, never>; response: ResetResult };
 }
 

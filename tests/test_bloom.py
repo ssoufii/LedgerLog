@@ -922,3 +922,55 @@ def test_any_bytes_like_blob_is_accepted(wrapper: object) -> None:
     restored = BloomFilter.deserialize(wrapper(original.serialize()))  # type: ignore[operator]
 
     assert restored.bits == original.bits
+
+
+# ---------------------------------------------------------------------------
+# Bit level introspection, for a tool explaining a read (story M11.5)
+# ---------------------------------------------------------------------------
+
+
+def test_bit_positions_are_the_bits_an_add_sets() -> None:
+    empty = BloomFilter.for_target(expected_keys=64, false_positive_rate=0.01)
+    positions = empty.bit_positions(b"alpha")
+
+    assert len(positions) == empty.hash_count
+    assert all(0 <= position < empty.bit_count for position in positions)
+    assert not all(empty.bit_is_set(position) for position in positions)
+
+    empty.add(b"alpha")
+
+    assert empty.bit_positions(b"alpha") == positions
+    assert all(empty.bit_is_set(position) for position in positions)
+
+
+def test_bit_positions_agree_with_might_contain() -> None:
+    bloom = BloomFilter.for_target(expected_keys=128, false_positive_rate=0.01)
+    for index in range(64):
+        bloom.add(f"key-{index}".encode())
+
+    for index in range(200):
+        key = f"probe-{index}".encode()
+        covered = all(bloom.bit_is_set(position) for position in bloom.bit_positions(key))
+        assert covered is bloom.might_contain(key)
+
+
+def test_bit_positions_survive_a_round_trip() -> None:
+    bloom = BloomFilter.for_target(expected_keys=32, false_positive_rate=0.01)
+    bloom.add(b"alpha")
+
+    restored = BloomFilter.deserialize(bloom.serialize())
+
+    positions = restored.bit_positions(b"alpha")
+    assert positions == bloom.bit_positions(b"alpha")
+    assert [restored.bit_is_set(bit) for bit in positions] == [True] * restored.hash_count
+
+
+def test_bit_is_set_refuses_an_index_outside_the_array() -> None:
+    bloom = BloomFilter.for_target(expected_keys=16, false_positive_rate=0.01)
+
+    with pytest.raises(IndexError):
+        bloom.bit_is_set(bloom.bit_count)
+    with pytest.raises(IndexError):
+        bloom.bit_is_set(-1)
+    with pytest.raises(TypeError):
+        bloom.bit_is_set("3")  # type: ignore[arg-type]

@@ -23,6 +23,7 @@ import {
   type EngineInfo,
   type FlushResult,
   type GetResult,
+  type LocateResult,
   type PutResult,
   type ResetResult,
   type Snapshot,
@@ -47,6 +48,8 @@ export interface EngineBridge {
   flush(): Promise<FlushResult>;
   compactOnce(): Promise<CompactionResult | null>;
   snapshot(): Promise<Snapshot>;
+  /** Where one key is, layer by layer. Costlier than a snapshot: see session.py. */
+  locate(key: string): Promise<LocateResult>;
   reset(): Promise<ResetResult>;
   /** Stop the worker. The bridge cannot be used afterwards. */
   dispose(): void;
@@ -168,6 +171,9 @@ export function createBridge(): EngineBridge {
     },
     snapshot() {
       return call("snapshot", {});
+    },
+    locate(key) {
+      return call("locate", { key });
     },
     reset() {
       return call("reset", {});
