@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { expect, test } from "@playwright/test";
 
 import { auditPage, stampFocusable } from "./support/house-rules";
+import { revealAll } from "./support/reveal";
 
 /**
  * Story M11.3's contract: the house rules in section 7 of
@@ -41,6 +42,9 @@ for (const { width, height } of WIDTHS) {
   test(`the house rules hold at ${String(width)} wide`, async ({ page }, testInfo) => {
     await page.setViewportSize({ width, height });
     await openReady(page);
+    // Scrolled through once, as a visitor would, so the sections below the
+    // fold are audited and photographed after their entrance, not before it.
+    await revealAll(page);
 
     const report = await page.evaluate(auditPage);
 

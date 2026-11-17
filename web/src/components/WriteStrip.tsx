@@ -116,7 +116,7 @@ export function WriteStrip() {
 
   return (
     <section className="strip" id="how-it-works" aria-labelledby="strip-heading">
-      <h2 className="strip__heading" id="strip-heading">
+      <h2 className="strip__heading" id="strip-heading" data-reveal="0">
         how a write travels
       </h2>
 
@@ -129,7 +129,7 @@ export function WriteStrip() {
             ? {}
             : { missing: "no record for this key in the log", action: writeAction })}
         />
-        <p className="strip__clause">{CLAUSES[0]}</p>
+        <p className="strip__clause" data-reveal="1">{CLAUSES[0]}</p>
       </div>
 
       <div className="strip__field" data-field="memory">
@@ -146,7 +146,7 @@ export function WriteStrip() {
                 ...(table ? {} : { action: writeAction }),
               })}
         />
-        <p className="strip__clause">{CLAUSES[1]}</p>
+        <p className="strip__clause" data-reveal="1">{CLAUSES[1]}</p>
       </div>
 
       <div className="strip__field" data-field="disk">
@@ -170,7 +170,7 @@ export function WriteStrip() {
                 ),
               })}
         />
-        <p className="strip__clause">{CLAUSES[2]}</p>
+        <p className="strip__clause" data-reveal="1">{CLAUSES[2]}</p>
       </div>
 
       <div className="strip__field" data-field="merge">
@@ -202,7 +202,7 @@ export function WriteStrip() {
                   : {}),
               })}
         />
-        <p className="strip__clause">{CLAUSES[3]}</p>
+        <p className="strip__clause" data-reveal="1">{CLAUSES[3]}</p>
       </div>
     </section>
   );

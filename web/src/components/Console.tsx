@@ -1,6 +1,8 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 
 import { actions, useEngineState } from "../engine/state";
+import type { SSTableView } from "../engine/protocol";
+import { moveOut, settle, useEntrance } from "../motion";
 import { useEngineStatus } from "../engine/useEngine";
 import { Tower } from "./Tower";
 import { TowerLoader } from "./TowerLoader";
@@ -65,8 +67,15 @@ export function Console() {
     withKey((named) => actions.delete(named));
   };
 
+  // Section 8: a flush moves the towers out as one group before the engine is
+  // asked, so the tile that appears is visibly where they went.
+  const towersRef = useRef<HTMLUListElement>(null);
   const onFlush = () => {
-    void actions.flush();
+    void (async () => {
+      await moveOut(towersRef.current);
+      await actions.flush();
+      settle(towersRef.current);
+    })();
   };
 
   const onCompact = () => {
@@ -190,7 +199,12 @@ export function Console() {
           <span className="console__panel-label" id="panel-memtable">
             in memory
           </span>
-          <ul className="towers" data-testid="memtable-entries" aria-labelledby="panel-memtable">
+          <ul
+            className="towers"
+            data-testid="memtable-entries"
+            aria-labelledby="panel-memtable"
+            ref={towersRef}
+          >
             {memtableEntries.map((entry) => (
               <li
                 className="tower"
@@ -244,16 +258,7 @@ export function Console() {
           </span>
           <ul className="tiles" data-testid="sstables" aria-labelledby="panel-tables">
             {tables.map((table) => (
-              <li className="tile" key={table.sequence} data-sequence={table.sequence}>
-                <span className="tile__name" title={table.name}>
-                  {table.name}
-                </span>{" "}
-                <span className="tile__figure">{table.record_count}</span>{" "}
-                <span className="tile__unit">records</span>{" "}
-                <span className="tile__range">
-                  keys {table.min_key ?? "none"} to {table.max_key ?? "none"}
-                </span>
-              </li>
+              <TableTile key={table.sequence} table={table} />
             ))}
           </ul>
           <span className="console__empty" data-testid="compaction-state">
@@ -266,5 +271,26 @@ export function Console() {
         </div>
       </div>
     </div>
+  );
+}
+
+/**
+ * One table a flush wrote. Its own component so that each tile fixes its
+ * entrance when it mounts (see `useEntrance`): a tile written by a keyboard
+ * flush fades in, one written by a click rises into place.
+ */
+function TableTile({ table }: { table: SSTableView }) {
+  const entrance = useEntrance();
+  return (
+    <li className="tile" data-sequence={table.sequence} data-enter={entrance}>
+      <span className="tile__name" title={table.name}>
+        {table.name}
+      </span>{" "}
+      <span className="tile__figure">{table.record_count}</span>{" "}
+      <span className="tile__unit">records</span>{" "}
+      <span className="tile__range">
+        keys {table.min_key ?? "none"} to {table.max_key ?? "none"}
+      </span>
+    </li>
   );
 }

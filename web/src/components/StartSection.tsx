@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState } from "react";
+import { useEffect, useId, useRef, useState, type CSSProperties } from "react";
 
 import { REPO_URL } from "../links";
 import {
@@ -75,17 +75,23 @@ export function StartSection() {
   return (
     <section className="start" id="start" aria-labelledby="start-heading">
       <div className="start__copy">
-        <h2 className="start__heading" id="start-heading">
+        <h2 className="start__heading" id="start-heading" data-reveal="0">
           <span className="start__line">start</span>{" "}
           <span className="start__line">writing.</span>
         </h2>
-        <p className="start__sentence">
+        <p className="start__sentence" data-reveal="1">
           The code opens a database in the directory you name, with the fsync policy you pick,
           writes one key and reads it back.
         </p>
       </div>
 
-      <div className="start-dialog" role="dialog" aria-labelledby={titleId} data-ui="new-database">
+      <div
+        className="start-dialog"
+        role="dialog"
+        aria-labelledby={titleId}
+        data-ui="new-database"
+        data-reveal="2"
+      >
         <h3 className="start-dialog__title" id={titleId}>
           new database
         </h3>
@@ -123,6 +129,17 @@ export function StartSection() {
             aria-labelledby={`${titleId}-fsync`}
             data-testid="start-policy"
           >
+            <span
+              className="segment-indicator"
+              aria-hidden="true"
+              data-active="true"
+              style={
+                {
+                  "--segment-index": SNIPPET_POLICIES.indexOf(policy),
+                  "--segment-count": SNIPPET_POLICIES.length,
+                } as CSSProperties
+              }
+            />
             {SNIPPET_POLICIES.map((option, index) => (
               <button
                 key={option}

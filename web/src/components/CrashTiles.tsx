@@ -97,7 +97,7 @@ export function CrashTiles() {
   return (
     <section className="crash" id="crash-proof" aria-labelledby="crash-heading">
       <div className="crash__board">
-        <div className="crash-tile crash-tile--heading">
+        <div className="crash-tile crash-tile--heading" data-reveal="0">
           <h2 className="crash__heading" id="crash-heading">
             pull the plug
           </h2>

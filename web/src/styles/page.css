@@ -772,7 +772,9 @@
   display: flex;
   align-items: center;
   justify-content: center;
-  background: var(--surface-2);
+  position: relative;
+  z-index: 1;
+  background: transparent;
   color: var(--muted);
   font-size: var(--step-dial);
   font-weight: 500;
@@ -784,7 +786,6 @@
 }
 
 .dial__option[aria-checked="true"] {
-  background: var(--maroon-bright);
   color: var(--ink);
 }
 
@@ -1138,14 +1139,17 @@
 }
 
 .start-dialog__segments {
+  position: relative;
   display: flex;
   background: var(--surface-2);
 }
 
 .start-dialog__option {
   flex: 1 1 0;
+  position: relative;
+  z-index: 1;
   padding: 10px 0;
-  background: var(--surface-2);
+  background: transparent;
   color: var(--muted);
   font-size: var(--step-small);
   transition:
@@ -1155,7 +1159,6 @@
 }
 
 .start-dialog__option[aria-checked="true"] {
-  background: var(--maroon-bright);
   color: var(--ink);
 }
 
@@ -1193,4 +1196,186 @@
   font-size: var(--step-nav);
   text-decoration: underline;
   text-underline-offset: 0.2em;
+}
+
+/* Motion. Section 8 of docs/FRONTEND_DESIGN.md, rule by rule:
+   only transform, opacity and clip-path move (colour fades on hover and on a
+   tombstone are colour, not movement); no `transition: all`; never ease-in;
+   UI responses under 300ms; nothing enters from scale(0); state-driven moves
+   are transitions so they retarget; keyboard actions fade rather than travel
+   (the [data-enter] and [data-input] hooks, set by src/motion.ts); hover only
+   behind the hover media query; and under reduced motion, nothing travels or
+   scales. */
+
+/* The signature: the hero stage opens from its bottom edge, once. The notch is
+   part of the stage's shape, so the shutter animates the same ten-point
+   polygon from flat along the bottom to the notched outline, rather than an
+   inset that would drop the notch for the length of the move. */
+@keyframes stage-shutter {
+  from {
+    clip-path: polygon(
+      calc(3 * var(--block-lg)) 100%,
+      100% 100%,
+      100% 100%,
+      0 100%,
+      0 100%,
+      var(--block-lg) 100%,
+      var(--block-lg) 100%,
+      calc(2 * var(--block-lg)) 100%,
+      calc(2 * var(--block-lg)) 100%,
+      calc(3 * var(--block-lg)) 100%
+    );
+  }
+}
+
+@keyframes console-settle {
+  from {
+    transform: scale(1.04);
+  }
+}
+
+.stage {
+  animation: stage-shutter var(--t-open) var(--ease-in-out) both;
+}
+
+.stage .console {
+  animation: console-settle 1500ms var(--ease-soft) both;
+}
+
+/* Section entrances: heading, then text, then fragment, 70ms apart, rising
+   20px. The waiting state exists only under .motion, which the motion script
+   adds once it knows the entrance can run, so a failed script hides nothing. */
+[data-reveal] {
+  transition:
+    opacity var(--t-reveal) var(--ease-out),
+    transform var(--t-reveal) var(--ease-out);
+}
+
+[data-reveal="1"] {
+  transition-delay: var(--stagger);
+}
+
+[data-reveal="2"] {
+  transition-delay: calc(2 * var(--stagger));
+}
+
+.motion [data-reveal]:not([data-revealed]) {
+  opacity: 0;
+  transform: translateY(20px);
+}
+
+/* A new key's tower builds block by block from the bottom, 140ms a block,
+   40ms apart. Born from the keyboard, it fades in whole instead (rule 8). */
+@keyframes block-build {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+}
+
+.tower__stack[data-enter="travel"] .tower__block {
+  animation: block-build var(--t-press) var(--ease-out) both;
+  animation-delay: calc(var(--block-index, 0) * 40ms);
+}
+
+.tower__stack[data-enter="fade"] .tower__block {
+  animation: fade-in var(--t-press) var(--ease-out) both;
+}
+
+/* A tombstone turns the tower grey: a colour change, faded. */
+.tower__block {
+  transition: background-color var(--t-ui) ease;
+}
+
+/* The table a flush wrote rises into place where the towers went. */
+@keyframes tile-rise {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+}
+
+.tile[data-enter="travel"] {
+  animation: tile-rise var(--t-ui) var(--ease-out) both;
+}
+
+.tile[data-enter="fade"] {
+  animation: fade-in var(--t-press) var(--ease-out) both;
+}
+
+/* A crash tile's result replaces its description: a state change, so it
+   fades in rather than appearing at once. Opacity only; the tile does not
+   move (section 6: no hover lift, and nothing else lifts either). */
+.crash-tile__result {
+  animation: fade-in var(--t-ui) var(--ease-out) both;
+}
+
+/* Segmented controls: one active block that slides between the options. */
+.segment-indicator {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  width: calc(100% / var(--segment-count, 3));
+  background: var(--maroon-bright);
+  transform: translateX(calc(var(--segment-index, 0) * 100%));
+  transition:
+    transform var(--t-ui) var(--ease-in-out),
+    opacity var(--t-ui) ease;
+}
+
+.segment-indicator[data-active="false"] {
+  opacity: 0;
+}
+
+:root[data-input="keyboard"] .segment-indicator {
+  transition: opacity var(--t-press) ease;
+}
+
+/* Press feedback on the links as well as the buttons (rule 5). A transform
+   needs a box, so the links that carry it are inline blocks. */
+.nav-link,
+.start-dialog__link {
+  display: inline-block;
+  transition:
+    color var(--t-hover) ease,
+    transform var(--t-press) var(--ease-out);
+}
+
+.nav-link:active,
+.start-dialog__link:active {
+  transform: scale(0.97);
+}
+
+/* Rule 11. No travel and no scale: the shutter and the settle go, entrances
+   become the short fade, the indicator jumps, presses stay put. */
+@media (prefers-reduced-motion: reduce) {
+  .stage,
+  .stage .console {
+    animation: none;
+  }
+
+  [data-reveal] {
+    transition: opacity var(--t-press) ease;
+  }
+
+  .tower__stack[data-enter] .tower__block,
+  .tile[data-enter] {
+    animation: fade-in var(--t-press) ease both;
+  }
+
+  .segment-indicator {
+    transition: opacity var(--t-press) ease;
+  }
+
+  .nav-link:active,
+  .start-dialog__link:active {
+    transform: none;
+  }
 }

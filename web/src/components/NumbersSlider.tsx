@@ -63,11 +63,11 @@ export function NumbersSlider() {
 
   return (
     <section className="numbers" id="numbers" aria-labelledby="numbers-heading">
-      <h2 className="numbers__heading" id="numbers-heading">
+      <h2 className="numbers__heading" id="numbers-heading" data-reveal="0">
         how many records?
       </h2>
 
-      <div className="numbers__control" data-ui="records-slider">
+      <div className="numbers__control" data-ui="records-slider" data-reveal="2">
         <label className="numbers__label" htmlFor={sliderId}>
           records to write
         </label>
@@ -88,14 +88,14 @@ export function NumbersSlider() {
         </output>
       </div>
 
-      <div className="numbers__result">
+      <div className="numbers__result" data-reveal="1">
         <span className="numbers__figure" data-numeric data-testid="records-seconds">
           {formatSeconds(seconds)}
           <span className="numbers__suffix">s</span>
         </span>
       </div>
 
-      <div className="numbers__note">
+      <div className="numbers__note" data-reveal="1">
         <p>
           {records.toLocaleString("en-GB")} records divided by {rate.toLocaleString("en-GB")}{" "}
           records per second, the sequential write throughput measured at{" "}
