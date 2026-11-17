@@ -1,0 +1,43 @@
+# Render Blueprint for the LedgerLog web demo (story M11.10).
+#
+# A static site: the page, the worker, the Pyodide runtime and the engine's own
+# Python source are all files in web/dist, so there is no server to run. Render
+# reads this file when the repository is connected as a Blueprint.
+#
+# The build runs from web/ but reads outside it: scripts/sync-assets.mjs copies
+# ../src/ledgerlog into the bundle and scripts/bench-data.mjs reads ../README.md.
+# Render clones the whole repository, so both are there; the build filter makes
+# a change to either one trigger a deploy too.
+services:
+  - type: web
+    name: ledgerlog-demo
+    runtime: static
+    rootDir: web
+    buildCommand: npm ci && npm run build
+    staticPublishPath: dist
+    buildFilter:
+      paths:
+        - web/**
+        - src/ledgerlog/**
+        - README.md
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+    headers:
+      # Hashed by Vite: a new build is a new name, so these never go stale.
+      - path: /assets/*
+        name: Cache-Control
+        value: public, max-age=31536000, immutable
+      # The page itself must always be fresh, or a visitor keeps loading the
+      # names of assets the last build replaced.
+      - path: /index.html
+        name: Cache-Control
+        value: no-cache
+      - path: /
+        name: Cache-Control
+        value: no-cache
+      # The engine source is copied in unhashed, and the page claims to run
+      # this commit's engine, so it is revalidated on every load.
+      - path: /engine/*
+        name: Cache-Control
+        value: no-cache

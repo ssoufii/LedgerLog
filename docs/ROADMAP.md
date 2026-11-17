@@ -69,9 +69,9 @@ The real engine running in the browser (Pyodide, in a Web Worker), with no serve
 - [x] Read-only introspection snapshot and a synchronous single compaction step, so a UI never touches private state
 - [x] `web/` app (Vite, React, TypeScript) booting the engine in a worker behind a typed bridge, with Playwright tests in CI
 - [x] Design system, frame, hero stage and footer that pass the house rules at 1440, 768 and 390 wide
-- [ ] Live console (memtable towers, WAL tail, flush, compact), the four-stage write strip, the durability dial and numbers slider from measured data, crash recovery tiles, and the start dialog
-- [ ] Motion layer per the spec, with reduced-motion support
-- [ ] `render.yaml` static site config and a README "Live demo" section
+- [x] Live console (memtable towers, WAL tail, flush, compact), the four-stage write strip, the durability dial and numbers slider from measured data, crash recovery tiles, and the start dialog
+- [x] Motion layer per the spec, with reduced-motion support
+- [x] `render.yaml` static site config and a README "Live demo" section
 
 ## Stretch goals (not required for a complete v1)
 - TTL/retention as a first-class `put(key, value, ttl=...)` parameter: promoted into Milestone 8 (stories M8.6 to M8.8), since "compaction drops old stuff" needs a per-record expiry before it can drop anything
