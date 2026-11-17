@@ -1,0 +1,130 @@
+/*
+ * Element defaults. Tokens only: every colour and type size here is a var()
+ * from tokens.css.
+ *
+ * Why so little: section 5 of docs/FRONTEND_DESIGN.md asks for one button
+ * shape, corners of 0 everywhere, surfaces separated by a step in tone rather
+ * than by a line, and no shadows at rest. Most of that is best said once, as
+ * the default, so that a component has to opt out of it on purpose.
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  background: var(--ground);
+}
+
+body {
+  margin: 0;
+  background: var(--ground);
+  color: var(--ink);
+  font-family: var(--font-text);
+  font-size: var(--step-body);
+  font-weight: 400;
+  line-height: 1.5;
+  letter-spacing: 0;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1,
+h2,
+h3,
+h4,
+h5,
+h6 {
+  margin: 0;
+  font-weight: 700;
+  letter-spacing: -0.05em;
+  line-height: 0.9;
+  text-transform: lowercase;
+}
+
+p {
+  margin: 0;
+}
+
+ul {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+pre,
+code {
+  font-family: var(--font-code);
+}
+
+/* One button shape on the whole page: square corners, flat fill, no border.
+   Press feedback is on the shape itself rather than on each use of it, so
+   nothing pressable can ship without it (section 8, rule 5). */
+button {
+  appearance: none;
+  border: 0;
+  border-radius: 0;
+  background: var(--maroon-bright);
+  color: var(--ink);
+  font: inherit;
+  font-weight: 500;
+  padding: 14px 22px;
+  cursor: pointer;
+  transition:
+    transform var(--t-press) var(--ease-out),
+    background-color var(--t-hover) ease,
+    color var(--t-hover) ease;
+}
+
+button:active:not(:disabled) {
+  transform: scale(0.97);
+}
+
+button:disabled {
+  background: var(--surface-3);
+  color: var(--muted);
+  cursor: default;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  button:not(:disabled):hover {
+    background: var(--maroon);
+  }
+}
+
+input {
+  appearance: none;
+  background: var(--surface-2);
+  border: 0;
+  border-radius: 0;
+  color: var(--ink);
+  font: inherit;
+  padding: 10px 12px;
+}
+
+/* The focus ring is an outline rather than a border, so that it cannot be
+   mistaken for the thin rules section 7 rules out, and so it takes no space. */
+:focus-visible {
+  outline: 3px solid var(--ink);
+  outline-offset: 2px;
+}
+
+/* Numbers that update are read in columns, so they are set as tabular figures
+   wherever they appear (section 4). */
+[data-numeric] {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Section 8, rule 11. Travel and scale go; short opacity fades stay. Nothing
+   here can leave content hidden, because nothing here hides anything. */
+@media (prefers-reduced-motion: reduce) {
+  button:active:not(:disabled) {
+    transform: none;
+  }
+}

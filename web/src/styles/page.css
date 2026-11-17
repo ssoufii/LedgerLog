@@ -1,0 +1,377 @@
+/*
+ * The frame and the sections. Geometry from section 5 and section 6 of
+ * docs/FRONTEND_DESIGN.md; colours and type sizes are tokens.
+ *
+ * Three decisions in here are not literally what section 6 says, because
+ * section 7's house rules are the checked contract and they win:
+ *
+ * 1. The hero copy spans eight columns, not six. At 1440 six columns is 668px
+ *    and "a storage engine" sets about 750px at --step-hero, so six columns
+ *    would push the headline onto a third line and fail the two-line rule.
+ * 2. The console is never cropped. Section 6 lets the bottom edge of the stage
+ *    cut it, and the right edge cut it on a phone, but a clipped region does
+ *    not scroll, so a control inside the crop would be focusable and invisible
+ *    at once: house rule 11 against a visual crop, and the rule wins. The
+ *    stage still bleeds off the right and bottom edges of the hero itself.
+ * 3. On the narrow layout the console sits under the notch rather than beside
+ *    it, as section 6's phone note describes, because beside it there is not
+ *    enough width left for the fragment at true size.
+ */
+
+/* Section 5: a plain row 28px from the top. No bar chrome, no blur, no pill. */
+.site-nav {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 16px 28px;
+  padding: 28px var(--margin) 0;
+}
+
+.site-nav__wordmark {
+  font-size: var(--step-nav);
+  font-weight: 700;
+  letter-spacing: -0.03em;
+}
+
+.site-nav__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+}
+
+.nav-link {
+  font-size: var(--step-nav);
+  color: var(--muted);
+  transition: color var(--t-hover) ease;
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .nav-link:hover {
+    color: var(--ink);
+  }
+}
+
+/* The hero. Row one is the copy, row two is the stage. On the wide layout row
+   one is exactly 42svh tall so that the stage starts 42% down, and the copy is
+   allowed to spill past it: the three-step notch is cut out of precisely the
+   corner it spills over, so the spilled line lands on the ground and not on
+   the maroon. */
+.hero {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  grid-template-rows: auto auto;
+  column-gap: var(--grid-gap);
+  row-gap: 56px;
+  padding-inline: var(--margin);
+  min-height: 100svh;
+  align-content: start;
+}
+
+.hero__copy {
+  grid-row: 1;
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  padding-top: 64px;
+  position: relative;
+  z-index: 1;
+}
+
+.hero__title {
+  font-size: var(--step-hero);
+}
+
+/* Two lines, said in the markup rather than left to the measure, so the break
+   is the one the spec asks for at every width. */
+.hero__line {
+  display: block;
+}
+
+.hero__lead {
+  max-width: 40ch;
+  font-size: var(--step-lead);
+  line-height: 1.5;
+  margin-top: 32px;
+}
+
+.hero__action {
+  margin-top: 36px;
+}
+
+.stage {
+  grid-row: 2;
+  grid-column: 1 / -1;
+  margin-inline: calc(-1 * var(--margin));
+  min-height: 58svh;
+  background: var(--maroon);
+  padding: calc(3 * var(--block-lg) + 28px) var(--margin) 48px;
+  clip-path: polygon(
+    calc(3 * var(--block-lg)) 0,
+    100% 0,
+    100% 100%,
+    0 100%,
+    0 calc(3 * var(--block-lg)),
+    var(--block-lg) calc(3 * var(--block-lg)),
+    var(--block-lg) calc(2 * var(--block-lg)),
+    calc(2 * var(--block-lg)) calc(2 * var(--block-lg)),
+    calc(2 * var(--block-lg)) var(--block-lg),
+    calc(3 * var(--block-lg)) var(--block-lg)
+  );
+}
+
+@media (min-width: 1100px) {
+  .hero {
+    grid-template-rows: 42svh auto;
+    row-gap: 0;
+  }
+
+  .hero__copy {
+    grid-column: 1 / span 8;
+    padding-top: 104px;
+  }
+
+  .stage {
+    grid-column: 5 / -1;
+    margin-inline: 0 calc(-1 * var(--margin));
+    padding: 56px 0 56px calc(3 * var(--block-lg) + 56px);
+  }
+}
+
+/* The console fragment. Inside a [data-ui] root, product conventions apply:
+   the panel is a surface, the inputs carry a rule, and a secondary action is a
+   filled control rather than a text button, because six text buttons in a row
+   would read as a sentence. The shape is still the page's one button shape. */
+.console {
+  width: min(620px, 100%);
+  background: var(--surface-1);
+  padding: 24px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
+}
+
+.console__status {
+  display: flex;
+  align-items: flex-end;
+  gap: 12px;
+  min-height: calc(3 * var(--block) + 2 * var(--block-gap));
+}
+
+.console__phase {
+  font-size: var(--step-body);
+  line-height: 1.2;
+}
+
+.console__note {
+  font-size: var(--step-small);
+  color: var(--muted);
+  line-height: 1.4;
+}
+
+.console__fields {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.console__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1 1 180px;
+}
+
+.console__label {
+  font-size: var(--step-small);
+  color: var(--muted);
+}
+
+.console__input {
+  border: 1px solid var(--surface-3);
+  width: 100%;
+}
+
+.console__actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.console__actions button {
+  font-size: var(--step-small);
+  padding: 10px 14px;
+}
+
+.button--secondary {
+  background: var(--surface-2);
+  border: 1px solid var(--surface-3);
+  color: var(--ink);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .button--secondary:not(:disabled):hover {
+    background: var(--surface-3);
+  }
+}
+
+/* One line held open so that the first result does not shove the panels
+   below it down the stage; a second line simply grows the console. */
+.console__readout {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--step-small);
+  min-height: 1.5em;
+}
+
+.console__readout span {
+  color: var(--muted);
+}
+
+.console__panels {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.console__panel-label {
+  font-size: var(--step-small);
+  color: var(--muted);
+  display: block;
+  margin-bottom: 6px;
+}
+
+.console__rows {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: var(--step-small);
+}
+
+.console__rows li {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.console__empty {
+  font-size: var(--step-small);
+  color: var(--muted);
+}
+
+/* The motif at text size: three blocks rising in sequence while the engine
+   boots. Constant motion, so it is linear and a keyframe animation rather
+   than a transition (section 8, rules 3 and 7). */
+.loader {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: var(--block-gap);
+  height: calc(3 * var(--block) + 2 * var(--block-gap));
+}
+
+.loader__block {
+  width: var(--block);
+  background: var(--maroon-text);
+  animation: tower-rise 900ms linear infinite;
+}
+
+.loader__block:nth-child(1) {
+  height: var(--block);
+}
+
+.loader__block:nth-child(2) {
+  height: calc(2 * var(--block) + var(--block-gap));
+  animation-delay: 150ms;
+}
+
+.loader__block:nth-child(3) {
+  height: calc(3 * var(--block) + 2 * var(--block-gap));
+  animation-delay: 300ms;
+}
+
+@keyframes tower-rise {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+
+  50% {
+    transform: translateY(-30%);
+  }
+}
+
+@keyframes tower-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .loader__block {
+    animation-name: tower-pulse;
+    animation-duration: 1400ms;
+  }
+}
+
+/* The footer: the mark, built large. */
+.footer {
+  min-height: 34svh;
+  padding: 96px var(--margin) 64px;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+}
+
+.wordmark {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--block-gap);
+}
+
+/* Each letter knocked out of its own solid rectangle, bottoms aligned, heights
+   from a real skip list's levels (see Wordmark.tsx for the run that drew
+   them). Level 1 is 60% of the band and level 4 is 100%, which is the 60-100%
+   range section 6 asks for. */
+.wordmark__block {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  overflow: hidden;
+  width: var(--wordmark-unit);
+  height: calc(var(--wordmark-unit) * (1.5 + 0.3333 * (var(--level) - 1)));
+  background: var(--surface-3);
+  color: var(--ground);
+  font-size: var(--wordmark-unit);
+  font-weight: 700;
+  line-height: 1;
+  letter-spacing: 0;
+}
+
+.wordmark__block[data-tall="true"] {
+  background: var(--maroon);
+}
+
+.footer__meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 16px 40px;
+  margin-top: 56px;
+}
+
+.footer__copy {
+  color: var(--muted);
+}
+
+.footer__links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 24px;
+}

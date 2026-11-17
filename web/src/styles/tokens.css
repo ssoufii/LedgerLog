@@ -1,0 +1,93 @@
+/*
+ * The token file: the only stylesheet under web/src that holds a literal
+ * colour, font family or type size.
+ *
+ * Why the rule, and why it is checked: docs/FRONTEND_DESIGN.md fixes the
+ * palette (section 3), the type scale (section 4) and the motion curves and
+ * durations (section 8). A component that reaches past a token to a literal is
+ * how a palette stops being one, so web/tests/house-rules.spec.ts reads every
+ * other stylesheet in this directory and fails on a raw colour or font size.
+ * Layout numbers (padding, insets, grid spans) are deliberately not tokenised:
+ * they are geometry from section 6, not part of a scale that has to agree with
+ * itself across the page.
+ */
+
+:root {
+  color-scheme: dark;
+
+  /* Section 3. One ground, one ink, one accent family. Maroon is the accent:
+     the hero stage, the primary button, the active segment, the heading tile,
+     the cta field, and nothing else. */
+  --ground: #0d0b0c; /* page ground, near-black with a warm tint */
+  --surface-1: #181516; /* one step up: tiles, panels on the ground */
+  --surface-2: #232021; /* two steps up: inputs, hovered rows */
+  --surface-3: #2e2a2b; /* dark grey field */
+  --maroon-deep: #3b0f17; /* deep maroon field */
+  --maroon: #6e1a26; /* the accent field */
+  --maroon-bright: #8c2433; /* the one button fill and the active segment */
+  --maroon-text: #d65a6c; /* accent used as text on the ground (5.2:1), sparingly */
+  --ink: #efe8e6; /* all running text (16.2:1 on ground, 7.2:1 on maroon-bright) */
+  --muted: #b3a9a7; /* secondary notes only; never on --maroon-bright (3.8:1 fails) */
+
+  /* Section 4. One family, loaded in index.html without blocking the first
+     paint, so the fallback is what renders when the provider is unreachable.
+     The code stack is the only monospace on the page. */
+  --font-text: "Pilcrow Rounded", ui-rounded, system-ui, sans-serif;
+  --font-code: ui-monospace, "SF Mono", Menlo, monospace;
+
+  /* Five sizes, no more. */
+  --step-small: clamp(0.8125rem, 0.79rem + 0.1vw, 0.875rem); /* 13-14px: data labels in fragments */
+  --step-body: clamp(1.0625rem, 1rem + 0.25vw, 1.1875rem); /* 17-19px: running text */
+  --step-lead: clamp(1.25rem, 1.1rem + 0.7vw, 1.625rem); /* 20-26px: supporting sentences */
+  --step-head: clamp(2rem, 1.3rem + 3.2vw, 4rem); /* 32-64px: section headings */
+  --step-hero: clamp(3.25rem, 7vw, 8rem); /* 52-128px: h1, cta line, figures */
+
+  /* Navigation and footer links. Section 5 and section 6 both fix these at
+     15px, which is below the body step on purpose: they are chrome, not
+     reading matter, and they are the only text on the page at this size. */
+  --step-nav: 0.9375rem;
+
+  /* The motif. A tower is a column of equal square blocks, bottoms on one
+     line, 4px gaps. --block is a block at true size (the loader, and the
+     memtable towers from M11.4); --block-lg is one step of the hero stage
+     notch, 72px on a desktop and 40px on a phone. */
+  --block: 14px;
+  --block-gap: 4px;
+  --block-lg: 72px;
+
+  /* The wordmark's letter blocks. A type size, so it lives here. */
+  --wordmark-unit: clamp(30px, 7vw, 96px);
+
+  /* Section 5. The frame: 12 columns, equal outer margins at every width. */
+  --margin: clamp(16px, 3vw, 40px);
+  --grid-gap: clamp(16px, 1.5vw, 24px);
+
+  /* Section 8. Motion tokens. */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1); /* entrances, UI responses */
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1); /* things moving while visible, the shutter */
+  --ease-soft: cubic-bezier(0.33, 1, 0.68, 1); /* slow settle inside the shutter */
+  --t-press: 140ms;
+  --t-hover: 180ms;
+  --t-ui: 220ms;
+  --t-reveal: 700ms;
+  --t-open: 1100ms;
+  --stagger: 70ms;
+}
+
+/* Section 6, phone. The headline is set at 10vw there, which is below the
+   52px floor of --step-hero, so the step itself is redefined rather than a
+   sixth size introduced for one breakpoint. Only the phone needs it: from
+   600px up, the floor is what renders and the headline holds two lines. */
+@media (max-width: 599px) {
+  :root {
+    --step-hero: 10vw;
+  }
+}
+
+/* The narrow layout, where the stage goes full bleed under the copy instead
+   of beside it, and the notch steps drop to the phone size section 6 gives. */
+@media (max-width: 1099px) {
+  :root {
+    --block-lg: 40px;
+  }
+}

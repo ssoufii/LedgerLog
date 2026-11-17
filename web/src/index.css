@@ -1,74 +1,12 @@
 /*
- * Enough styling to read the scaffold, and no design decisions.
+ * The page's stylesheet, in three parts: the tokens, the element defaults
+ * built from them, and the frame and sections built from those.
  *
- * docs/FRONTEND_DESIGN.md is authoritative for how this page looks, and story
- * M11.3 is where it gets built: palette, type scale, grid, motion. What is here
- * is a dark page and a readable measure, so that this story's page can be
- * looked at without pre-empting any of that.
+ * Split so that the token file can be the only place with a literal colour or
+ * type size, which is the rule house-rules.spec.ts checks by reading these
+ * files off disk.
  */
 
-:root {
-  color-scheme: dark;
-  background: #0d0b0c;
-  color: #efe8e6;
-  font-family: ui-rounded, system-ui, sans-serif;
-  font-size: 17px;
-  line-height: 1.5;
-}
-
-body {
-  margin: 0;
-  background: #0d0b0c;
-}
-
-main {
-  max-width: 72ch;
-  padding: 40px 24px 96px;
-  margin: 0 auto;
-}
-
-h1 {
-  font-size: 2rem;
-  letter-spacing: -0.05em;
-  line-height: 0.9;
-  margin: 0 0 24px;
-}
-
-h2 {
-  font-size: 1.25rem;
-  margin: 48px 0 8px;
-}
-
-input {
-  background: #232021;
-  border: 1px solid #2e2a2b;
-  color: inherit;
-  font: inherit;
-  padding: 6px 8px;
-}
-
-button {
-  background: #8c2433;
-  border: 0;
-  border-radius: 0;
-  color: #efe8e6;
-  font: inherit;
-  padding: 8px 14px;
-}
-
-button:disabled {
-  background: #2e2a2b;
-}
-
-label {
-  display: inline-block;
-  min-width: 4em;
-}
-
-ul {
-  padding-left: 1.2em;
-}
-
-li {
-  font-variant-numeric: tabular-nums;
-}
+@import "./styles/tokens.css";
+@import "./styles/base.css";
+@import "./styles/page.css";

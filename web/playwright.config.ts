@@ -34,7 +34,18 @@ export default defineConfig({
       args: ["--no-sandbox"],
     },
   },
-  projects: [{ name: "chromium", use: { ...devices["Desktop Chrome"] } }],
+  // Two projects over the same specs. Section 10 of docs/FRONTEND_DESIGN.md
+  // asks for the reduced motion run explicitly, and the point of running the
+  // whole suite under it rather than one spec is rule 11 of section 8: content
+  // must never stay hidden when motion is reduced, which is a claim about the
+  // page, not about one test.
+  projects: [
+    { name: "chromium", use: { ...devices["Desktop Chrome"] } },
+    {
+      name: "chromium-reduced-motion",
+      use: { ...devices["Desktop Chrome"], reducedMotion: "reduce" },
+    },
+  ],
   webServer: {
     command: `npm run preview -- --host ${HOST} --port ${PORT} --strictPort`,
     url: `http://${HOST}:${PORT}`,
