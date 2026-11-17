@@ -131,6 +131,40 @@ export interface LocateResult {
   answering_sequence: number | null;
 }
 
+/** One table the engine refused to load, and the reason it gave. */
+export interface RejectedTable {
+  name: string;
+  status: string;
+  reason: string | null;
+}
+
+/** What one staged crash did to a copy of the database, and what recovered. */
+export interface CrashReport {
+  scenario: string;
+  damage: string;
+  tables_staged: number;
+  keys_before: string[];
+  keys_after: string[];
+  dropped: string[];
+  recovery: {
+    records_replayed: number;
+    end_offset: number;
+    stopped_at: number | null;
+    reason: string | null;
+  };
+  tables_loaded: string[];
+  tables_rejected: RejectedTable[];
+}
+
+/**
+ * A staged crash, or the reason the database had nothing to stage it on.
+ *
+ * A refusal is a result rather than an error because it is an ordinary state:
+ * a visitor who has written two records cannot be shown a crash mid-merge yet,
+ * and the tile should say so.
+ */
+export type CrashResult = { ok: true; report: CrashReport } | { ok: false; reason: string };
+
 /** What one `put` did. */
 export interface PutResult {
   key: string;
@@ -198,6 +232,7 @@ export interface EngineCalls {
   compactOnce: { request: Record<string, never>; response: CompactionResult | null };
   snapshot: { request: Record<string, never>; response: Snapshot };
   locate: { request: { key: string }; response: LocateResult };
+  crash: { request: { scenario: string }; response: CrashResult };
   reset: { request: Record<string, never>; response: ResetResult };
 }
 
