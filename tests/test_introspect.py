@@ -804,3 +804,263 @@ def test_the_whole_api_runs_without_starting_a_thread(
         assert introspect.snapshot(engine)["compaction"]["needs_compaction"] is False
         assert engine.get(b"key-1") == b"value"
         assert engine.get(b"key-0") is None
+
+
+# ---------------------------------------------------------------------------
+# locate: one key's passage through the layers (story M11.5)
+# ---------------------------------------------------------------------------
+
+
+def test_locate_is_json_and_round_trips(table_engine: LedgerLog) -> None:
+    table_engine.put(b"alpha", b"one")
+    table_engine.flush_pending()
+    table_engine.put(b"alpha", b"two")
+
+    located = introspect.locate(table_engine, "alpha")
+
+    for path, value in walk(located):
+        assert isinstance(value, JSON_TYPES), f"{path} is a {type(value).__name__}"
+    assert json.loads(json.dumps(located)) == located
+
+
+def test_locate_takes_bytes_and_text_alike(engine: LedgerLog) -> None:
+    engine.put(b"alpha", b"one")
+
+    assert introspect.locate(engine, b"alpha") == introspect.locate(engine, "alpha")
+
+
+def test_locate_refuses_a_key_that_is_neither_bytes_nor_text(engine: LedgerLog) -> None:
+    with pytest.raises(TypeError, match="key must be bytes or str"):
+        introspect.locate(engine, 7)  # type: ignore[arg-type]
+
+
+def test_locate_finds_a_fresh_write_in_the_log_and_the_memtable(engine: LedgerLog) -> None:
+    engine.put(b"alpha", b"one")
+    engine.put(b"bravo", b"two")
+
+    located = introspect.locate(engine, "alpha")
+
+    wal = located["wal"]
+    assert wal is not None
+    # The offset and the framing come from the log file itself, not from the
+    # engine's report of it.
+    raw = engine.wal_path.read_bytes()
+    payload = raw[wal["offset"] + RECORD_HEADER_SIZE : wal["offset"] + wal["length"]]
+    assert wal["checksum"] == zlib.crc32(payload) & 0xFFFFFFFF
+    assert wal["kind"] == "put"
+    assert located["memtable"] == {
+        "key": "alpha",
+        "value": "one",
+        "value_length": 3,
+        "tombstone": False,
+        "expires_at_ms": None,
+        "level": located["memtable"]["level"],
+        "frozen": False,
+    }
+    assert 1 <= located["memtable"]["level"] <= DEFAULT_MAX_LEVEL
+    assert located["sstables"] == []
+    assert located["answered_by"] == "memtable"
+    assert located["answering_sequence"] is None
+
+
+def test_locate_reports_the_newest_log_record_for_a_key(engine: LedgerLog) -> None:
+    engine.put(b"alpha", b"one")
+    first = introspect.locate(engine, "alpha")["wal"]
+    engine.put(b"alpha", b"two")
+
+    second = introspect.locate(engine, "alpha")["wal"]
+
+    assert first is not None and second is not None
+    assert second["offset"] > first["offset"]
+    assert second["value_length"] == 3
+
+
+def test_locate_says_nothing_it_was_not_told(engine: LedgerLog) -> None:
+    engine.put(b"alpha", b"one")
+
+    located = introspect.locate(engine, "never-written")
+
+    assert located["wal"] is None
+    assert located["memtable"] is None
+    assert located["answered_by"] is None
+    assert located["answering_sequence"] is None
+
+
+def test_locate_follows_a_key_onto_disk_after_a_flush(engine: LedgerLog) -> None:
+    engine.put(b"alpha", b"one")
+    engine.flush()
+
+    located = introspect.locate(engine, "alpha")
+
+    assert located["memtable"] is None
+    assert located["answered_by"] == "sstable"
+    table = located["sstables"][0]
+    assert table["sequence"] == located["answering_sequence"]
+    assert table["present"] is True
+    assert table["searched"] is True
+    assert table["tombstone"] is False
+    # The offset names a real record in a real file.
+    handle = engine.sstables[0]
+    with handle.borrow_reader() as reader:
+        # The first record is always indexed, so the index's first offset is
+        # where the data block starts.
+        block_start = reader.index.entries[0].offset
+    with open(handle.path, "rb") as stream:
+        records = {
+            record.offset: record.key
+            for record in iter_records(
+                stream, start_offset=block_start, end_offset=handle.footer.data_block_end
+            )
+        }
+    assert records[table["record_offset"]] == b"alpha"
+
+
+def test_locate_reports_the_bloom_bits_the_key_lands_on(engine: LedgerLog) -> None:
+    engine.put(b"alpha", b"one")
+    engine.flush()
+
+    table = introspect.locate(engine, "alpha")["sstables"][0]
+
+    handle = engine.sstables[0]
+    assert table["bloom_bit_positions"] == list(handle.bloom_filter.bit_positions(b"alpha"))
+    assert table["bloom_bit_count"] == handle.bloom_filter.bit_count
+    # A key that was added has every one of its bits set, which is why the
+    # filter can never give a false negative.
+    assert all(table["bloom_bits_set_for_key"])
+    assert table["bloom_might_contain"] is True
+
+
+def test_locate_does_not_open_a_table_the_filter_rejects(engine: LedgerLog) -> None:
+    engine.put(b"alpha", b"one")
+    engine.flush()
+
+    table = introspect.locate(engine, "zulu")["sstables"][0]
+
+    assert table["bloom_might_contain"] is False
+    assert table["searched"] is False
+    assert table["present"] is False
+    assert table["record_offset"] is None
+    assert table["index_offset"] is None
+    assert not all(table["bloom_bits_set_for_key"])
+
+
+def test_locate_distinguishes_an_indexed_key_from_a_scanned_one(tmp_path: Path) -> None:
+    # An index interval of two indexes every other key, so one of a pair is
+    # pointed at directly and the other is reached by scanning forward from it.
+    with LedgerLog(
+        tmp_path / "data",
+        fsync_policy="never",
+        flush_in_background=False,
+        index_interval=2,
+    ) as engine:
+        for index in range(6):
+            engine.put(f"key-{index}".encode(), b"value")
+        engine.flush()
+
+        indexed = introspect.locate(engine, "key-0")["sstables"][0]
+        scanned = introspect.locate(engine, "key-1")["sstables"][0]
+
+        assert indexed["indexed"] is True
+        assert indexed["scan_from_key"] == "key-0"
+        assert scanned["indexed"] is False
+        assert scanned["scan_from_key"] == "key-0"
+        assert scanned["index_offset"] == indexed["index_offset"]
+        assert scanned["present"] is True
+
+
+def test_locate_walks_the_tables_newest_first_and_stops_at_the_winner(
+    table_engine: LedgerLog,
+) -> None:
+    table_engine.put(b"alpha", b"old")
+    table_engine.flush_pending()
+    table_engine.put(b"alpha", b"new")
+    table_engine.flush_pending()
+
+    located = introspect.locate(table_engine, "alpha")
+
+    sequences = [table["sequence"] for table in located["sstables"]]
+    assert sequences == sorted(sequences, reverse=True)
+    # Both tables hold the key, and the newest is the one that answers.
+    assert [table["present"] for table in located["sstables"]] == [True, True]
+    assert located["answering_sequence"] == sequences[0]
+    assert table_engine.get(b"alpha") == b"new"
+
+
+def test_locate_sees_a_tombstone_on_disk_as_a_record(table_engine: LedgerLog) -> None:
+    table_engine.put(b"alpha", b"one")
+    table_engine.flush_pending()
+    table_engine.delete(b"alpha")
+    table_engine.flush_pending()
+
+    located = introspect.locate(table_engine, "alpha")
+
+    newest = located["sstables"][0]
+    assert newest["present"] is True
+    assert newest["tombstone"] is True
+    assert located["answering_sequence"] == newest["sequence"]
+    assert table_engine.get(b"alpha") is None
+
+
+def test_locate_sees_a_frozen_memtable_between_memory_and_disk(tmp_path: Path) -> None:
+    with LedgerLog(
+        tmp_path / "data",
+        fsync_policy="never",
+        flush_in_background=False,
+        memtable_threshold_bytes=1,
+    ) as engine:
+        engine.put(b"alpha", b"one")
+
+        located = introspect.locate(engine, "alpha")
+
+        assert engine.frozen_memtables
+        assert located["memtable"] is not None
+        assert located["memtable"]["frozen"] is True
+        assert located["answered_by"] == "frozen_memtable"
+
+
+def test_locate_agrees_with_the_engine_after_a_compaction(table_engine: LedgerLog) -> None:
+    for index in range(4):
+        table_engine.put(b"alpha", f"value-{index}".encode())
+        table_engine.flush_pending()
+    merged = introspect.compact_once(table_engine)
+
+    located = introspect.locate(table_engine, "alpha")
+
+    assert merged is not None
+    assert [table["sequence"] for table in located["sstables"]] == [merged["output_sequence"]]
+    assert located["answering_sequence"] == merged["output_sequence"]
+    assert table_engine.get(b"alpha") == b"value-3"
+
+
+def test_locating_a_key_changes_nothing(table_engine: LedgerLog) -> None:
+    for index in range(3):
+        table_engine.put(f"key-{index}".encode(), b"value")
+        table_engine.flush_pending()
+
+    before = introspect.snapshot(table_engine)
+    first = introspect.locate(table_engine, "key-1")
+    second = introspect.locate(table_engine, "key-1")
+
+    assert first == second
+    assert introspect.snapshot(table_engine) == before
+    assert table_engine.get(b"key-1") == b"value"
+
+
+def test_locate_runs_without_starting_a_thread(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(self: threading.Thread, *args: Any, **kwargs: Any) -> NoReturn:
+        raise AssertionError("a thread was started")
+
+    monkeypatch.setattr(threading.Thread, "start", refuse)
+
+    with LedgerLog(
+        tmp_path / "data",
+        fsync_policy="never",
+        flush_in_background=False,
+        memtable_threshold_bytes=1,
+    ) as engine:
+        engine.put(b"alpha", b"one")
+        engine.flush_pending()
+
+        assert introspect.locate(engine, "alpha")["answered_by"] == "sstable"

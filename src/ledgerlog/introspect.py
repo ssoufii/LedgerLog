@@ -54,7 +54,15 @@ surface as a missing key deep in a UI. Bumped whenever a field is removed or
 changes meaning, not when one is added.
 """
 
-__all__ = ["SNAPSHOT_VERSION", "compact_once", "snapshot"]
+LOCATE_VERSION = 1
+"""Shape version of the dictionary :func:`locate` returns.
+
+Separate from :data:`SNAPSHOT_VERSION` because the two answer different
+questions and will not change together: a snapshot describes the engine, and a
+locate describes one key's journey through it.
+"""
+
+__all__ = ["LOCATE_VERSION", "SNAPSHOT_VERSION", "compact_once", "locate", "snapshot"]
 
 
 def _text(data: bytes) -> str:
@@ -258,6 +266,143 @@ def snapshot(engine: LedgerLog) -> dict[str, Any]:
         "frozen_memtables": [_memtable_snapshot(memtable) for memtable in engine.frozen_memtables],
         "sstables": [_sstable_snapshot(handle) for handle in engine.sstables],
         "compaction": _compaction_snapshot(engine),
+    }
+
+
+def _locate_in_table(handle: SSTableHandle, key: bytes) -> dict[str, Any]:
+    """Describe what one table has to say about ``key``, the way a read asks it.
+
+    The order of the questions is the read path's (ARCHITECTURE.md section 5),
+    and it is the point of this function: the filter is asked first, and the
+    data block is only opened if the filter says it might be worth opening. A
+    table the filter rejects reports ``searched`` false and no record, which is
+    the saving a bloom filter buys, stated rather than implied.
+
+    ``indexed`` is about this key and not about the table: the index holds every
+    Nth key, so a key that is not one of them is still found, by scanning
+    forward from ``scan_from_key``. Showing the difference is the only way a
+    reader of this can see what "sparse" costs and saves.
+    """
+    bloom = handle.bloom_filter
+    positions = bloom.bit_positions(key)
+    might_contain = bloom.might_contain(key)
+
+    indexed = False
+    index_offset: int | None = None
+    scan_from_key: str | None = None
+    record_offset: int | None = None
+    record_end_offset: int | None = None
+    tombstone = False
+    present = False
+
+    if might_contain:
+        with handle.borrow_reader() as reader:
+            index = reader.index
+            index_offset = index.offset_for(key)
+            for entry in index.entries:
+                if entry.key == key:
+                    indexed = True
+                if entry.offset == index_offset:
+                    scan_from_key = _text(entry.key)
+            record = reader.lookup(key)
+        if record is not None:
+            present = True
+            record_offset = record.offset
+            record_end_offset = record.end_offset
+            tombstone = record.is_tombstone
+
+    return {
+        "sequence": handle.sequence,
+        "name": handle.path.name,
+        "bloom_bit_count": bloom.bit_count,
+        "bloom_bit_positions": list(positions),
+        "bloom_bits_set_for_key": [bloom.bit_is_set(position) for position in positions],
+        "bloom_might_contain": might_contain,
+        "searched": might_contain,
+        "indexed": indexed,
+        "index_offset": index_offset,
+        "scan_from_key": scan_from_key,
+        "present": present,
+        "record_offset": record_offset,
+        "record_end_offset": record_end_offset,
+        "tombstone": tombstone,
+    }
+
+
+def locate(engine: LedgerLog, key: bytes | str) -> dict[str, Any]:
+    """Return a JSON-shaped account of where one key is, layer by layer.
+
+    :func:`snapshot` describes the engine; this describes one key's passage
+    through it, which is a different question and not one a caller can answer
+    from a snapshot. A snapshot says a table holds 400 records between two
+    bounds and that its filter has 912 bits set; it cannot say whether this key
+    is one of the indexed ones, which bits this key lands on, or which table
+    actually answers for it. Working that out from a snapshot would mean
+    reimplementing the read path in the caller, which is exactly what the web
+    demo must not do.
+
+    The layers are reported in the order a ``get`` consults them: the log the
+    write landed in first, the active memtable, the memtables frozen behind it,
+    then every table on disk newest first. ``answered_by`` names the layer that
+    would win, so a caller does not have to re-derive precedence either.
+
+    Read-only, like :func:`snapshot`, and in the same way: a table's reader may
+    be opened to read its index, which the next ``get`` on that table would
+    open anyway. Nothing is written and no record is dropped or hidden, an
+    expired one included, for the reason given on :func:`snapshot`: whether a
+    deadline has passed is the caller's to decide against its own clock.
+
+    ``key`` is taken as ``bytes``, or as text that is encoded UTF-8 first, which
+    is the same encoding :func:`snapshot` decodes with. Every key in the result
+    is text, decoded the way this module's docstring describes.
+
+    Not cheap, and not meant to be: it may open every table whose filter accepts
+    the key. It is a tool's call, made when a person asks where something is,
+    not something to put on a read path.
+    """
+    key_bytes = key.encode("utf-8") if isinstance(key, str) else key
+    if not isinstance(key_bytes, bytes):
+        raise TypeError(f"key must be bytes or str, got {type(key).__name__}")
+    key_text = _text(key_bytes)
+
+    # The newest log record naming this key. Later records shadow earlier ones,
+    # so the last match is the one the log would replay last and therefore the
+    # one that is true.
+    wal_record: dict[str, Any] | None = None
+    for record in _wal_snapshot(engine.wal_path)["records"]:
+        if record["key"] == key_text:
+            wal_record = record
+
+    memtable_entry: dict[str, Any] | None = None
+    answered_by: str | None = None
+    for position, memtable in enumerate((engine.active_memtable, *engine.frozen_memtables)):
+        match = next(
+            (entry for entry in _memtable_entries(memtable) if entry["key"] == key_text),
+            None,
+        )
+        if match is not None:
+            memtable_entry = {**match, "frozen": position > 0}
+            answered_by = "memtable" if position == 0 else "frozen_memtable"
+            break
+
+    tables = [_locate_in_table(handle, key_bytes) for handle in engine.sstables]
+    answering_table: int | None = None
+    for table in tables:
+        if table["present"]:
+            answering_table = table["sequence"]
+            break
+    if answered_by is None and answering_table is not None:
+        answered_by = "sstable"
+
+    return {
+        "locate_version": LOCATE_VERSION,
+        "key": key_text,
+        "key_bytes": len(key_bytes),
+        "wal": wal_record,
+        "memtable": memtable_entry,
+        "sstables": tables,
+        "answered_by": answered_by,
+        "answering_sequence": answering_table,
     }
 
 
