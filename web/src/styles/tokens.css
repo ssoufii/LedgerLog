@@ -77,6 +77,11 @@
   --margin: clamp(16px, 3vw, 40px);
   --grid-gap: clamp(16px, 1.5vw, 24px);
 
+  /* The one shadow on the page. Section 7 allows a shadow inside an open
+     dialog in a [data-ui] fragment and nowhere else, so it is defined once,
+     here, where a second one would be visible as a second token. */
+  --shadow-dialog: 0 24px 64px rgb(0 0 0 / 45%);
+
   /* Section 8. Motion tokens. */
   --ease-out: cubic-bezier(0.23, 1, 0.32, 1); /* entrances, UI responses */
   --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1); /* things moving while visible, the shutter */

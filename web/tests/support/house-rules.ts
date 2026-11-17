@@ -247,6 +247,24 @@ export function auditPage(): AuditReport {
   // cannot reach. So those are not expected in the tab walk, and a negative
   // tabindex outside a composite widget is a violation in its own right.
   const COMPOSITE = "[role='radiogroup'],[role='tablist'],[role='menu'],[role='listbox'],[role='grid']";
+
+  /**
+   * A native radio that its group has already passed over.
+   *
+   * Sequential focus navigation gives a radio group one tab stop, the checked
+   * member, and the arrow keys move within it. The unchecked members are
+   * therefore not expected in the tab walk, for the same reason a roving
+   * tabindex's unselected options are not, and for the same platform reason.
+   */
+  const skippedRadio = (element: HTMLElement): boolean => {
+    if (!(element instanceof HTMLInputElement) || element.type !== "radio" || element.name === "") {
+      return false;
+    }
+    const group = document.querySelectorAll<HTMLInputElement>(
+      `input[type='radio'][name='${CSS.escape(element.name)}']`,
+    );
+    return !element.checked && Array.from(group).some((radio) => radio.checked);
+  };
   const focusableSelector =
     "a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex='-1'])";
   const candidates = Array.from(document.querySelectorAll<HTMLElement>(focusableSelector)).filter(isVisible);
@@ -258,7 +276,9 @@ export function auditPage(): AuditReport {
       );
     }
   }
-  const focusable = candidates.filter((element) => element.tabIndex >= 0).map(describe);
+  const focusable = candidates
+    .filter((element) => element.tabIndex >= 0 && !skippedRadio(element))
+    .map(describe);
 
   return {
     violations,
@@ -278,16 +298,27 @@ export function auditPage(): AuditReport {
  * Stamp every element the tab order should reach, so a tab walk can say which
  * ones it did.
  *
- * Controls with a negative tabindex are left out, because they are the inside
- * of a composite widget that is itself one tab stop (see the audit, which
- * fails a negative tabindex anywhere else). Moving within such a widget is
- * checked where that widget is built.
+ * Two kinds are left out, both for the same reason: they are the inside of a
+ * widget that is itself one tab stop. A control with a negative tabindex is
+ * one (see the audit, which fails a negative tabindex outside a composite
+ * widget), and an unchecked radio in a group that has a checked member is the
+ * other, which is the platform's own rule rather than this page's. Moving
+ * within either is checked where that widget is built.
  */
 export function stampFocusable(): number {
   const focusableSelector =
     "a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex='-1'])";
+  const checkedInGroup = (element: HTMLElement): boolean => {
+    if (!(element instanceof HTMLInputElement) || element.type !== "radio" || element.name === "") {
+      return true;
+    }
+    const group = document.querySelectorAll<HTMLInputElement>(
+      `input[type='radio'][name='${CSS.escape(element.name)}']`,
+    );
+    return element.checked || !Array.from(group).some((radio) => radio.checked);
+  };
   const elements = Array.from(document.querySelectorAll<HTMLElement>(focusableSelector)).filter(
-    (element) => element.tabIndex >= 0,
+    (element) => element.tabIndex >= 0 && checkedInGroup(element),
   );
   elements.forEach((element, index) => {
     element.dataset.kbStamp = String(index);

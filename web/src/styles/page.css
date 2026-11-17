@@ -1050,3 +1050,164 @@
     aspect-ratio: auto;
   }
 }
+
+/* Start: the first step, already open.
+ *
+ * A full bleed accent field with the closing line bottom left and the dialog
+ * to the right of it. The dialog is the one place on the page section 7 lets
+ * a shadow exist, because it is an open dialog inside a [data-ui] fragment.
+ */
+.start {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  column-gap: var(--grid-gap);
+  row-gap: 56px;
+  align-items: center;
+  min-height: 90svh;
+  padding: 96px var(--margin);
+  background: var(--maroon);
+}
+
+.start__closing {
+  grid-column: 1 / -1;
+  align-self: end;
+}
+
+.start__line {
+  font-size: var(--step-hero);
+}
+
+.start__word {
+  display: block;
+}
+
+.start__sentence {
+  max-width: 40ch;
+  margin-top: 28px;
+  font-size: var(--step-body);
+}
+
+.start__dialog {
+  grid-column: 1 / -1;
+  /* A non-modal <dialog open> is absolutely positioned by default, which
+     would take it out of the grid and lay it over the closing line. It is on
+     the page as a panel, so it is laid out as one. */
+  position: static;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 16px;
+  width: min(440px, 100%);
+  max-width: 100%;
+  margin: 0;
+  padding: 24px;
+  border: 0;
+  background: var(--surface-1);
+  color: var(--ink);
+  box-shadow: var(--shadow-dialog);
+}
+
+.start__dialog-title {
+  font-size: var(--step-body);
+  font-weight: 500;
+}
+
+.start__field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+}
+
+.start__fieldset {
+  border: 0;
+  margin: 0;
+  padding: 0;
+  width: 100%;
+}
+
+.start__choice {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+/* The segment is the label, and the radio inside it is hidden from the eye
+   but not from the keyboard or from a screen reader: it is still the control
+   being operated, which is why the focus ring is drawn on the segment around
+   it rather than suppressed. */
+.start__option input {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.start__option:has(input:focus-visible) {
+  outline: 3px solid var(--ink);
+  outline-offset: 2px;
+}
+
+.start__option {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 0;
+  justify-content: center;
+  padding: 10px 8px;
+  background: var(--surface-2);
+  border: 1px solid var(--surface-3);
+  font-size: var(--step-small);
+  color: var(--muted);
+  cursor: pointer;
+  transition:
+    background-color var(--t-ui) ease,
+    color var(--t-ui) ease;
+}
+
+.start__option[data-chosen="true"] {
+  background: var(--maroon-bright);
+  border-color: var(--maroon-bright);
+  color: var(--ink);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .start__option:not([data-chosen="true"]):hover {
+    background: var(--surface-3);
+    color: var(--ink);
+  }
+}
+
+.start__snippet {
+  width: 100%;
+  margin: 0;
+  padding: 14px;
+  background: var(--surface-2);
+  font-size: var(--step-small);
+  color: var(--ink);
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.start__status {
+  font-size: var(--step-small);
+  color: var(--muted);
+  min-height: 1.4em;
+}
+
+.start__repo {
+  margin-top: 4px;
+}
+
+@media (min-width: 900px) {
+  .start__closing {
+    grid-column: 1 / span 5;
+  }
+
+  .start__dialog {
+    grid-column: 7 / span 5;
+    align-self: center;
+  }
+}

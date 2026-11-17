@@ -363,3 +363,11 @@ The page can now be used to pull the plug. A board of tiles names six ways a sto
 The damage itself is not demo code. It lives in the store's own source, in a module whose only job is to break things on purpose, and the test suite drives the same functions to assert the same recoveries. That is the point of the arrangement: the demonstration on the page and the assertion in the tests cannot drift apart, because they are the same code. Each tile also names the test that covers its failure, and a test checks that every name on a tile is a test that really exists, so the page cannot claim a guarantee nobody wrote down.
 
 Two of the results are worth reading. A torn write loses exactly the record that was cut and nothing written before it. A flush killed before its end marker loses nothing at all: the file is passed over and every record comes back from the log, which is what makes that marker the moment a file counts as written.
+
+## Story M11.8: Start dialog that writes the snippet
+
+The page now ends with the code a visitor needs, already written for the choices they made. A small open dialog asks for two things: where the database should live and how often the log should be forced to disk. Underneath, the Python to do exactly that appears and changes as the fields change, and one button copies it and says "copied" for a second and a half.
+
+What makes this more than a pretty code box is that the snippet is not written by the page. There is one template, kept as data, and the test suite renders that same template for each of the three durability settings, writes it to a file, runs it as a real program and then reopens the database it claims to have created to check the record is really there. So the code on the page is code that has been executed, not code that looks plausible. A further test confirms the snippet still matches the store's real constructor, so renaming a parameter in the engine breaks the test rather than quietly handing visitors something that no longer works.
+
+Small details that matter: the directory field is free text, so anything typed into it is escaped properly before it becomes a Python string, and a test puts quotes and a backslash in the path and checks the result still parses. The whole dialog works from the keyboard, arrow keys and all, and a link under the button goes to the source.

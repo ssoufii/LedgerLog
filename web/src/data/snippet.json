@@ -1,0 +1,6 @@
+{
+  "comment": "One template, rendered by the page and executed by pytest, so the code a visitor copies is code that runs. Placeholders are substituted with an escaped Python string literal body. See web/src/data/snippet.ts and tests/test_snippet.py.",
+  "default_directory": "./data",
+  "policies": ["never", "interval", "always"],
+  "template": "from ledgerlog import LedgerLog\n\n# fsync_policy decides when the write-ahead log is forced to disk.\nwith LedgerLog(\"__DIRECTORY__\", fsync_policy=\"__POLICY__\") as db:\n    db.put(b\"user:1042:login\", b\"2026-11-16T05:00:00Z\")\n    print(db.get(b\"user:1042:login\"))\n"
+}

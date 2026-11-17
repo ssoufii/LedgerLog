@@ -6,6 +6,7 @@ import { CrashTiles } from "./components/CrashTiles";
 import { DurabilityDial } from "./components/DurabilityDial";
 import { Hero } from "./components/Hero";
 import { NumbersSlider } from "./components/NumbersSlider";
+import { StartDialog } from "./components/StartDialog";
 import { SiteFooter } from "./components/SiteFooter";
 import { SiteNav } from "./components/SiteNav";
 import { WriteStrip } from "./components/WriteStrip";
@@ -42,6 +43,7 @@ export function App() {
         <DurabilityDial />
         <CrashTiles />
         <NumbersSlider />
+        <StartDialog />
       </main>
       <SiteFooter />
     </>
