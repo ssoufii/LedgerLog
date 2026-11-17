@@ -249,4 +249,14 @@ test("the console holds together on a phone with real data in it", async ({ page
 
   expect(report.violations).toEqual([]);
   expect(report.scrollWidth).toBeLessThanOrEqual(report.clientWidth);
+
+  // The key is the column worth reading in the log tail. On a phone the four
+  // column row leaves it a few characters wide, so the row splits in two and
+  // the key gets the width back.
+  const keyCellWidth = await page
+    .getByTestId("wal-records")
+    .locator(".wal__cell--key")
+    .first()
+    .evaluate((node) => node.clientWidth);
+  expect(keyCellWidth).toBeGreaterThan(140);
 });

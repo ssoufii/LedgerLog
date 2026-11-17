@@ -145,6 +145,11 @@
    would read as a sentence. The shape is still the page's one button shape. */
 .console {
   width: min(620px, 100%);
+  /* Queried rather than the viewport, because what decides whether the log
+     tail fits on one line is how wide the fragment ended up, which depends on
+     the stage as much as on the window. */
+  container-type: inline-size;
+  container-name: console;
   background: var(--surface-1);
   padding: 24px;
   display: flex;
@@ -271,6 +276,25 @@
   text-align: right;
 }
 
+/* Too narrow for four columns: the key is the column worth reading, so the
+   byte count and the checksum drop to a second line rather than squeezing it
+   down to three characters. */
+@container console (max-width: 460px) {
+  /* Two lines per record, so the gap between records has to beat the gap
+     between a record's own lines or the tail reads as twelve rows. */
+  .console__rows {
+    gap: 10px;
+  }
+
+  .console__rows li {
+    grid-template-columns: auto minmax(0, 1fr);
+  }
+
+  .console__rows li > :last-child {
+    text-align: left;
+  }
+}
+
 .wal__cell {
   white-space: nowrap;
 }
@@ -365,13 +389,14 @@
   background: var(--surface-2);
   padding: 12px 14px;
   min-width: 150px;
+  max-width: min(280px, 100%);
   font-size: var(--step-small);
 }
 
 .tile__name,
 .tile__range {
   color: var(--muted);
-  max-width: 180px;
+  max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
