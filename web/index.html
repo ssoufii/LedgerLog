@@ -8,6 +8,29 @@
       name="description"
       content="A log-structured key-value storage engine written from scratch in Python, running in your browser."
     />
+    <!--
+      Pilcrow Rounded, from Fontshare's CSS API as docs/FRONTEND_DESIGN.md
+      section 4 asks. Loaded without blocking the first paint: the media swap
+      is the standard way to do that, and it matters here because the page has
+      to render the same whether or not the provider is reachable (a Playwright
+      run may have no network at all, and the house rules are checked with the
+      font requests blocked). The noscript copy covers a visitor with scripting
+      off, who gets the font and no engine.
+    -->
+    <link rel="preconnect" href="https://api.fontshare.com" crossorigin />
+    <link rel="preconnect" href="https://cdn.fontshare.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://api.fontshare.com/v2/css?f[]=pilcrow-rounded@400,500,700&display=swap"
+      media="print"
+      onload="this.media='all'"
+    />
+    <noscript>
+      <link
+        rel="stylesheet"
+        href="https://api.fontshare.com/v2/css?f[]=pilcrow-rounded@400,500,700&display=swap"
+      />
+    </noscript>
   </head>
   <body>
     <div id="root"></div>
