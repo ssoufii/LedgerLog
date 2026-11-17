@@ -48,7 +48,7 @@ See [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) for the full design writeup, 
 
 ## Status
 
-Milestones 0 through 10 of [`docs/ROADMAP.md`](docs/ROADMAP.md) are built and tested: WAL, concurrent skip-list memtable, SSTables with sparse index and bloom filter, memtable flush, multi-SSTable reads, size-tiered compaction with tombstone and TTL cleanup, full-stack crash recovery, and the bench harness. Stretch goals (leveled compaction, range scans, snapshot reads) are not started. User stories live in [`docs/USER_STORIES.md`](docs/USER_STORIES.md).
+Milestones 0 through 11 of [`docs/ROADMAP.md`](docs/ROADMAP.md) are built and tested: WAL, concurrent skip-list memtable, SSTables with sparse index and bloom filter, memtable flush, multi-SSTable reads, size-tiered compaction with tombstone and TTL cleanup, full-stack crash recovery, the bench harness, and an in-browser demo that runs the real engine (see [Live demo](#live-demo)). Stretch goals (leveled compaction, range scans, snapshot reads) are not started. User stories live in [`docs/USER_STORIES.md`](docs/USER_STORIES.md).
 
 ## Performance
 
@@ -99,6 +99,24 @@ Counted inside the read path, not inferred from the table count. The incremental
 | After compaction | 3 | 1.015 | 2 | 2 |
 
 Compaction ran 31 tier merges (1.804 s in the `never` run), took 96 tables down to 3, and rewrote 36.95 MiB, 2.66x the bytes flushed (write amplification). The bloom filters skipped 942,147 table probes before compaction at a measured 1.02% false-positive rate, which matches the 0.01 target.
+
+## Live demo
+
+`web/` is a one-page site that runs this repository's own `src/ledgerlog` in the browser, with Pyodide in a Web Worker. There is no server: you can put, get, delete, flush and compact keys, follow one record through the write path, and crash a copy of your database in six ways to see what recovery keeps. Every number on the page comes from the live engine or from the Performance tables above.
+
+**Deploy on Render.** The site is a static build, and [`render.yaml`](render.yaml) describes it. In the Render dashboard, choose *New* then *Blueprint*, and connect this repository. Render reads `render.yaml` and builds `web/` with `npm ci && npm run build`. It publishes `web/dist`, with long-lived caching for hashed assets and `no-cache` for `index.html` and the engine source. A push that changes `web/`, `src/ledgerlog/` or this README redeploys it.
+
+**Run it locally.** You need Node 22 or newer:
+
+```bash
+cd web
+npm ci
+npm run dev                  # development server
+npm run build && npm run preview   # the production build, as Render serves it
+npx playwright install chromium && npx playwright test   # the browser test suite
+```
+
+The design rules the page follows are in [`docs/FRONTEND_DESIGN.md`](docs/FRONTEND_DESIGN.md).
 
 ## Install
 
