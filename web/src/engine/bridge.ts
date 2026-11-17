@@ -17,6 +17,7 @@ import {
   BOOT_MESSAGES,
   type BootPhase,
   type CompactionResult,
+  type CrashResult,
   type DeleteResult,
   type EngineCallName,
   type EngineCalls,
@@ -50,6 +51,8 @@ export interface EngineBridge {
   snapshot(): Promise<Snapshot>;
   /** Where one key is, layer by layer. Costlier than a snapshot: see session.py. */
   locate(key: string): Promise<LocateResult>;
+  /** Stage one crash on a copy of the database. The visitor's own is untouched. */
+  crash(scenario: string): Promise<CrashResult>;
   reset(): Promise<ResetResult>;
   /** Stop the worker. The bridge cannot be used afterwards. */
   dispose(): void;
@@ -174,6 +177,9 @@ export function createBridge(): EngineBridge {
     },
     locate(key) {
       return call("locate", { key });
+    },
+    crash(scenario) {
+      return call("crash", { scenario });
     },
     reset() {
       return call("reset", {});

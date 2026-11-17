@@ -1,0 +1,40 @@
+{
+  "scenarios": [
+    {
+      "id": "torn-write",
+      "title": "torn write",
+      "detail": "The log is cut in half through its last record, which is what a process killed mid-append leaves. Replay stops at the first record it cannot trust and keeps everything before it.",
+      "test": "tests/test_engine.py::test_a_torn_tail_is_discarded_and_every_earlier_record_is_recovered"
+    },
+    {
+      "id": "flipped-byte",
+      "title": "flipped byte",
+      "detail": "One byte inside the last log record is inverted. The record is whole and its checksum no longer matches, so replay discards it rather than believing it.",
+      "test": "tests/test_engine.py::test_a_corrupt_record_in_the_middle_discards_it_and_everything_after"
+    },
+    {
+      "id": "crash-mid-flush",
+      "title": "crash mid flush",
+      "detail": "A table loses the footer that would have committed it. The footer is the commit point, so the file is passed over and its records come back from the log.",
+      "test": "tests/test_engine.py::test_a_file_no_footer_committed_is_left_out_of_the_tables_the_engine_serves"
+    },
+    {
+      "id": "crash-mid-compaction",
+      "title": "crash mid compaction",
+      "detail": "A real merge is killed before its footer, leaving a partial output beside its sources. The sources are still the truth, and they are all loaded again.",
+      "test": "tests/test_engine.py::test_the_source_tables_a_dead_compaction_left_are_loaded_again"
+    },
+    {
+      "id": "missing-footer",
+      "title": "missing footer",
+      "detail": "A committed table's footer is damaged so it no longer passes its own checksum. A footer the engine cannot verify is a footer it does not have, and it says so.",
+      "test": "tests/test_engine.py::test_a_table_whose_footer_fails_its_own_checksum_is_not_returned"
+    },
+    {
+      "id": "expired-record",
+      "title": "expired record",
+      "detail": "A record is rewritten with a deadline that then passes. Recovery keeps it, because an expiry is a fact about the record and not damage to it, and the read path declines to return it.",
+      "test": "tests/test_engine.py::test_an_expired_record_reads_as_absent_with_no_compaction_having_run"
+    }
+  ]
+}
