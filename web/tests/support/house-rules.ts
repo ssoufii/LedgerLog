@@ -239,11 +239,26 @@ export function auditPage(): AuditReport {
   // Rule: every control reachable by keyboard and named. The selectors go back
   // to the spec, which checks the names against Playwright's own accessible
   // name computation and walks the tab order.
+  //
+  // A control with a negative tabindex is deliberately out of the tab order.
+  // That is correct inside a composite widget, where the widget is one tab
+  // stop and the arrow keys move within it (a radio group is the case on this
+  // page), and wrong anywhere else, where it is just a control a keyboard
+  // cannot reach. So those are not expected in the tab walk, and a negative
+  // tabindex outside a composite widget is a violation in its own right.
+  const COMPOSITE = "[role='radiogroup'],[role='tablist'],[role='menu'],[role='listbox'],[role='grid']";
   const focusableSelector =
     "a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex='-1'])";
-  const focusable = Array.from(document.querySelectorAll<HTMLElement>(focusableSelector))
-    .filter(isVisible)
-    .map(describe);
+  const candidates = Array.from(document.querySelectorAll<HTMLElement>(focusableSelector)).filter(isVisible);
+  for (const candidate of candidates) {
+    if (candidate.tabIndex < 0 && candidate.closest(COMPOSITE) === null) {
+      add(
+        "every control reachable by keyboard",
+        `${describe(candidate)} is out of the tab order and not inside a composite widget`,
+      );
+    }
+  }
+  const focusable = candidates.filter((element) => element.tabIndex >= 0).map(describe);
 
   return {
     violations,
@@ -259,11 +274,21 @@ export function auditPage(): AuditReport {
   };
 }
 
-/** Stamp every focusable element so a tab walk can say which one it reached. */
+/**
+ * Stamp every element the tab order should reach, so a tab walk can say which
+ * ones it did.
+ *
+ * Controls with a negative tabindex are left out, because they are the inside
+ * of a composite widget that is itself one tab stop (see the audit, which
+ * fails a negative tabindex anywhere else). Moving within such a widget is
+ * checked where that widget is built.
+ */
 export function stampFocusable(): number {
   const focusableSelector =
     "a[href],button:not([disabled]),input:not([disabled]),select:not([disabled]),textarea:not([disabled]),[tabindex]:not([tabindex='-1'])";
-  const elements = Array.from(document.querySelectorAll<HTMLElement>(focusableSelector));
+  const elements = Array.from(document.querySelectorAll<HTMLElement>(focusableSelector)).filter(
+    (element) => element.tabIndex >= 0,
+  );
   elements.forEach((element, index) => {
     element.dataset.kbStamp = String(index);
   });

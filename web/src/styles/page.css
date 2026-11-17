@@ -676,3 +676,233 @@
   font-size: var(--step-small);
   padding: 8px 12px;
 }
+
+/* Durability: one control, blown up.
+ *
+ * The field is full bleed and swaps ground as the control is operated. The
+ * control itself bleeds off the right and the bottom, which is what the field
+ * clips; it is anchored right of centre and sized by the layout rather than
+ * purely in em, so that every segment stays on screen and operable. Section 6
+ * asks for a crop of about a fifth on both edges; a horizontal segmented
+ * control that is 46svh tall is wider than 1440 from the centre, so the bottom
+ * takes the crop and the right takes a bleed, and no segment is cut.
+ */
+.dial-section {
+  position: relative;
+  min-height: 92svh;
+  padding: 120px var(--margin) 52svh;
+  overflow: clip;
+  background: var(--surface-3);
+  transition: background-color var(--t-ui) ease;
+}
+
+.dial-section[data-ground="deep"] {
+  background: var(--maroon-deep);
+}
+
+.dial-section__heading {
+  font-size: var(--step-head);
+  max-width: 14ch;
+}
+
+.dial-section__copy {
+  max-width: min(42ch, 40%);
+}
+
+@media (max-width: 899px) {
+  .dial-section__copy {
+    max-width: 100%;
+  }
+}
+
+.dial-section__sentence {
+  max-width: 38ch;
+  font-size: var(--step-body);
+  margin-top: 28px;
+}
+
+.dial-section__figures {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 8px 12px;
+  margin-top: 28px;
+  max-width: 38ch;
+}
+
+.dial-section__rate {
+  font-size: var(--step-head);
+  font-weight: 700;
+  line-height: 1;
+}
+
+.dial-section__unit {
+  font-size: var(--step-body);
+  color: var(--muted);
+}
+
+.dial-section__aside {
+  flex-basis: 100%;
+  font-size: var(--step-small);
+  color: var(--muted);
+}
+
+.invocation {
+  max-width: 100%;
+  margin-top: 24px;
+  padding-bottom: 6px;
+  font-size: var(--step-small);
+  color: var(--muted);
+  white-space: pre;
+  overflow-x: auto;
+}
+
+.dial {
+  position: absolute;
+  left: 44%;
+  right: calc(-1 * var(--margin));
+  bottom: -9svh;
+  height: 46svh;
+  display: flex;
+  background: var(--surface-2);
+}
+
+.dial__option {
+  flex: 1 1 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-2);
+  color: var(--muted);
+  font-size: var(--step-dial);
+  font-weight: 500;
+  padding: 0;
+  transition:
+    background-color var(--t-ui) ease,
+    color var(--t-ui) ease,
+    transform var(--t-press) var(--ease-out);
+}
+
+.dial__option[aria-checked="true"] {
+  background: var(--maroon-bright);
+  color: var(--ink);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .dial__option:not([aria-checked="true"]):hover {
+    background: var(--surface-3);
+    color: var(--ink);
+  }
+}
+
+@media (max-width: 899px) {
+  .dial-section {
+    padding-bottom: 46svh;
+  }
+
+  /* Full bleed on a phone, anchored to the bottom, so three segments stay
+     readable at a width where an enlarged control cannot. The label follows
+     the width rather than the height here, because what has to fit is
+     "interval" inside a third of the screen. */
+  .dial {
+    left: calc(-1 * var(--margin));
+    height: 34svh;
+    bottom: -6svh;
+  }
+
+}
+
+/* Numbers: one figure, set by a slider. */
+.numbers {
+  display: grid;
+  grid-template-columns: repeat(12, minmax(0, 1fr));
+  column-gap: var(--grid-gap);
+  row-gap: 48px;
+  align-content: space-between;
+  min-height: 88svh;
+  padding: 120px var(--margin) 64px;
+  background: var(--ground);
+}
+
+.numbers__heading {
+  grid-column: 1 / -1;
+  font-size: var(--step-head);
+}
+
+.numbers__control {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  max-width: 400px;
+}
+
+.numbers__label {
+  font-size: var(--step-small);
+  color: var(--muted);
+}
+
+.numbers__slider {
+  appearance: none;
+  width: 100%;
+  height: var(--block);
+  background: var(--surface-2);
+  padding: 0;
+}
+
+.numbers__slider::-webkit-slider-thumb {
+  appearance: none;
+  width: var(--block);
+  height: calc(2 * var(--block));
+  background: var(--maroon-bright);
+  border: 0;
+  border-radius: 0;
+}
+
+.numbers__slider::-moz-range-thumb {
+  width: var(--block);
+  height: calc(2 * var(--block));
+  background: var(--maroon-bright);
+  border: 0;
+  border-radius: 0;
+}
+
+.numbers__records {
+  font-size: var(--step-body);
+}
+
+.numbers__result {
+  grid-column: 1 / -1;
+}
+
+.numbers__figure {
+  display: block;
+  font-size: var(--step-figure);
+  font-weight: 700;
+  line-height: 0.8;
+  letter-spacing: -0.05em;
+  white-space: nowrap;
+}
+
+.numbers__suffix {
+  font-size: var(--step-figure-unit);
+  letter-spacing: 0;
+}
+
+.numbers__note {
+  grid-column: 1 / -1;
+  max-width: 30ch;
+  font-size: var(--step-body);
+}
+
+@media (min-width: 900px) {
+  .numbers__result {
+    grid-column: 1 / span 8;
+  }
+
+  .numbers__note {
+    grid-column: 9 / -1;
+    align-self: end;
+  }
+}

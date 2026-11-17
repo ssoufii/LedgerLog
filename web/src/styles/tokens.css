@@ -42,6 +42,21 @@
   --step-head: clamp(2rem, 1.3rem + 3.2vw, 4rem); /* 32-64px: section headings */
   --step-hero: clamp(3.25rem, 7vw, 8rem); /* 52-128px: h1, cta line, figures */
 
+  /* The stats figure. Section 4 calls this --step-hero scaled, the same step
+     in its figure role rather than a sixth size, so it is named for the role
+     and not for a new place on the scale. The unit beside it is 0.22em of the
+     figure, which section 6 fixes, so it is relative to the figure and not a
+     place on the scale either. */
+  --step-figure: clamp(140px, 19vw, 320px);
+  --step-figure-unit: 0.22em;
+
+  /* The durability control's label. Section 6 builds that control in em and
+     enlarges it until it is about 46svh tall, so its label is sized by the
+     control rather than by the type scale: it follows the height on a desktop
+     and the width on a phone, where what has to fit is "interval" inside a
+     third of the screen. */
+  --step-dial: clamp(1.25rem, 4.4vh, 3.25rem);
+
   /* Navigation and footer links. Section 5 and section 6 both fix these at
      15px, which is below the body step on purpose: they are chrome, not
      reading matter, and they are the only text on the page at this size. */
@@ -81,6 +96,9 @@
 @media (max-width: 599px) {
   :root {
     --step-hero: 10vw;
+    /* The figure's 140px floor is wider than a phone at four digits and a
+       unit, so on a phone the step follows the viewport as the hero does. */
+    --step-figure: 22vw;
   }
 }
 
@@ -89,5 +107,11 @@
 @media (max-width: 1099px) {
   :root {
     --block-lg: 40px;
+  }
+}
+
+@media (max-width: 899px) {
+  :root {
+    --step-dial: clamp(1rem, 7.4vw, 2.25rem);
   }
 }
